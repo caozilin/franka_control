@@ -1,0 +1,209 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import math
+import pathlib
+import sys
+
+import numpy as np
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+
+from analysis import analyze_trace_csv, write_plot_svg, write_summary_json  # noqa: E402
+from control.franka_env import FrankaEnv  # noqa: E402
+from recording import TraceRecorder, create_run_paths  # noqa: E402
+from utils import POLICY_HZ  # noqa: E402
+
+
+ACTION_DIM = 7
+BLOCK_SIZE = 60
+CONTROLLER_CHOICES = ("min_jerk", "linear", "cubic", "motion_limited")
+
+
+class TimedActionBlockSource:
+    def __init__(self, *, max_translation_step: float, max_rotation_step: float, scale: float):
+        self._actions = self._build_actions(max_translation_step, max_rotation_step, scale)
+        self._cursor = 0
+
+    def _build_actions(
+        self,
+        max_translation_step: float,
+        max_rotation_step: float,
+        scale: float,
+    ) -> list[np.ndarray]:
+        block6 = np.array(
+            [
+                [0.018, 0.008, 0.005, 0.035, -0.030, 0.040],
+                [0.018, 0.008, 0.005, 0.035, -0.030, 0.040],
+                [0.018, 0.008, 0.005, 0.035, -0.030, 0.040],
+                [0.018, 0.008, 0.005, 0.035, -0.030, 0.040],
+                [0.018, 0.008, 0.005, 0.035, -0.030, 0.040],
+                [0.018, 0.008, 0.005, 0.035, -0.030, 0.040],
+                [0.018, 0.008, 0.005, 0.035, -0.030, 0.040],
+                [0.018, 0.008, 0.005, 0.035, -0.030, 0.040],
+                [0.018, 0.008, 0.005, 0.035, -0.030, 0.040],
+                [0.018, 0.008, 0.005, 0.035, -0.030, 0.040],
+                [0.010, -0.012, 0.000, -0.025, 0.000, -0.030],
+                [0.010, -0.000, 0.006, -0.000, 0.020, -0.030],
+                [0.000, -0.012, 0.006, -0.000, 0.000, -0.000],
+                [0.000, -0.000, 0.000, -0.025, 0.020, -0.030],
+                [0.010, -0.000, 0.006, -0.000, 0.020, -0.000],
+                [0.000, -0.012, 0.000, -0.025, 0.000, -0.000],
+                [0.000, -0.000, 0.006, -0.000, 0.000, -0.030],
+                [0.010, -0.012, 0.000, -0.000, 0.020, -0.000],
+                [0.010, -0.000, 0.000, -0.025, 0.000, -0.030],
+                [0.000, -0.012, 0.006, -0.000, 0.020, -0.000],
+                [-0.012, -0.014, -0.008, -0.030, 0.030, -0.040],
+                [-0.012, -0.014, -0.008, -0.030, 0.030, -0.040],
+                [-0.012, -0.014, -0.008, -0.030, 0.030, -0.040],
+                [-0.012, -0.014, -0.008, -0.030, 0.030, -0.040],
+                [-0.012, -0.014, -0.008, -0.030, 0.030, -0.040],
+                [-0.012, -0.014, -0.008, -0.030, 0.030, -0.040],
+                [-0.012, -0.014, -0.008, -0.030, 0.030, -0.040],
+                [-0.012, -0.014, -0.008, -0.030, 0.030, -0.040],
+                [-0.012, -0.014, -0.008, -0.030, 0.030, -0.040],
+                [-0.012, -0.014, -0.008, -0.030, 0.030, -0.040],
+                [0.012, 0.018, 0.010, 0.030, -0.020, 0.035],
+                [-0.012, -0.018, 0.000, -0.030, 0.020, -0.035],
+                [0.010, 0.015, -0.010, 0.025, 0.000, 0.030],
+                [-0.010, -0.015, 0.000, -0.025, 0.000, -0.030],
+                [0.015, -0.020, 0.012, 0.020, 0.025, -0.025],
+                [-0.015, 0.020, 0.000, -0.020, -0.025, 0.025],
+                [0.008, 0.014, -0.012, 0.015, -0.015, 0.020],
+                [-0.008, -0.014, 0.000, -0.015, 0.015, -0.020],
+                [0.012, 0.018, 0.010, 0.010, 0.020, 0.015],
+                [-0.012, -0.018, -0.010, -0.010, -0.020, -0.015],
+                [0.008, 0.000, -0.006, 0.000, -0.018, 0.000],
+                [0.000, 0.010, -0.000, 0.010, -0.000, 0.000],
+                [0.008, 0.000, -0.000, 0.000, -0.018, 0.000],
+                [0.000, 0.010, -0.006, 0.000, -0.000, 0.000],
+                [0.008, 0.000, -0.000, 0.010, -0.000, 0.000],
+                [0.000, 0.010, -0.000, 0.000, -0.018, 0.000],
+                [0.008, 0.000, -0.006, 0.000, -0.000, 0.000],
+                [0.000, 0.010, -0.000, 0.010, -0.018, 0.000],
+                [0.008, 0.000, -0.000, 0.000, -0.000, 0.000],
+                [0.000, 0.010, -0.006, 0.000, -0.000, 0.000],
+            ],
+            dtype=np.float64,
+        )
+        block6 *= float(scale)
+
+        actions: list[np.ndarray] = []
+        rotation_scale = float(max_rotation_step) / 6.0
+        for delta in block6:
+            action = np.zeros(ACTION_DIM, dtype=np.float64)
+            action[:3] = delta[:3] / float(max_translation_step)
+            action[3:6] = delta[3:6] / rotation_scale
+            action[6] = -1.0
+            actions.append(action)
+
+        for _ in range(int(POLICY_HZ)):
+            action = np.zeros(ACTION_DIM, dtype=np.float64)
+            action[6] = -1.0
+            actions.append(action)
+        return actions
+
+    @property
+    def done(self) -> bool:
+        return self._cursor >= len(self._actions)
+
+    @property
+    def duration(self) -> float:
+        return len(self._actions) / POLICY_HZ
+
+    def next_block(self) -> np.ndarray:
+        if self.done:
+            return np.zeros((BLOCK_SIZE, ACTION_DIM), dtype=np.float64)
+        remaining = self._actions[self._cursor : self._cursor + BLOCK_SIZE]
+        self._cursor += 1
+        if len(remaining) < BLOCK_SIZE:
+            padding = [np.zeros(ACTION_DIM, dtype=np.float64) for _ in range(BLOCK_SIZE - len(remaining))]
+            remaining = remaining + padding
+        return np.vstack(remaining)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--ip", default="172.16.0.2", help="Robot IP address")
+    parser.add_argument("--controller", choices=CONTROLLER_CHOICES, default="min_jerk")
+    parser.add_argument("--log-dir", type=pathlib.Path, default=ROOT / "log" / "runs")
+    parser.add_argument("--max-translation-step", type=float, default=0.1)
+    parser.add_argument("--max-rotation-step", type=float, default=math.pi / 4.0)
+    parser.add_argument("--scale", type=float, default=1.0)
+    parser.add_argument("--reset-duration", type=float, default=5.0)
+    parser.add_argument("--no-home-first", action="store_true")
+    parser.add_argument("--yes", action="store_true", help="Skip interactive safety prompts")
+    args = parser.parse_args()
+
+    run_paths = create_run_paths(args.log_dir, args.controller)
+    recorder = TraceRecorder(controller_name=args.controller)
+    source = TimedActionBlockSource(
+        max_translation_step=args.max_translation_step,
+        max_rotation_step=args.max_rotation_step,
+        scale=args.scale,
+    )
+    env = FrankaEnv(
+        robot_ip=args.ip,
+        reset_duration=args.reset_duration,
+        max_translation_step=args.max_translation_step,
+        max_rotation_step=args.max_rotation_step,
+    )
+
+    print("WARNING: This script will run a 6s action sequence on the robot.")
+    print("First 5s: mixed motion. Last 1s: zero motion.")
+    print(f"Controller: {args.controller}, scale: {args.scale}")
+    print(f"Run directory: {run_paths.run_dir}")
+    if not args.yes:
+        input("Press Enter to continue...")
+
+    try:
+        if not args.no_home_first:
+            print("Resetting robot to home pose...")
+            env.reset()
+            if not args.yes:
+                input("Reset complete. Press Enter to start torque control...")
+
+        while not source.done:
+            env.enqueue_action_block(source.next_block())
+
+        env.run_action_loop(
+            max_duration=source.duration + 0.2,
+            print_events=True,
+            controller_name=args.controller,
+            trace_callback=recorder.append_sample,
+        )
+    finally:
+        env.stop()
+
+    recorder.write_trace_csv(run_paths.trace_csv)
+    recorder.write_metadata_json(
+        run_paths.metadata_json,
+        {
+            "controller": args.controller,
+            "max_translation_step": float(args.max_translation_step),
+            "max_rotation_step": float(args.max_rotation_step),
+            "scale": float(args.scale),
+            "reset_duration": float(args.reset_duration),
+            "sample_count": len(recorder.rows),
+            "trajectory_files": {
+                "pose_tracks_csv": run_paths.trace_csv.name,
+                "summary_json": run_paths.summary_json.name,
+                "plot_svg": run_paths.plot_svg.name,
+            },
+        },
+    )
+    summary = analyze_trace_csv(run_paths.trace_csv)
+    write_summary_json(run_paths.summary_json, summary)
+    write_plot_svg(run_paths.trace_csv, run_paths.plot_svg)
+
+    print(f"Saved pose tracks: {run_paths.trace_csv}")
+    print(f"Saved metadata: {run_paths.metadata_json}")
+    print(f"Saved summary: {run_paths.summary_json}")
+    print(f"Saved plot: {run_paths.plot_svg}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

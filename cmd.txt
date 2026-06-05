@@ -1,0 +1,28 @@
+cd /home/k324/franka_my_code/franka_control
+source .venv/bin/activate
+pip install -e .
+
+python tests/test_env_logic.py
+python examples/no_robot_env_smoke_test.py
+python examples/keyboard_no_robot_smoke_test.py
+python examples/ps4_no_robot_smoke_test.py
+python examples/real_robot_env_smoke_test.py
+python examples/teleop_keyboard.py
+python examples/keyboard_cartesian_pose_official.py
+python examples/cartesian_pose_key.py
+python examples/cartesian_pose_origin.py
+python examples/action_block_first_only_x.py --execute --ip 172.16.0.2
+python examples/pylibfranka/cartesian_pose_example.py
+python examples/pylibfranka/joint_impedance_example.py
+python examples/pylibfranka/async_position_control.py
+python scripts/action_block_first_only_env.py 
+python scripts/key_control.py --ip 172.16.0.2
+python scripts/key_control.py --input-device ps4 --joystick-index 0 --controller linear
+python scripts/timed_action_block_log.py --controller min_jerk 
+python scripts/timed_action_block_log.py --controller linear --scale 1
+python scripts/timed_action_block_log.py --controller cubic
+motion_limited
+python scripts/example_trajectory_record_and_analyze.py --controller motion_limited --scale 1
+
+
+
