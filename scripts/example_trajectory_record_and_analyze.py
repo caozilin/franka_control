@@ -5,6 +5,7 @@ import argparse
 import math
 import pathlib
 import sys
+import time
 
 import numpy as np
 
@@ -17,9 +18,10 @@ from recording import TraceRecorder, create_run_paths  # noqa: E402
 from utils import POLICY_HZ  # noqa: E402
 
 
+
 ACTION_DIM = 7
 BLOCK_SIZE = 60
-CONTROLLER_CHOICES = ("min_jerk", "linear", "cubic", "motion_limited")
+CONTROLLER_CHOICES = ("min_jerk", "linear", "cubic")
 
 
 class TimedActionBlockSource:
@@ -133,9 +135,17 @@ def main() -> int:
     parser.add_argument("--max-rotation-step", type=float, default=math.pi / 4.0)
     parser.add_argument("--scale", type=float, default=1.0)
     parser.add_argument("--reset-duration", type=float, default=5.0)
+    parser.add_argument("--settle", type=float, default=4.0)
     parser.add_argument("--no-home-first", action="store_true")
+    parser.add_argument("--no-robot", action="store_true", help="Run the trajectory/logging path without connecting to the robot")
     parser.add_argument("--yes", action="store_true", help="Skip interactive safety prompts")
     args = parser.parse_args()
+
+    print("WARNING: This script will run a scaled 10Hz action sequence on the robot.")
+    print("First 5s: mixed motion. Last 1s: zero motion. C++ may continue settling after the last action.")
+    print(f"Controller: {args.controller}, scale: {args.scale}")
+    if not args.yes:
+        input("Press Enter to continue...")
 
     run_paths = create_run_paths(args.log_dir, args.controller)
     recorder = TraceRecorder(controller_name=args.controller)
@@ -149,14 +159,10 @@ def main() -> int:
         reset_duration=args.reset_duration,
         max_translation_step=args.max_translation_step,
         max_rotation_step=args.max_rotation_step,
+        controller_name=args.controller,
+        no_robot=args.no_robot,
     )
-
-    print("WARNING: This script will run a 6s action sequence on the robot.")
-    print("First 5s: mixed motion. Last 1s: zero motion.")
-    print(f"Controller: {args.controller}, scale: {args.scale}")
     print(f"Run directory: {run_paths.run_dir}")
-    if not args.yes:
-        input("Press Enter to continue...")
 
     try:
         if not args.no_home_first:
@@ -165,15 +171,31 @@ def main() -> int:
             if not args.yes:
                 input("Reset complete. Press Enter to start torque control...")
 
-        while not source.done:
-            env.enqueue_action_block(source.next_block())
+        tick = 0
+        first_block = source.next_block()
+        env.enqueue_action_block(first_block)
+        tick += 1
+        print(f"10Hz tick {tick:03d}  (first block enqueued)")
 
-        env.run_action_loop(
-            max_duration=source.duration + 0.2,
-            print_events=True,
-            controller_name=args.controller,
-            trace_callback=recorder.append_sample,
-        )
+        env.start_control_loop(max_duration=source.duration + float(args.settle))
+        next_time = time.monotonic()
+        while not source.done:
+            next_time += 1.0 / POLICY_HZ
+            sleep_time = next_time - time.monotonic()
+            if sleep_time > 0.0:
+                time.sleep(sleep_time)
+            block = source.next_block()
+            env.enqueue_action_block(block)
+            tick += 1
+            first_action = block[0]
+            action_mm = first_action[:3] * float(args.max_translation_step) * 1000.0
+            print(f"10Hz tick {tick:03d}  dxyz_mm=[{action_mm[0]:+.1f},{action_mm[1]:+.1f},{action_mm[2]:+.1f}]  "
+                  f"drot=[{first_action[3]:+.3f},{first_action[4]:+.3f},{first_action[5]:+.3f}]")
+
+        print("Waiting for C++ backend to finish settling...")
+        env.wait_control_loop()
+        print("Saving 1kHz trace from C++ ring buffer...")
+        env.save_trace_to_recorder(recorder, controller_name=args.controller)
     finally:
         env.stop()
 

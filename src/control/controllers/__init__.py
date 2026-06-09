@@ -1,11 +1,8 @@
-from .cubic import CubicController
-from .linear import LinearController
-from .min_jerk import MinJerkController
-from .motion_limited import MotionLimitedPoseController
+"""Legacy Python controller implementations.
 
-__all__ = [
-    "CubicController",
-    "LinearController",
-    "MinJerkController",
-    "MotionLimitedPoseController",
-]
+Runtime robot control now uses the C++ controllers under ``src/control/cpp``.
+These Python modules are kept only as historical reference code and are not part
+of the public runtime control API.
+"""
+
+__all__: list[str] = []

@@ -1,27 +1,26 @@
 from __future__ import annotations
 
-import time
+import pathlib
+import sys
 
-from franka_control import FrankaEnv, TeleopController
+import numpy as np
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+
+from control.franka_env import FrankaEnv  # noqa: E402
 
 
 def main() -> int:
-    env = FrankaEnv(no_robot=True, no_cameras=True)
-    teleop = TeleopController(env=env, input_device="ps4")
-
-    print("PS4 no-robot smoke test")
-    print("Use OPTIONS to exit, or Ctrl-C in terminal")
-
-    teleop.start(home_first=False)
+    env = FrankaEnv(no_robot=True, no_cameras=True, controller_name="cubic")
     try:
-        while teleop.running:
-            state, action = teleop.get_state_and_action()
-            print("state:", state, "action:", action)
-            time.sleep(1.0)
-    except KeyboardInterrupt:
-        pass
+        print("PS4 no-robot smoke: enqueueing a zero action")
+        env.enqueue_action_block(np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0], dtype=np.float64))
+        env.start_control_loop(max_duration=0.2)
+        env.wait_control_loop()
+        print("state:", env.get_robot_state_vector())
     finally:
-        teleop.stop()
+        env.stop()
     return 0
 
 

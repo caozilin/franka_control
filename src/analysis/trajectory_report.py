@@ -164,8 +164,12 @@ def write_summary_json(path: Path, summary: dict) -> None:
         output_file.write("\n")
 
 
-def write_plot_svg(trace_csv: Path, svg_path: Path) -> None:
+def write_plot_svg(trace_csv: Path, svg_path: Path, *, max_points: int = 2000) -> None:
     rows = _reconstruct_continuous_rows(_load_rows(trace_csv))
+    # Downsample for SVG: keep at most max_points evenly spaced rows
+    if len(rows) > max_points:
+        step = max(1, len(rows) // max_points)
+        rows = rows[::step]
     svg_path.parent.mkdir(parents=True, exist_ok=True)
     if not rows:
         empty_svg = '<svg xmlns="http://www.w3.org/2000/svg" width="900" height="80"><text x="20" y="45">no samples</text></svg>\n'

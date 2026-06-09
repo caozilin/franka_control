@@ -43,7 +43,6 @@ dependencies = [
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.10.*'" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "pygame" },
-    { name = "pylibfranka" },
     { name = "pynput" },
 ]
 
@@ -57,7 +56,6 @@ dev = [
 requires-dist = [
     { name = "numpy", specifier = ">=1.19.0" },
     { name = "pygame", specifier = ">=2.0" },
-    { name = "pylibfranka", specifier = ">=0.18.0" },
     { name = "pynput", specifier = ">=1.8.2" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0" },
 ]
@@ -340,23 +338,6 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/c3/b2/bc9c9196916376152d655522fdcebac55e66de6603a76a02bca1b6414f6c/pygments-2.20.0.tar.gz", hash = "sha256:6757cd03768053ff99f3039c1a36d6c0aa0b263438fcab17520b30a303a82b5f", size = 4955991, upload-time = "2026-03-29T13:29:33.898Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/f4/7e/a72dd26f3b0f4f2bf1dd8923c85f7ceb43172af56d63c7383eb62b332364/pygments-2.20.0-py3-none-any.whl", hash = "sha256:81a9e26dd42fd28a23a2d169d86d7ac03b46e2f8b59ed4698fb4785f946d0176", size = 1231151, upload-time = "2026-03-29T13:29:30.038Z" },
-]
-
-[[package]]
-name = "pylibfranka"
-version = "0.21.2"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "numpy", version = "2.0.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
-    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.10.*'" },
-    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/4f/05/9a5c83923ea7f71ed84b1e3f8de825ce76fdc6949c38796d90b750c4c4f8/pylibfranka-0.21.2.tar.gz", hash = "sha256:806881f08258636cd890f3722d923621fe7e5454f4a980ef7bd51d7a4a7cfabf", size = 16223, upload-time = "2026-05-04T11:59:00.021Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/af/34/a69d40f093dd2e4701e391c922edbbdf1284281836d51e7bf9d6002ab1a4/pylibfranka-0.21.2-cp310-cp310-manylinux_2_34_x86_64.whl", hash = "sha256:a308f87e5873f77b2a12884c9fe374aa7b219a2e3fa29e04ddd617225cda9073", size = 4167541, upload-time = "2026-05-04T11:58:51.738Z" },
-    { url = "https://files.pythonhosted.org/packages/a4/ad/9ab7bd929d9c1ec4ebe54267a3ed4fbe1a5878ac9a941baf3bd7c99f7c92/pylibfranka-0.21.2-cp311-cp311-manylinux_2_34_x86_64.whl", hash = "sha256:e3824043aad56f0b7d42acc5d2064621323d442200b4a8eddeb4f4bad18d4ac8", size = 4169378, upload-time = "2026-05-04T11:58:53.839Z" },
-    { url = "https://files.pythonhosted.org/packages/16/f6/824d85b6fdaa7ae0a90d8f754eed788c1c70871d961bc8cde16c46514c94/pylibfranka-0.21.2-cp312-cp312-manylinux_2_34_x86_64.whl", hash = "sha256:841bcac90305fa3411659168718c67ba79c5e3677715fa87cc21ecd0f02c727f", size = 4172926, upload-time = "2026-05-04T11:58:56.532Z" },
-    { url = "https://files.pythonhosted.org/packages/89/be/689c83af79eee736380c46792ea57fdca75d94b849cbbd1a49456404e4ad/pylibfranka-0.21.2-cp39-cp39-manylinux_2_31_x86_64.whl", hash = "sha256:6fcb23396ba6f4500517f02ded405e534b79a022223375faa958aab9b37c8227", size = 4406562, upload-time = "2026-05-04T11:58:58.287Z" },
 ]
 
 [[package]]

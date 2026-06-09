@@ -1,44 +1,33 @@
 from __future__ import annotations
 
 import argparse
-import time
+import math
+import pathlib
+import sys
 
-from franka_control import FrankaEnv, TeleopController
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+
+from data_collection.key_control import KeyboardController  # noqa: E402
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="Keyboard teleoperation through FrankaEnv and the C++ backend.")
     parser.add_argument("--ip", default="172.16.0.2")
-    parser.add_argument("--home-first", action="store_true")
-    parser.add_argument("--rotation-frame", choices=["eef", "base"], default="eef")
+    parser.add_argument("--no-home-first", action="store_true")
+    parser.add_argument("--max-translation-step", type=float, default=0.1)
+    parser.add_argument("--max-rotation-step", type=float, default=math.pi / 4.0)
+    parser.add_argument("--controller", choices=("min_jerk", "linear", "cubic"), default="linear")
     args = parser.parse_args()
 
-    env = FrankaEnv(robot_ip=args.ip)
-    teleop = TeleopController(
-        env=env,
+    controller = KeyboardController(
+        robot_ip=args.ip,
         input_device="keyboard",
-        rotation_input_frame=args.rotation_frame,
+        max_translation_step=args.max_translation_step,
+        max_rotation_step=args.max_rotation_step,
+        controller_name=args.controller,
     )
-    listener = teleop.create_keyboard_listener()
-
-    print("keyboard robot teleop")
-    print("W/S:X  A/D:Y  I/K:Z  Q/E:Roll  U/O:Pitch  J/L:Yaw")
-    print(f"rotation frame: {args.rotation_frame}")
-    print("G/H: gripper  +/-: speed  R: reset home  ESC: exit")
-    print("keep the user stop button available before enabling motion")
-
-    teleop.start(home_first=args.home_first)
-    listener.start()
-    try:
-        while teleop.running:
-            state, action = teleop.get_state_and_action()
-            print("state:", state, "action:", action)
-            time.sleep(1.0)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        listener.stop()
-        teleop.stop()
+    controller.run(home_first=not args.no_home_first)
     return 0
 
 

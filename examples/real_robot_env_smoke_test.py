@@ -1,27 +1,25 @@
 from __future__ import annotations
 
 import argparse
-import time
+import pathlib
+import sys
 
-from franka_control import FrankaEnv
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+
+from control.franka_env import FrankaEnv, ROBOT_IP  # noqa: E402
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--ip", default="172.16.0.2")
+    parser = argparse.ArgumentParser(description="Connect to the robot and read the current end-effector state.")
+    parser.add_argument("--ip", default=ROBOT_IP)
     args = parser.parse_args()
 
     env = FrankaEnv(robot_ip=args.ip)
-    env.start_readonly()
     try:
         print("state:", env.get_robot_state_vector())
-        print("joints:", env.get_joint_state_vector())
-        obs, _, _ = env.get_observation("test")
-        print("observation/state shape:", obs["observation/state"].shape)
-        print("observation/image shape:", obs["observation/image"].shape)
-        time.sleep(0.5)
     finally:
-        env.stop_control()
+        env.stop()
     return 0
 
 

@@ -79,6 +79,7 @@ class KeyboardController:
             reset_duration=reset_duration,
             max_translation_step=max_translation_step,
             max_rotation_step=max_rotation_step,
+            controller_name=controller_name,
         )
         self.max_translation_step = float(max_translation_step)
         self.max_rotation_step = float(max_rotation_step)
@@ -121,7 +122,11 @@ class KeyboardController:
     def _reset_env(self):
         print("  [复位] 回到初始位姿...")
         self.gripper_target = 0.08
-        self.env.reset()
+        try:
+            self.env.reset()
+        except Exception:
+            print("  [复位] 失败")
+            raise
         print("  [复位] 完成")
 
     def stop(self):
@@ -403,12 +408,26 @@ class KeyboardController:
         )
 
 
-    def _input_loop(self) -> None:
+    def _input_loop(self):
+        tick = 0
         next_time = time.monotonic()
         while self.running:
             action = self._build_action()
             with self._action_lock:
                 self._latest_action = action
+            try:
+                self.env.enqueue_action_block(action)
+            except Exception as exc:
+                print(f"  [输入] action 入队失败: {exc}", flush=True)
+                self.running = False
+                self.env.request_stop()
+                break
+            tick += 1
+            dx, dy, dz = action[0], action[1], action[2]
+            drx, dry, drz = action[3], action[4], action[5]
+            gripper = "open" if action[6] > 0 else "close"
+            print(f"10Hz tick {tick:04d}  dxyz=[{dx:+.3f},{dy:+.3f},{dz:+.3f}]  "
+                  f"drot=[{drx:+.3f},{dry:+.3f},{drz:+.3f}]  gripper={gripper}")
             next_time += INPUT_DT
             sleep_time = next_time - time.monotonic()
             if sleep_time > 0.0:
@@ -454,12 +473,12 @@ class KeyboardController:
                 listener.start()
             self._start_input_thread()
             while self.running:
-                self.env.run_action_loop(
+                self.env.start_control_loop(
                     max_duration=None,
                     print_events=True,
-                    action_source=self._get_latest_action,
                     controller_name=self.controller_name,
                 )
+                self.env.wait_control_loop()
                 if not self._reset_requested:
                     break
                 self._reset_requested = False

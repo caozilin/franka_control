@@ -21,7 +21,7 @@ def main() -> int:
     parser.add_argument("--max-translation-step", type=float, default=0.1)
     parser.add_argument("--max-rotation-step", type=float, default=math.pi / 4.0)
     parser.add_argument("--reset-duration", type=float, default=5.0)
-    parser.add_argument("--controller", choices=("min_jerk", "linear", "cubic", "motion_limited"), default="linear")
+    parser.add_argument("--controller", choices=("min_jerk", "linear", "cubic"), default="linear")
     args = parser.parse_args()
 
     controller = KeyboardController(
