@@ -71,14 +71,28 @@ class Args:
     no_robot: bool = False
     no_cameras: bool = False
     use_gripper: bool = True
+    save_recording: bool = False
     control_hz: float = 10.0
-    controller_name: str = "min_jerk"
+    reference_name: str = "min_jerk"
+    nullspace_enabled: bool = False
+    nullspace_q_target: tuple[float, float, float, float, float, float, float] | None = None
+    nullspace_stiffness: float = 10.0
+    nullspace_damping: float = 2.0
+    nullspace_pinv: str = "plain"
+    nullspace_projector: str = "kinematic"
+    nullspace_lambda: float = 0.05
     step_warn_ms: float = 20.0
 
     def __post_init__(self) -> None:
         self.policy_type = self.policy_type.lower().strip()
         if self.policy_type not in {"openpi", "cosmos"}:
             raise ValueError("policy_type must be 'openpi' or 'cosmos'")
+        self.nullspace_pinv = self.nullspace_pinv.lower().strip()
+        if self.nullspace_pinv not in {"plain", "damped"}:
+            raise ValueError("nullspace_pinv must be 'plain' or 'damped'")
+        self.nullspace_projector = self.nullspace_projector.lower().strip()
+        if self.nullspace_projector not in {"kinematic", "dynamic"}:
+            raise ValueError("nullspace_projector must be 'kinematic' or 'dynamic'")
         if self.replan_steps is None:
             self.replan_steps = 16 if self.policy_type == "cosmos" else 5
 
@@ -144,6 +158,15 @@ class Coordinator:
             no_robot=args.no_robot,
             no_cameras=args.no_cameras,
             use_gripper=args.use_gripper,
+            save_recording=args.save_recording,
+            reference_name=args.reference_name,
+            nullspace_enabled=args.nullspace_enabled,
+            nullspace_q_target=None if args.nullspace_q_target is None else np.asarray(args.nullspace_q_target, dtype=np.float64),
+            nullspace_stiffness=args.nullspace_stiffness,
+            nullspace_damping=args.nullspace_damping,
+            nullspace_pinv=args.nullspace_pinv,
+            nullspace_projector=args.nullspace_projector,
+            nullspace_lambda=args.nullspace_lambda,
         )
         self._control_timing_profiler: RealtimeTimingProfiler | None = None
         self._connect_client()
@@ -440,7 +463,7 @@ class Coordinator:
             self._control_timing_profiler = RealtimeTimingProfiler(capacity=12000)
             self._env.start_control(
                 home_first=True,
-                controller_name=self._args.controller_name,
+                reference_name=self._args.reference_name,
                 timing_profiler=self._control_timing_profiler,
             )
             return
@@ -588,7 +611,7 @@ class Coordinator:
             control_status = self._env.get_control_status()
             entry = {
                 "timestamp": round(time.time() - self._record_start_time, 3),
-                "controller_state": self.state.value,
+                "reference_generator_state": self.state.value,
                 "prompt": prompt,
                 "state": self._latest_state,
                 "joint_state": self._latest_joints,
@@ -619,7 +642,7 @@ class Coordinator:
             future_primary = self._latest_future_primary
             control_status = self._env.get_control_status()
             payload = {
-                "controller_state": self.state.value,
+                "reference_generator_state": self.state.value,
                 "recording": recording,
                 "prompt": prompt,
                 "log_subdir": self.log_subdir,
@@ -732,7 +755,7 @@ def build_app(coordinator: Coordinator) -> FastAPI:
         with coordinator._telemetry_lock:
             control_status = coordinator._env.get_control_status()
             data = {
-                "controller_state": coordinator.state.value,
+                "reference_generator_state": coordinator.state.value,
                 "recording": coordinator._recording,
                 "prompt": coordinator._prompt,
                 "log_subdir": coordinator.log_subdir,

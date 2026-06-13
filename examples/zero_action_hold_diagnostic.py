@@ -4,6 +4,8 @@ import argparse
 import pathlib
 import sys
 
+import numpy as np
+
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -11,21 +13,42 @@ sys.path.insert(0, str(ROOT / "src"))
 from control.franka_env import FrankaEnv, ROBOT_IP  # noqa: E402
 
 
+def parse_joint_vector(value: str) -> np.ndarray:
+    parts = [float(part.strip()) for part in value.split(",") if part.strip()]
+    if len(parts) != 7:
+        raise argparse.ArgumentTypeError("--nullspace-q-target must contain 7 comma-separated joint values")
+    return np.asarray(parts, dtype=np.float64)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run a minimal zero-action Franka torque-control hold.")
     parser.add_argument("--ip", default=ROBOT_IP)
     parser.add_argument("--duration", type=float, default=6.0)
-    parser.add_argument("--controller", default="min_jerk", choices=("min_jerk", "linear", "cubic"))
+    parser.add_argument("--reference", default="min_jerk", choices=("min_jerk", "linear", "cubic", "motion_limited"))
     parser.add_argument("--no-home-first", action="store_true")
     parser.add_argument("--with-cameras", action="store_true")
     parser.add_argument("--with-gripper", action="store_true")
+    parser.add_argument("--nullspace-enabled", action="store_true")
+    parser.add_argument("--nullspace-pinv", choices=("plain", "damped"), default="plain")
+    parser.add_argument("--nullspace-projector", choices=("kinematic", "dynamic"), default="kinematic")
+    parser.add_argument("--nullspace-lambda", type=float, default=0.05)
+    parser.add_argument("--nullspace-stiffness", type=float, default=10.0)
+    parser.add_argument("--nullspace-damping", type=float, default=2.0)
+    parser.add_argument("--nullspace-q-target", type=parse_joint_vector, default=None)
     args = parser.parse_args()
 
     env = FrankaEnv(
         robot_ip=args.ip,
         no_cameras=not args.with_cameras,
         use_gripper=args.with_gripper,
-        controller_name=args.controller,
+        reference_name=args.reference,
+        nullspace_enabled=args.nullspace_enabled,
+        nullspace_q_target=args.nullspace_q_target,
+        nullspace_stiffness=args.nullspace_stiffness,
+        nullspace_damping=args.nullspace_damping,
+        nullspace_pinv=args.nullspace_pinv,
+        nullspace_projector=args.nullspace_projector,
+        nullspace_lambda=args.nullspace_lambda,
     )
     run_error = None
     try:
@@ -34,13 +57,13 @@ def main() -> int:
             env.reset()
         print(
             f"Starting zero-action hold: duration={args.duration:.3f}s "
-            f"controller={args.controller} cameras={args.with_cameras} gripper={args.with_gripper}",
+            f"reference={args.reference} cameras={args.with_cameras} gripper={args.with_gripper}",
             flush=True,
         )
         env.run_action_loop(
             max_duration=args.duration,
             print_events=False,
-            controller_name=args.controller,
+            reference_name=args.reference,
         )
         print("Zero-action hold finished without control exception.", flush=True)
     except Exception as exc:

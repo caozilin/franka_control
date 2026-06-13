@@ -14,6 +14,13 @@ sys.path.insert(0, str(ROOT / "src"))
 from control.franka_env import FrankaEnv  # noqa: E402
 
 
+def parse_joint_vector(value: str) -> np.ndarray:
+    parts = [float(part.strip()) for part in value.split(",") if part.strip()]
+    if len(parts) != 7:
+        raise argparse.ArgumentTypeError("--nullspace-q-target must contain 7 comma-separated joint values")
+    return np.asarray(parts, dtype=np.float64)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Move Franka +X 30 cm via FrankaEnv 10Hz actions and C++ minjerk backend.")
     parser.add_argument("--ip", default="172.16.0.2")
@@ -22,6 +29,13 @@ def main() -> int:
     parser.add_argument("--settle", type=float, default=3.0)
     parser.add_argument("--yes", action="store_true")
     parser.add_argument("--connect-only", action="store_true", help="Construct FrankaEnv and exit without starting control.")
+    parser.add_argument("--nullspace-enabled", action="store_true")
+    parser.add_argument("--nullspace-pinv", choices=("plain", "damped"), default="plain")
+    parser.add_argument("--nullspace-projector", choices=("kinematic", "dynamic"), default="kinematic")
+    parser.add_argument("--nullspace-lambda", type=float, default=0.05)
+    parser.add_argument("--nullspace-stiffness", type=float, default=10.0)
+    parser.add_argument("--nullspace-damping", type=float, default=2.0)
+    parser.add_argument("--nullspace-q-target", type=parse_joint_vector, default=None)
     args = parser.parse_args()
 
     ticks = int(round(args.distance / args.step))
@@ -32,7 +46,18 @@ def main() -> int:
         input("Press Enter to start...")
 
     print("[stage] constructing FrankaEnv", flush=True)
-    env = FrankaEnv(robot_ip=args.ip, max_translation_step=args.step, no_robot=False)
+    env = FrankaEnv(
+        robot_ip=args.ip,
+        max_translation_step=args.step,
+        no_robot=False,
+        nullspace_enabled=args.nullspace_enabled,
+        nullspace_q_target=args.nullspace_q_target,
+        nullspace_stiffness=args.nullspace_stiffness,
+        nullspace_damping=args.nullspace_damping,
+        nullspace_pinv=args.nullspace_pinv,
+        nullspace_projector=args.nullspace_projector,
+        nullspace_lambda=args.nullspace_lambda,
+    )
     print("[stage] FrankaEnv constructed", flush=True)
     if args.connect_only:
         env.stop()

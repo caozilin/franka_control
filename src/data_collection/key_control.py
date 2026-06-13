@@ -66,7 +66,15 @@ class KeyboardController:
         max_translation_step: float = 0.1,
         max_rotation_step: float = math.pi / 4.0,
         reset_duration: float = 5.0,
-        controller_name: str = "linear",
+        reference_name: str = "linear",
+        save_recording: bool = False,
+        nullspace_enabled: bool = False,
+        nullspace_q_target: np.ndarray | None = None,
+        nullspace_stiffness: float = 10.0,
+        nullspace_damping: float = 2.0,
+        nullspace_pinv: str = "plain",
+        nullspace_projector: str = "kinematic",
+        nullspace_lambda: float = 0.05,
     ):
         if input_device not in ("keyboard", "ps4"):
             raise ValueError(f"不支持的输入设备: {input_device}")
@@ -79,11 +87,20 @@ class KeyboardController:
             reset_duration=reset_duration,
             max_translation_step=max_translation_step,
             max_rotation_step=max_rotation_step,
-            controller_name=controller_name,
+            reference_name=reference_name,
+            save_recording=save_recording,
+            log_subdir="teleop",
+            nullspace_enabled=nullspace_enabled,
+            nullspace_q_target=nullspace_q_target,
+            nullspace_stiffness=nullspace_stiffness,
+            nullspace_damping=nullspace_damping,
+            nullspace_pinv=nullspace_pinv,
+            nullspace_projector=nullspace_projector,
+            nullspace_lambda=nullspace_lambda,
         )
         self.max_translation_step = float(max_translation_step)
         self.max_rotation_step = float(max_rotation_step)
-        self.controller_name = str(controller_name)
+        self.reference_name = str(reference_name)
 
         self.gripper_target = 0.08
         self.step_size = 1.0
@@ -409,7 +426,6 @@ class KeyboardController:
 
 
     def _input_loop(self):
-        tick = 0
         next_time = time.monotonic()
         while self.running:
             action = self._build_action()
@@ -422,12 +438,6 @@ class KeyboardController:
                 self.running = False
                 self.env.request_stop()
                 break
-            tick += 1
-            dx, dy, dz = action[0], action[1], action[2]
-            drx, dry, drz = action[3], action[4], action[5]
-            gripper = "open" if action[6] > 0 else "close"
-            print(f"10Hz tick {tick:04d}  dxyz=[{dx:+.3f},{dy:+.3f},{dz:+.3f}]  "
-                  f"drot=[{drx:+.3f},{dry:+.3f},{drz:+.3f}]  gripper={gripper}")
             next_time += INPUT_DT
             sleep_time = next_time - time.monotonic()
             if sleep_time > 0.0:
@@ -476,7 +486,7 @@ class KeyboardController:
                 self.env.start_control_loop(
                     max_duration=None,
                     print_events=True,
-                    controller_name=self.controller_name,
+                    reference_name=self.reference_name,
                 )
                 self.env.wait_control_loop()
                 if not self._reset_requested:

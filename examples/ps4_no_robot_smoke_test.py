@@ -12,7 +12,7 @@ from control.franka_env import FrankaEnv  # noqa: E402
 
 
 def main() -> int:
-    env = FrankaEnv(no_robot=True, no_cameras=True, controller_name="cubic")
+    env = FrankaEnv(no_robot=True, no_cameras=True, reference_name="cubic")
     try:
         print("PS4 no-robot smoke: enqueueing a zero action")
         env.enqueue_action_block(np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0], dtype=np.float64))

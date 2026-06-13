@@ -2,11 +2,11 @@
 
 #include <algorithm>
 
-#include "controllers/controller_base.hpp"
+#include "reference/reference_base.hpp"
 
 namespace franka_control::cpp {
 
-class MinJerkController final : public ReferenceController {
+class MinJerkReferenceGenerator final : public ReferenceGenerator {
  public:
   const char* name() const override { return "min_jerk"; }
 

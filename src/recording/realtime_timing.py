@@ -47,6 +47,21 @@ class RealtimeTimingProfiler:
         self.count = 0
         self.dropped = 0
 
+    @classmethod
+    def from_cpp_array(cls, timing: np.ndarray, fields: tuple[str, ...] = TIMING_FIELDS) -> "RealtimeTimingProfiler":
+        timing = np.asarray(timing, dtype=np.float64)
+        if timing.ndim != 2:
+            raise ValueError(f"timing array must be 2D; got shape {timing.shape}")
+        if timing.shape[1] != 3 + len(fields):
+            raise ValueError(f"timing array must have {3 + len(fields)} columns; got {timing.shape[1]}")
+        profiler = cls(capacity=max(1, timing.shape[0]), fields=fields)
+        profiler.count = int(timing.shape[0])
+        if profiler.count:
+            profiler.elapsed[: profiler.count] = timing[:, 1]
+            profiler.robot_dt[: profiler.count] = timing[:, 2]
+            profiler.data[: profiler.count, :] = timing[:, 3:]
+        return profiler
+
     def now(self) -> float:
         return time.perf_counter()
 

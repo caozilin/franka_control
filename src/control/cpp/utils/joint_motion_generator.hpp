@@ -145,4 +145,35 @@ class JointMotionGenerator {
   Vector7d ddq_max_goal_ = (Vector7d() << 5, 5, 5, 5, 5, 5, 5).finished();
 };
 
+class DurationJointMotionGenerator {
+ public:
+  DurationJointMotionGenerator(double duration, const std::array<double, 7>& q_goal)
+      : duration_(std::max(duration, 1e-3)), q_goal_(q_goal.data()) {}
+
+  franka::JointPositions operator()(const franka::RobotState& robot_state, franka::Duration period) {
+    if (!initialized_) {
+      q_start_ = Vector7d(robot_state.q_d.data());
+      if (!q_start_.allFinite()) q_start_ = Vector7d(robot_state.q.data());
+      delta_q_ = q_goal_ - q_start_;
+      initialized_ = true;
+    }
+    time_ += period.toSec();
+    const double alpha = std::clamp(time_ / duration_, 0.0, 1.0);
+    const double weight = 10.0 * std::pow(alpha, 3.0) - 15.0 * std::pow(alpha, 4.0) + 6.0 * std::pow(alpha, 5.0);
+    std::array<double, 7> joint_positions;
+    Eigen::Map<Vector7d>(joint_positions.data()) = q_start_ + weight * delta_q_;
+    franka::JointPositions output(joint_positions);
+    output.motion_finished = alpha >= 1.0;
+    return output;
+  }
+
+ private:
+  double duration_;
+  Vector7d q_goal_;
+  Vector7d q_start_{Vector7d::Zero()};
+  Vector7d delta_q_{Vector7d::Zero()};
+  double time_ = 0.0;
+  bool initialized_ = false;
+};
+
 }  // namespace franka_control::cpp

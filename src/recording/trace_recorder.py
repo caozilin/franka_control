@@ -76,14 +76,14 @@ def _align_rotvec_to_reference(
 
 @dataclass
 class TraceRecorder:
-    controller_name: str
+    reference_name: str
     rows: list[dict[str, float]] = field(default_factory=list)
     _previous_rotvec_by_series: dict[str, np.ndarray] = field(default_factory=dict)
 
     def append_sample(self, sample: dict) -> None:
         row: dict[str, float] = {
             "time": float(sample["time"]),
-            "controller": sample["controller"],
+            "reference": sample["reference"],
         }
         previous_rotvecs = {label: value.copy() for label, value in self._previous_rotvec_by_series.items()}
         values_by_series: dict[str, np.ndarray] = {}
@@ -109,7 +109,7 @@ class TraceRecorder:
         self.rows.append(row)
 
     def write_trace_csv(self, path: Path) -> None:
-        fieldnames = ["time", "controller"]
+        fieldnames = ["time", "reference"]
         for series_name in SERIES:
             fieldnames.extend(f"{series_name}_{axis_name}" for axis_name in AXES)
 

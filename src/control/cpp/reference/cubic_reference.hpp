@@ -2,11 +2,11 @@
 
 #include <algorithm>
 
-#include "controllers/controller_base.hpp"
+#include "reference/reference_base.hpp"
 
 namespace franka_control::cpp {
 
-class CubicController final : public ReferenceController {
+class CubicReferenceGenerator final : public ReferenceGenerator {
  public:
   const char* name() const override { return "cubic"; }
 

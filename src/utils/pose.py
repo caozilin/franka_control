@@ -105,9 +105,10 @@ def pose_error(
     desired_pose: np.ndarray,
     previous_rotvec: np.ndarray | None = None,
 ) -> np.ndarray:
+    del previous_rotvec
     current = pose_array_to_matrix(current_pose)
     desired = pose_array_to_matrix(desired_pose)
     error = np.zeros(6, dtype=np.float64)
     error[:3] = current[:3, 3] - desired[:3, 3]
-    error[3:] = matrix_to_rotvec_continuous(current[:3, :3] @ desired[:3, :3].T, previous_rotvec)
+    error[3:] = matrix_to_rotvec(current[:3, :3] @ desired[:3, :3].T)
     return error

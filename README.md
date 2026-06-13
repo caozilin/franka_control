@@ -1,14 +1,12 @@
 # franka_control
 
-Python high-level Franka control interface with an in-process C++ realtime backend.
+基于进程内 C++ 实时后端的 Python 高级 Franka 控制接口。
 
-The Python layer runs policy/input updates at 10Hz and sends actions into a pybind11
-extension. The C++ backend owns the libfranka connection and realtime control loop;
-the control loop does not call back into Python.
+Python 层以 10Hz 运行策略/输入更新，并通过 pybind11 扩展发送动作。C++ 后端拥有 libfranka 连接和实时控制回路；控制回路不回调 Python。
 
-## Python Environment
+## Python 环境
 
-Recommended: use `uv` and one dedicated virtual environment for this project.
+推荐使用 `uv` 为本项目创建专用虚拟环境。
 
 ```bash
 cd /home/k324/franka_my_code/franka_control
@@ -18,7 +16,7 @@ $HOME/.local/bin/uv pip install -U pip setuptools wheel pybind11 cmake
 $HOME/.local/bin/uv pip install -e .
 ```
 
-Build the C++ extension after building libfranka 0.21.2:
+构建 libfranka 0.21.2 后构建 C++ 扩展：
 
 ```bash
 cd /home/k324/franka_my_code/franka_control
@@ -29,44 +27,36 @@ cmake -S . -B build -DPYTHON_EXECUTABLE="$PWD/.venv/bin/python"
 cmake --build build -j2
 ```
 
-## Minimal Robot Check
+## 最小机器人验证
 
-The shortest current robot validation moves the end effector in base-frame +X by
-30cm. It uses `FrankaEnv`; Python sends one action every 0.1s, and C++ emits the
-1kHz Cartesian impedance torque command stream. Supported C++ reference profiles
-are `min_jerk`, `linear`, and `cubic`.
+最简单的机器人验证是将末端执行器沿基坐标系 +X 方向移动 30cm。它使用 `FrankaEnv`；Python 每 0.1s 发送一个动作，C++ 以 1kHz 的频率输出笛卡尔阻抗力矩指令流。支持 C++ 参考轨迹类型包括 `min_jerk`、`linear`、`cubic` 和 `motion_limited`。
 
 ```bash
 .venv/bin/python examples/move_forward_30cm.py --ip 172.16.0.2
 ```
 
-Use connect-only mode to verify the C++ extension can connect without starting
-motion:
+使用仅连接模式验证 C++ 扩展可以连接但不启动运动：
 
 ```bash
 .venv/bin/python examples/move_forward_30cm.py --ip 172.16.0.2 --yes --connect-only
 ```
 
-Keep the user stop button available before running active motion.
+在运行主动运动前，请确保用户急停按钮可用。
 
-## 6s Trajectory Reproduction
+## 6秒轨迹复现
 
-This reproduces the 60-tick, 10Hz trajectory through the same `FrankaEnv` and C++
-backend path. `--scale` scales the Cartesian translation and rotation deltas before
-they are converted to normalized actions.
+通过相同的 `FrankaEnv` 和 C++ 后端路径复现 60 拍、10Hz 的轨迹。`--scale` 用于缩放笛卡尔平移和旋转增量，然后再转换为归一化动作。
 
 ```bash
-.venv/bin/python scripts/example_trajectory_record_and_analyze.py --ip 172.16.0.2 --controller linear --scale 1.0
+.venv/bin/python scripts/example_trajectory_record_and_analyze.py --ip 172.16.0.2 --reference linear --scale 1.0
 ```
 
-Dry-run the Python/logging path without connecting to the robot:
+不连接机器人地试运行 Python/日志路径：
 
 ```bash
 .venv/bin/python scripts/example_trajectory_record_and_analyze.py --no-robot --yes --scale 1.0 --settle 0.2
 ```
 
-Use `--controller min_jerk`, `--controller linear`, or `--controller cubic` to
-select the C++ realtime reference profile.
+使用 `--reference min_jerk`、`--reference linear`、`--reference cubic` 或 `--reference motion_limited` 来选择 C++ 实时参考轨迹。要使 nullspace 中仅 J2 趋近于 0，请使用 `--nullspace-enabled --nullspace-q-target "nan,0,nan,nan,nan,nan,nan"`；`nan` 表示该关节没有姿态参考。
 
-By default, robot scripts call C++ joint-position reset first. Use
-`--no-home-first` only when you explicitly want to start from the current pose.
+默认情况下，机器人脚本首先调用 C++ 关节位置复位。只有在明确希望从当前位置开始时才使用 `--no-home-first`。

@@ -21,7 +21,21 @@ from utils import POLICY_HZ  # noqa: E402
 
 ACTION_DIM = 7
 BLOCK_SIZE = 60
-CONTROLLER_CHOICES = ("min_jerk", "linear", "cubic")
+REFERENCE_CHOICES = ("min_jerk", "linear", "cubic", "motion_limited")
+
+
+def parse_joint_vector(value: str) -> np.ndarray:
+    parts = [float(part.strip()) for part in value.split(",") if part.strip()]
+    if len(parts) != 7:
+        raise argparse.ArgumentTypeError("--nullspace-q-target must contain 7 comma-separated joint values")
+    return np.asarray(parts, dtype=np.float64)
+
+
+def timed_step(label, func):
+    start = time.time()
+    result = func()
+    print(f"  [save] {label} in {time.time() - start:.3f}s")
+    return result
 
 
 class TimedActionBlockSource:
@@ -129,8 +143,8 @@ class TimedActionBlockSource:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--ip", default="172.16.0.2", help="Robot IP address")
-    parser.add_argument("--controller", choices=CONTROLLER_CHOICES, default="min_jerk")
-    parser.add_argument("--log-dir", type=pathlib.Path, default=ROOT / "log" / "runs")
+    parser.add_argument("--reference", choices=REFERENCE_CHOICES, default="min_jerk")
+    parser.add_argument("--log-dir", type=pathlib.Path, default=ROOT / "logs" / "runs")
     parser.add_argument("--max-translation-step", type=float, default=0.1)
     parser.add_argument("--max-rotation-step", type=float, default=math.pi / 4.0)
     parser.add_argument("--scale", type=float, default=1.0)
@@ -139,16 +153,23 @@ def main() -> int:
     parser.add_argument("--no-home-first", action="store_true")
     parser.add_argument("--no-robot", action="store_true", help="Run the trajectory/logging path without connecting to the robot")
     parser.add_argument("--yes", action="store_true", help="Skip interactive safety prompts")
+    parser.add_argument("--nullspace-enabled", action="store_true")
+    parser.add_argument("--nullspace-pinv", choices=("plain", "damped"), default="plain")
+    parser.add_argument("--nullspace-projector", choices=("kinematic", "dynamic"), default="kinematic")
+    parser.add_argument("--nullspace-lambda", type=float, default=0.05)
+    parser.add_argument("--nullspace-stiffness", type=float, default=10.0)
+    parser.add_argument("--nullspace-damping", type=float, default=2.0)
+    parser.add_argument("--nullspace-q-target", type=parse_joint_vector, default=None)
     args = parser.parse_args()
 
     print("WARNING: This script will run a scaled 10Hz action sequence on the robot.")
     print("First 5s: mixed motion. Last 1s: zero motion. C++ may continue settling after the last action.")
-    print(f"Controller: {args.controller}, scale: {args.scale}")
+    print(f"Reference: {args.reference}, scale: {args.scale}")
     if not args.yes:
         input("Press Enter to continue...")
 
-    run_paths = create_run_paths(args.log_dir, args.controller)
-    recorder = TraceRecorder(controller_name=args.controller)
+    run_paths = create_run_paths(args.log_dir, args.reference)
+    recorder = TraceRecorder(reference_name=args.reference)
     source = TimedActionBlockSource(
         max_translation_step=args.max_translation_step,
         max_rotation_step=args.max_rotation_step,
@@ -159,8 +180,16 @@ def main() -> int:
         reset_duration=args.reset_duration,
         max_translation_step=args.max_translation_step,
         max_rotation_step=args.max_rotation_step,
-        controller_name=args.controller,
+        reference_name=args.reference,
         no_robot=args.no_robot,
+        auto_record=False,
+        nullspace_enabled=args.nullspace_enabled,
+        nullspace_q_target=args.nullspace_q_target,
+        nullspace_stiffness=args.nullspace_stiffness,
+        nullspace_damping=args.nullspace_damping,
+        nullspace_pinv=args.nullspace_pinv,
+        nullspace_projector=args.nullspace_projector,
+        nullspace_lambda=args.nullspace_lambda,
     )
     print(f"Run directory: {run_paths.run_dir}")
 
@@ -195,32 +224,38 @@ def main() -> int:
         print("Waiting for C++ backend to finish settling...")
         env.wait_control_loop()
         print("Saving 1kHz trace from C++ ring buffer...")
-        env.save_trace_to_recorder(recorder, controller_name=args.controller)
+        timed_step("trace rows", lambda: env.save_trace_to_recorder(recorder, reference_name=args.reference))
+        timed_step("timing csv", lambda: env.save_timing_csv(run_paths.timing_csv))
     finally:
         env.stop()
 
-    recorder.write_trace_csv(run_paths.trace_csv)
-    recorder.write_metadata_json(
-        run_paths.metadata_json,
-        {
-            "controller": args.controller,
-            "max_translation_step": float(args.max_translation_step),
-            "max_rotation_step": float(args.max_rotation_step),
-            "scale": float(args.scale),
-            "reset_duration": float(args.reset_duration),
-            "sample_count": len(recorder.rows),
-            "trajectory_files": {
-                "pose_tracks_csv": run_paths.trace_csv.name,
-                "summary_json": run_paths.summary_json.name,
-                "plot_svg": run_paths.plot_svg.name,
+    timed_step("trace csv", lambda: recorder.write_trace_csv(run_paths.trace_csv))
+    timed_step(
+        "metadata json",
+        lambda: recorder.write_metadata_json(
+            run_paths.metadata_json,
+            {
+                "reference": args.reference,
+                "max_translation_step": float(args.max_translation_step),
+                "max_rotation_step": float(args.max_rotation_step),
+                "scale": float(args.scale),
+                "reset_duration": float(args.reset_duration),
+                "sample_count": len(recorder.rows),
+                "trajectory_files": {
+                    "pose_tracks_csv": run_paths.trace_csv.name,
+                    "timing_csv": run_paths.timing_csv.name,
+                    "summary_json": run_paths.summary_json.name,
+                    "plot_svg": run_paths.plot_svg.name,
+                },
             },
-        },
+        ),
     )
-    summary = analyze_trace_csv(run_paths.trace_csv)
-    write_summary_json(run_paths.summary_json, summary)
-    write_plot_svg(run_paths.trace_csv, run_paths.plot_svg)
+    summary = timed_step("analyze trace", lambda: analyze_trace_csv(run_paths.trace_csv))
+    timed_step("summary json", lambda: write_summary_json(run_paths.summary_json, summary))
+    timed_step("plot svg", lambda: write_plot_svg(run_paths.trace_csv, run_paths.plot_svg))
 
     print(f"Saved pose tracks: {run_paths.trace_csv}")
+    print(f"Saved timing: {run_paths.timing_csv}")
     print(f"Saved metadata: {run_paths.metadata_json}")
     print(f"Saved summary: {run_paths.summary_json}")
     print(f"Saved plot: {run_paths.plot_svg}")

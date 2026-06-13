@@ -8,7 +8,6 @@ from pathlib import Path
 import numpy as np
 
 from recording.trace_recorder import AXES, SERIES
-from utils.pose import matrix_to_rotvec, rotvec_to_matrix
 
 
 SERIES_COLORS = {"goal": "#d62728", "ref": "#2ca02c", "actual": "#1f77b4"}
@@ -20,120 +19,29 @@ def _load_rows(trace_csv: Path) -> list[dict[str, str]]:
         return list(reader)
 
 
-def _raw_row_to_pose_values(raw_row: dict[str, str], series_name: str) -> np.ndarray:
-    values = np.array([float(raw_row[f"{series_name}_{axis_name}"]) for axis_name in AXES], dtype=np.float64)
-    rotation = rotvec_to_matrix(values[3:6])
-    values[3:6] = matrix_to_rotvec(rotation)
-    return values
+def _select_evenly_spaced_rows(raw_rows: list[dict[str, str]], max_points: int) -> list[dict[str, str]]:
+    if max_points <= 0 or len(raw_rows) <= max_points:
+        return raw_rows
+    indices = np.linspace(0, len(raw_rows) - 1, num=max_points, dtype=np.int64)
+    return [raw_rows[int(index)] for index in np.unique(indices)]
 
 
-def _enumerate_rotvec_candidates(rotvec: np.ndarray, previous_rotvec: np.ndarray | None = None) -> list[np.ndarray]:
-    rotvec = np.asarray(rotvec, dtype=np.float64)
-    angle = float(np.linalg.norm(rotvec))
-    if angle < 1e-12:
-        if previous_rotvec is None:
-            return [rotvec.copy()]
-        previous_rotvec = np.asarray(previous_rotvec, dtype=np.float64)
-        previous_norm = float(np.linalg.norm(previous_rotvec))
-        if previous_norm < 1e-12:
-            return [np.zeros(3, dtype=np.float64)]
-        axis = previous_rotvec / previous_norm
-        center = int(round(previous_norm / (2.0 * np.pi)))
-        candidates = [2.0 * np.pi * k * axis for k in range(center - 2, center + 3)]
-        candidates.append(np.zeros(3, dtype=np.float64))
-    else:
-        axis = rotvec / angle
-        if abs(angle - np.pi) < 1e-4 and previous_rotvec is not None:
-            previous_rotvec = np.asarray(previous_rotvec, dtype=np.float64)
-            previous_norm = float(np.linalg.norm(previous_rotvec))
-            if previous_norm >= 1e-12 and float(np.dot(axis, previous_rotvec / previous_norm)) < 0.0:
-                axis = -axis
-                rotvec = -rotvec
-        if previous_rotvec is None:
-            projected_previous = 0.0
-        else:
-            projected_previous = float(np.dot(np.asarray(previous_rotvec, dtype=np.float64), axis))
-        center = int(round((projected_previous - angle) / (2.0 * np.pi)))
-        candidates = [rotvec + 2.0 * np.pi * k * axis for k in range(center - 2, center + 3)]
-
-    unique_candidates: list[np.ndarray] = []
-    for candidate in candidates:
-        if any(np.allclose(candidate, existing, atol=1e-9, rtol=0.0) for existing in unique_candidates):
-            continue
-        unique_candidates.append(np.asarray(candidate, dtype=np.float64).copy())
-    return unique_candidates
-
-
-def _jointly_align_rotvecs(
-    values_by_series: dict[str, np.ndarray],
-    previous_rotvecs: dict[str, np.ndarray],
-) -> dict[str, np.ndarray]:
-    candidate_sets = {
-        series_name: _enumerate_rotvec_candidates(values_by_series[series_name][3:6], previous_rotvecs.get(series_name))
-        for series_name in SERIES
-    }
-
-    best_cost = float("inf")
-    best_rotvecs: dict[str, np.ndarray] | None = None
-    for goal_candidate in candidate_sets["goal"]:
-        for ref_candidate in candidate_sets["ref"]:
-            for actual_candidate in candidate_sets["actual"]:
-                continuity_cost = 0.0
-                for series_name, candidate in (("goal", goal_candidate), ("ref", ref_candidate), ("actual", actual_candidate)):
-                    previous = previous_rotvecs.get(series_name)
-                    if previous is not None:
-                        continuity_cost += float(np.sum(np.square(candidate - previous)))
-
-                consistency_cost = (
-                    float(np.sum(np.square(ref_candidate - goal_candidate)))
-                    + float(np.sum(np.square(actual_candidate - ref_candidate)))
-                    + 0.5 * float(np.sum(np.square(actual_candidate - goal_candidate)))
-                )
-                norm_cost = 1e-6 * (
-                    float(np.sum(np.square(goal_candidate)))
-                    + float(np.sum(np.square(ref_candidate)))
-                    + float(np.sum(np.square(actual_candidate)))
-                )
-                cost = continuity_cost + 0.7 * consistency_cost + norm_cost
-                if cost < best_cost:
-                    best_cost = cost
-                    best_rotvecs = {
-                        "goal": goal_candidate.copy(),
-                        "ref": ref_candidate.copy(),
-                        "actual": actual_candidate.copy(),
-                    }
-
-    assert best_rotvecs is not None
-    aligned_values = {series_name: values.copy() for series_name, values in values_by_series.items()}
-    for series_name in SERIES:
-        aligned_values[series_name][3:6] = best_rotvecs[series_name]
-    return aligned_values
-
-
-def _reconstruct_continuous_rows(raw_rows: list[dict[str, str]]) -> list[dict[str, float | str]]:
-    previous_rotvecs: dict[str, np.ndarray] = {}
-    reconstructed_rows: list[dict[str, float | str]] = []
+def _parse_continuous_rows(raw_rows: list[dict[str, str]]) -> list[dict[str, float | str]]:
+    rows: list[dict[str, float | str]] = []
     for raw_row in raw_rows:
-        values_by_series = {
-            series_name: _raw_row_to_pose_values(raw_row, series_name)
-            for series_name in SERIES
-        }
-        values_by_series = _jointly_align_rotvecs(values_by_series, previous_rotvecs)
-
-        reconstructed_row: dict[str, float | str] = {
+        row: dict[str, float | str] = {
             "time": float(raw_row["time"]),
-            "controller": raw_row["controller"],
+            "reference": raw_row.get("reference", ""),
         }
         for series_name in SERIES:
-            previous_rotvecs[series_name] = values_by_series[series_name][3:6].copy()
-            for axis_name, value in zip(AXES, values_by_series[series_name]):
-                reconstructed_row[f"{series_name}_{axis_name}"] = float(value)
-        reconstructed_rows.append(reconstructed_row)
-    return reconstructed_rows
+            for axis_name in AXES:
+                row[f"{series_name}_{axis_name}"] = float(raw_row[f"{series_name}_{axis_name}"])
+        rows.append(row)
+    return rows
 
 
 def analyze_trace_csv(trace_csv: Path) -> dict:
-    rows = _reconstruct_continuous_rows(_load_rows(trace_csv))
+    rows = _parse_continuous_rows(_load_rows(trace_csv))
     if not rows:
         return {"sample_count": 0, "duration_sec": 0.0, "axes": {}}
 
@@ -165,11 +73,8 @@ def write_summary_json(path: Path, summary: dict) -> None:
 
 
 def write_plot_svg(trace_csv: Path, svg_path: Path, *, max_points: int = 2000) -> None:
-    rows = _reconstruct_continuous_rows(_load_rows(trace_csv))
-    # Downsample for SVG: keep at most max_points evenly spaced rows
-    if len(rows) > max_points:
-        step = max(1, len(rows) // max_points)
-        rows = rows[::step]
+    raw_rows = _select_evenly_spaced_rows(_load_rows(trace_csv), max_points)
+    rows = _parse_continuous_rows(raw_rows)
     svg_path.parent.mkdir(parents=True, exist_ok=True)
     if not rows:
         empty_svg = '<svg xmlns="http://www.w3.org/2000/svg" width="900" height="80"><text x="20" y="45">no samples</text></svg>\n'

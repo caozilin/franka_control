@@ -34,12 +34,12 @@ def test_transform_action_matches_current_scaling() -> None:
 
 def test_trace_recorder_and_analysis_roundtrip(tmp_path: pathlib.Path) -> None:
     run_paths = create_run_paths(tmp_path, "min_jerk")
-    recorder = TraceRecorder(controller_name="min_jerk")
+    recorder = TraceRecorder(reference_name="min_jerk")
 
     recorder.append_sample(
         {
             "time": 0.0,
-            "controller": "min_jerk",
+            "reference": "min_jerk",
             "goal_pose": _pose_array(0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
             "ref_pose": _pose_array(0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
             "actual_pose": _pose_array(0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
@@ -48,7 +48,7 @@ def test_trace_recorder_and_analysis_roundtrip(tmp_path: pathlib.Path) -> None:
     recorder.append_sample(
         {
             "time": 0.001,
-            "controller": "min_jerk",
+            "reference": "min_jerk",
             "goal_pose": _pose_array(0.01, 0.0, 0.0, 0.0, 0.0, 0.1),
             "ref_pose": _pose_array(0.01, 0.0, 0.0, 0.0, 0.0, 0.1),
             "actual_pose": _pose_array(0.009, 0.0, 0.0, 0.0, 0.0, 0.08),

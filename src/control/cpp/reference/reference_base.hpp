@@ -13,13 +13,13 @@ struct ReferenceWeights {
   double velocity;
 };
 
-class ReferenceController {
+class ReferenceGenerator {
  public:
-  virtual ~ReferenceController() = default;
+  virtual ~ReferenceGenerator() = default;
   virtual const char* name() const = 0;
   virtual ReferenceWeights weights(double raw_alpha) const = 0;
 };
 
-std::shared_ptr<ReferenceController> makeReferenceController(const std::string& name);
+std::shared_ptr<ReferenceGenerator> makeReferenceGenerator(const std::string& name);
 
 }  // namespace franka_control::cpp

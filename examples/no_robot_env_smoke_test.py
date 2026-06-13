@@ -12,7 +12,7 @@ from control.franka_env import FrankaEnv  # noqa: E402
 
 
 def main() -> int:
-    env = FrankaEnv(no_robot=True, no_cameras=True, controller_name="linear")
+    env = FrankaEnv(no_robot=True, no_cameras=True, reference_name="linear")
     try:
         print("initial state:", env.get_robot_state_vector())
         env.enqueue_action_block(np.array([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0], dtype=np.float64))
