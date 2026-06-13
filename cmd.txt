@@ -22,7 +22,7 @@ python scripts/key_control.py --reference motion_limited --save-recording
 python scripts/key_control.py --reference motion_limited --nullspace-enabled \
 --nullspace-pinv plain \
 --nullspace-projector kinematic \
---nullspace-stiffness 10.0 \
---nullspace-damping 2.0 \
---nullspace-q-target "0.8,0,nan,nan,nan,nan,nan"
+--nullspace-stiffness 20.0 \
+--nullspace-damping 5.0 \
+--nullspace-q-target "nan,nan,0.5,nan,nan,nan,nan"
 

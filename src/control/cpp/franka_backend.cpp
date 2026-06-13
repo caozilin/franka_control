@@ -411,6 +411,12 @@ class RealtimeFrankaBackend {
     *segment_delta_rotvec = matrixToRotvecContinuous(
         segment_target_pose->block<3, 3>(0, 0) * segment_start_pose->block<3, 3>(0, 0).transpose(), *last_segment_rotvec);
     *last_segment_rotvec = *segment_delta_rotvec;
+
+    // Clamp position delta to max linear velocity per control period
+    *segment_delta_translation = clampNorm(*segment_delta_translation, kMaxRefLinearVelocity * kPolicyPeriod);
+    // Clamp rotation delta to max angular velocity per control period
+    *segment_delta_rotvec = clampNorm(*segment_delta_rotvec, kMaxRefAngularVelocity * kPolicyPeriod);
+
     segment_start_time_ = elapsed;
     if (timing != nullptr) timing->fields[kControllerUpdateGoal] += secondsSince(start);
   }

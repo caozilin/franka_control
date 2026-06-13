@@ -32,10 +32,11 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from control.franka_env import FrankaEnv  # noqa: E402
+from utils.pose import matrix_to_rotvec, rotvec_to_matrix  # noqa: E402
 
 
 INPUT_DT = 0.1
-MAX_LIN_VEL = 0.1
+MAX_LIN_VEL = 0.2
 MAX_ROT_VEL = math.pi / 4.0
 MAX_DELTA_POS = MAX_LIN_VEL * INPUT_DT
 MAX_DELTA_ROT = MAX_ROT_VEL * INPUT_DT
@@ -56,6 +57,18 @@ PS4_BUTTON_SQUARE = 3
 PS4_BUTTON_L1 = 4
 PS4_BUTTON_R1 = 5
 PS4_BUTTON_OPTIONS = 9
+
+
+def end_effector_rotation_to_backend_rotation(current_rotation: np.ndarray, rotvec_ee: np.ndarray) -> np.ndarray:
+    current_rotation = np.asarray(current_rotation, dtype=np.float64).reshape(3, 3)
+    rotvec_ee = np.asarray(rotvec_ee, dtype=np.float64)
+    if float(np.linalg.norm(rotvec_ee)) < 1e-12:
+        return np.zeros(3, dtype=np.float64)
+    delta_rotation_ee = rotvec_to_matrix(rotvec_ee)
+    delta_rotation_base = current_rotation @ delta_rotation_ee @ current_rotation.T
+    return matrix_to_rotvec(delta_rotation_base)
+
+
 class KeyboardController:
     def __init__(
         self,
@@ -372,8 +385,8 @@ class KeyboardController:
         dy = (int("d" in keys) - int("a" in keys)) * MAX_DELTA_POS * speed
         dz = (int("i" in keys) - int("k" in keys)) * MAX_DELTA_POS * speed
         droll = (int("q" in keys) - int("e" in keys)) * MAX_DELTA_ROT * speed
-        dpitch = (int("u" in keys) - int("o" in keys)) * MAX_DELTA_ROT * speed
-        dyaw = (int("l" in keys) - int("j" in keys)) * MAX_DELTA_ROT * speed
+        dpitch = (int("o" in keys) - int("u" in keys)) * MAX_DELTA_ROT * speed
+        dyaw = (int("j" in keys) - int("l" in keys)) * MAX_DELTA_ROT * speed
         return dx, dy, dz, droll, dpitch, dyaw
 
     def _get_ps4_delta(self) -> tuple[float, float, float, float, float, float]:
@@ -400,8 +413,8 @@ class KeyboardController:
         dy = left_x * MAX_DELTA_POS * speed
         dz = -right_y * MAX_DELTA_POS * speed
         droll = (l1 - r1) * MAX_DELTA_ROT * speed
-        dpitch = (l2 - r2) * MAX_DELTA_ROT * speed
-        dyaw = right_x * MAX_DELTA_ROT * speed
+        dpitch = (r2 - l2) * MAX_DELTA_ROT * speed
+        dyaw = -right_x * MAX_DELTA_ROT * speed
         return dx, dy, dz, droll, dpitch, dyaw
 
     def _get_input_delta(self) -> tuple[float, float, float, float, float, float]:
@@ -409,16 +422,29 @@ class KeyboardController:
             return self._get_ps4_delta()
         return self._get_keyboard_delta()
 
+    def _current_rotation_matrix(self) -> np.ndarray:
+        try:
+            state = self.env.get_robot_state_vector()
+            return rotvec_to_matrix(state[3:6])
+        except Exception:
+            return np.eye(3, dtype=np.float64)
+
+    def _end_effector_rotation_to_backend_rotation(self, rotvec_ee: np.ndarray) -> np.ndarray:
+        return end_effector_rotation_to_backend_rotation(self._current_rotation_matrix(), rotvec_ee)
+
     def _build_action(self) -> np.ndarray:
         dx, dy, dz, droll, dpitch, dyaw = self._get_input_delta()
+        drx, dry, drz = self._end_effector_rotation_to_backend_rotation(
+            np.array([droll, dpitch, dyaw], dtype=np.float64)
+        )
         return np.array(
             [
                 dx / self.max_translation_step,
                 dy / self.max_translation_step,
                 dz / self.max_translation_step,
-                droll / self.max_rotation_step * 6.0,
-                dpitch / self.max_rotation_step * 6.0,
-                dyaw / self.max_rotation_step * 6.0,
+                drx / self.max_rotation_step * 6.0,
+                dry / self.max_rotation_step * 6.0,
+                drz / self.max_rotation_step * 6.0,
                 1.0 if self.gripper_target <= 0.0 else -1.0,
             ],
             dtype=np.float64,
