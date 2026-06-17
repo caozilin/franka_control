@@ -24,8 +24,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Keyboard teleoperation through FrankaEnv and the C++ backend.")
     parser.add_argument("--ip", default="172.16.0.2")
     parser.add_argument("--no-home-first", action="store_true")
-    parser.add_argument("--max-translation-step", type=float, default=0.1)
-    parser.add_argument("--max-rotation-step", type=float, default=math.pi / 4.0)
+    parser.add_argument("--max-translation-velocity", "--max-translation-step", dest="max_translation_velocity", type=float, default=0.1)
+    parser.add_argument("--max-rotation-velocity", "--max-rotation-step", dest="max_rotation_velocity", type=float, default=math.pi / 4.0)
     parser.add_argument("--reference", choices=("min_jerk", "linear", "cubic", "motion_limited"), default="linear")
     parser.add_argument("--nullspace-enabled", action="store_true")
     parser.add_argument("--nullspace-pinv", choices=("plain", "damped"), default="plain")
@@ -39,8 +39,8 @@ def main() -> int:
     reference = KeyboardController(
         robot_ip=args.ip,
         input_device="keyboard",
-        max_translation_step=args.max_translation_step,
-        max_rotation_step=args.max_rotation_step,
+        max_translation_velocity=args.max_translation_velocity,
+        max_rotation_velocity=args.max_rotation_velocity,
         reference_name=args.reference,
         nullspace_enabled=args.nullspace_enabled,
         nullspace_q_target=args.nullspace_q_target,

@@ -7,6 +7,14 @@ dependencies = [
     "numpy>=1.19.0",
     "pygame>=2.0",
     "pynput>=1.8.2",
+    "imageio[ffmpeg]>=2.0",
+    "tyro>=0.1.0",
+    "fastapi>=0.100",
+    "uvicorn>=0.20",
+    "websockets>=10.0",
+    "msgpack-numpy>=0.4",
+    "opencv-python>=4.0",
+    "pyrealsense2>=2.0",
 ]
 
 [project.optional-dependencies]

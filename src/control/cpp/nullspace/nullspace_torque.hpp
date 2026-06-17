@@ -28,6 +28,7 @@ struct NullspaceConfig {
   double stiffness{10.0};
   double damping{2.0};
   std::array<double, 7> q_target{};
+  std::array<double, 6> task_constraint_mask{{1.0, 1.0, 1.0, 1.0, 1.0, 1.0}};
 };
 
 inline PseudoInverseMode parsePseudoInverseMode(const std::string& mode) {
@@ -78,19 +79,41 @@ inline Matrix6d pseudoInverseMatrix6(const Matrix6d& matrix, const NullspaceConf
   return svd.matrixV() * sigma_pinv * svd.matrixU().transpose();
 }
 
+inline Matrix67d maskTaskJacobian(const Matrix67d& jacobian, const NullspaceConfig& config) {
+  Matrix67d masked = jacobian;
+  for (Eigen::Index row = 0; row < 6; ++row) {
+    if (config.task_constraint_mask[static_cast<size_t>(row)] <= 0.5) {
+      masked.row(row).setZero();
+    }
+  }
+  return masked;
+}
+
+inline Vector6d maskTaskVector(const Vector6d& value, const NullspaceConfig& config) {
+  Vector6d masked = value;
+  for (Eigen::Index row = 0; row < 6; ++row) {
+    if (config.task_constraint_mask[static_cast<size_t>(row)] <= 0.5) {
+      masked(row) = 0.0;
+    }
+  }
+  return masked;
+}
+
 inline Matrix7d computeKinematicNullspaceProjector(const Matrix67d& jacobian, const NullspaceConfig& config) {
-  const Matrix76d j_pinv = pseudoInverseJacobian(jacobian, config);
-  return Matrix7d::Identity() - j_pinv * jacobian;
+  const Matrix67d task_jacobian = maskTaskJacobian(jacobian, config);
+  const Matrix76d j_pinv = pseudoInverseJacobian(task_jacobian, config);
+  return Matrix7d::Identity() - j_pinv * task_jacobian;
 }
 
 inline Matrix7d computeDynamicNullspaceProjector(const Matrix67d& jacobian,
                                                  const Matrix7d& mass,
                                                  const NullspaceConfig& config) {
+  const Matrix67d task_jacobian = maskTaskJacobian(jacobian, config);
   const Matrix7d mass_inv = mass.inverse();
-  const Matrix6d lambda_inv = jacobian * mass_inv * jacobian.transpose();
+  const Matrix6d lambda_inv = task_jacobian * mass_inv * task_jacobian.transpose();
   const Matrix6d inv = pseudoInverseMatrix6(lambda_inv, config);
-  const Matrix76d j_bar = mass_inv * jacobian.transpose() * inv;
-  return Matrix7d::Identity() - jacobian.transpose() * j_bar.transpose();
+  const Matrix76d j_bar = mass_inv * task_jacobian.transpose() * inv;
+  return Matrix7d::Identity() - task_jacobian.transpose() * j_bar.transpose();
 }
 
 inline Vector7d computeNullspaceTorque(const Matrix67d& jacobian,

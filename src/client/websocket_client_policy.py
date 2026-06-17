@@ -6,11 +6,11 @@ from typing import Dict, Optional, Tuple
 from typing_extensions import override
 import websockets.sync.client
 
-import base_policy as _base_policy
-import msgpack_numpy
+from client.base_policy import BasePolicy as _BasePolicy
+from client import msgpack_numpy
 
 
-class WebsocketClientPolicy(_base_policy.BasePolicy):
+class WebsocketClientPolicy(_BasePolicy):
     """Implements the Policy interface by communicating with a server over websocket.
     / 通过 WebSocket 与服务器通信实现策略接口。
 

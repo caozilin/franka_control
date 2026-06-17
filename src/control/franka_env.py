@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import math
-import multiprocessing as mp
 import pathlib
 import queue
 import threading
@@ -9,26 +8,170 @@ import time
 
 import numpy as np
 
-from utils.control import ActionConfig, GRIPPER_WIDTH_MAX, transform_action
+from client import image_tools
+from utils.control import ActionConfig, GRIPPER_WIDTH_MAX, POLICY_HZ, transform_action
+from utils.pose import matrix_to_rotvec, matrix_to_rotvec_continuous, rotvec_to_matrix
+
+try:
+    import pyrealsense2 as rs
+    HAS_REALSENSE = True
+except ImportError:
+    rs = None
+    HAS_REALSENSE = False
 
 ROBOT_IP = "172.16.0.2"
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
-DEFAULT_CAM1_SERIAL: str | None = None
-DEFAULT_CAM2_SERIAL: str | None = None
+DEFAULT_CAM1_SERIAL: str | None = "346222072769"
+DEFAULT_CAM2_SERIAL: str | None = "938422075745"
 REFERENCE_CHOICES = ("min_jerk", "linear", "cubic", "motion_limited")
 NULLSPACE_PINV_CHOICES = ("plain", "damped")
 NULLSPACE_PROJECTOR_CHOICES = ("kinematic", "dynamic")
 CONTROL_MODE_CHOICES = ("cartesian", "joint")
+DEFAULT_MAX_TRANSLATION_VELOCITY = 0.2
+DEFAULT_MAX_ROTATION_VELOCITY = math.pi / 4.0
+DEFAULT_MAX_TRANSLATION_GOAL_ERROR = 0.3
+DEFAULT_MAX_ROTATION_GOAL_ERROR = math.pi / 6.0
+DEFAULT_MOTION_LIMITED_VELOCITY_SCALE = 1.2
+DEFAULT_MOTION_LIMITED_ACCELERATION_SCALE = 5.0
+DEFAULT_MAX_TORQUE_RATE = 1000.0
 
 DEFAULT_HOME_Q = np.array(
     [0.0, -math.pi / 4.0, 0.0, -3.0 * math.pi / 4.0, 0.0, math.pi / 2.0, math.pi / 4.0],
     dtype=np.float64,
 )
-DEFAULT_STIFFNESS = np.diag([600.0, 600.0, 600.0, 50.0, 50.0, 50.0]).astype(np.float64)
+DEFAULT_STIFFNESS = np.diag([600.0, 600.0, 600.0, 25.0, 25.0, 25.0]).astype(np.float64)
 DEFAULT_DAMPING = np.diag([2.0 * math.sqrt(DEFAULT_STIFFNESS[i, i]) for i in range(6)]).astype(np.float64)
 GRIPPER_SPEED = 0.08
 GRIPPER_FORCE = 60.0
-GRIPPER_CONNECT_TIMEOUT = 3.0
+GRIPPER_CONNECT_TIMEOUT = 8.0
+GRIPPER_STATE_POLL_PERIOD = 1.0 / POLICY_HZ
+CAMERA_WIDTH = 640
+CAMERA_HEIGHT = 480
+CAMERA_FPS = 15
+D435_START_RETRIES = 5
+D435_START_RETRY_DELAY = 0.5
+OBS_IMAGE_SIZE = 224
+
+
+class D435Camera:
+    def __init__(
+        self,
+        serial_number: str | None = None,
+        width: int = CAMERA_WIDTH,
+        height: int = CAMERA_HEIGHT,
+        fps: int = CAMERA_FPS,
+    ) -> None:
+        self._serial = serial_number
+        self._width = int(width)
+        self._height = int(height)
+        self._fps = int(fps)
+        self._pipeline = None
+        self._latest_frame = np.zeros((self._height, self._width, 3), dtype=np.uint8)
+        self._frame_lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._reader_thread: threading.Thread | None = None
+
+    def _release_pipeline(self) -> None:
+        pipeline = self._pipeline
+        self._pipeline = None
+        if pipeline is not None:
+            try:
+                pipeline.stop()
+            except Exception:
+                pass
+
+    def start(self) -> None:
+        if not HAS_REALSENSE or rs is None:
+            raise RuntimeError("pyrealsense2 未安装，无法启动相机")
+        if self._pipeline is not None:
+            self.stop()
+
+        pipeline = rs.pipeline()
+        try:
+            config = rs.config()
+            if self._serial:
+                config.enable_device(self._serial)
+            config.enable_stream(rs.stream.color, self._width, self._height, rs.format.rgb8, self._fps)
+            pipeline.start(config)
+            self._pipeline = pipeline
+            self._stop_event.clear()
+            self._reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
+            self._reader_thread.start()
+            return
+        except Exception as exc:
+            self._release_pipeline()
+            raise RuntimeError(f"相机 {self._serial or '<auto>'} 启动失败: {exc}") from exc
+
+    def _reader_loop(self) -> None:
+        while not self._stop_event.is_set() and self._pipeline is not None:
+            try:
+                frames = self._pipeline.wait_for_frames()
+                color = frames.get_color_frame()
+                if not color:
+                    continue
+                frame = np.asanyarray(color.get_data())
+                with self._frame_lock:
+                    self._latest_frame = frame.copy()
+            except Exception as exc:
+                print(f"  [相机] 读帧失败，将保持上一帧缓存: {exc}", flush=True)
+                self._stop_event.set()
+                self._release_pipeline()
+                break
+
+    def get_frame(self) -> np.ndarray:
+        with self._frame_lock:
+            return self._latest_frame.copy()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if (
+            self._reader_thread is not None
+            and self._reader_thread.is_alive()
+            and threading.current_thread() is not self._reader_thread
+        ):
+            self._reader_thread.join(timeout=1.0)
+        self._reader_thread = None
+        self._release_pipeline()
+
+
+class DualD435:
+    def __init__(self, cam1_serial: str | None = None, cam2_serial: str | None = None) -> None:
+        self._cam1 = D435Camera(cam1_serial)
+        self._cam2 = D435Camera(cam2_serial)
+        self._black = np.zeros((CAMERA_HEIGHT, CAMERA_WIDTH, 3), dtype=np.uint8)
+
+    def start(self) -> None:
+        for cam in (self._cam1, self._cam2):
+            try:
+                cam.start()
+            except Exception as exc:
+                print(f"  [相机] 启动失败，将使用全黑帧: {exc}", flush=True)
+            time.sleep(0.2)
+
+    def stop(self) -> None:
+        for cam in (self._cam1, self._cam2):
+            try:
+                cam.stop()
+            except Exception:
+                pass
+
+    def get_frames(self) -> tuple[np.ndarray, np.ndarray]:
+        frames = []
+        for cam in (self._cam1, self._cam2):
+            if cam._pipeline is None:
+                frames.append(self._black.copy())
+                continue
+            try:
+                frames.append(cam.get_frame())
+            except Exception as exc:
+                print(f"  [相机] 读帧失败，返回全黑帧: {exc}", flush=True)
+                cam._release_pipeline()
+                frames.append(self._black.copy())
+        return frames[0], frames[1]
+
+
+def _resize_observation_image(image: np.ndarray) -> np.ndarray:
+    return image_tools.convert_to_uint8(image_tools.resize_with_pad(image, OBS_IMAGE_SIZE, OBS_IMAGE_SIZE))
 
 
 def _validate_control_mode(control_mode: str) -> str:
@@ -59,10 +202,31 @@ def _validate_nullspace_projector(mode: str) -> str:
     return mode
 
 
-def _gripper_worker(robot_ip: str, command_queue, status_queue, speed: float, force: float) -> None:
-    from control._franka_backend import RealtimeGripperBackend
+def _validate_task_constraint_mask(mask: np.ndarray | None) -> np.ndarray:
+    if mask is None:
+        return np.ones(6, dtype=np.float64)
+    array = np.asarray(mask, dtype=np.float64)
+    if array.shape != (6,):
+        raise ValueError(f"task_constraint_mask must have shape (6,); got {array.shape}")
+    validated = np.where(array > 0.5, 1.0, 0.0).astype(np.float64, copy=False)
+    if not np.any(validated):
+        raise ValueError("task_constraint_mask must keep at least one constrained task dimension")
+    return validated
 
+
+def _gripper_worker(robot_ip: str, command_queue, status_queue, speed: float, force: float) -> None:
     gripper = None
+
+    def report_state() -> None:
+        if gripper is None:
+            return
+        try:
+            state = gripper.read_once()
+            status_queue.put_nowait(("state", float(state.get("width", GRIPPER_WIDTH_MAX))))
+        except queue.Full:
+            pass
+        except Exception:
+            pass
 
     def drain_latest(first_target):
         target = first_target
@@ -76,15 +240,24 @@ def _gripper_worker(robot_ip: str, command_queue, status_queue, speed: float, fo
             target = latest
 
     try:
+        from control._franka_backend import RealtimeGripperBackend
+
         gripper = RealtimeGripperBackend(robot_ip)
-        status_queue.put((True, ""))
+        initial_state = gripper.read_once()
+        status_queue.put((True, "", float(initial_state.get("width", GRIPPER_WIDTH_MAX))))
         while True:
-            target = drain_latest(command_queue.get())
+            try:
+                item = command_queue.get(timeout=GRIPPER_STATE_POLL_PERIOD)
+            except queue.Empty:
+                report_state()
+                continue
+            target = drain_latest(item)
             if target is None:
                 break
             target = float(np.clip(float(target), 0.0, GRIPPER_WIDTH_MAX))
             try:
                 ok = gripper.command(target, float(speed), float(force))
+                report_state()
                 if ok is False:
                     print(f"  [夹爪] command({target:.3f}) 返回失败", flush=True)
             except Exception as exc:
@@ -102,8 +275,15 @@ def _gripper_worker(robot_ip: str, command_queue, status_queue, speed: float, fo
 class _NoRobotBackend:
     def __init__(
         self,
-        max_translation_step: float,
-        max_rotation_step: float,
+        max_translation_velocity: float,
+        max_rotation_velocity: float,
+        max_translation_goal_error: float = DEFAULT_MAX_TRANSLATION_GOAL_ERROR,
+        max_rotation_goal_error: float = DEFAULT_MAX_ROTATION_GOAL_ERROR,
+        motion_limited_max_translation_velocity: float | None = None,
+        motion_limited_max_rotation_velocity: float | None = None,
+        motion_limited_max_translation_acceleration: float | None = None,
+        motion_limited_max_rotation_acceleration: float | None = None,
+        max_torque_rate: float = DEFAULT_MAX_TORQUE_RATE,
         reference_name: str = "min_jerk",
         control_mode: str = "cartesian",
         home_q: np.ndarray | None = None,
@@ -116,10 +296,37 @@ class _NoRobotBackend:
         nullspace_pinv: str = "plain",
         nullspace_projector: str = "kinematic",
         nullspace_lambda: float = 0.05,
+        task_constraint_mask: np.ndarray | None = None,
     ):
         del home_q, stiffness, damping, nullspace_q_target
-        self.max_translation_step = float(max_translation_step)
-        self.max_rotation_step = float(max_rotation_step)
+        self.max_translation_velocity = float(max_translation_velocity)
+        self.max_rotation_velocity = float(max_rotation_velocity)
+        self.max_translation_goal_error = float(max_translation_goal_error)
+        self.max_rotation_goal_error = float(max_rotation_goal_error)
+        self.motion_limited_max_translation_velocity = float(
+            motion_limited_max_translation_velocity
+            if motion_limited_max_translation_velocity is not None
+            else DEFAULT_MOTION_LIMITED_VELOCITY_SCALE * self.max_translation_velocity
+        )
+        self.motion_limited_max_rotation_velocity = float(
+            motion_limited_max_rotation_velocity
+            if motion_limited_max_rotation_velocity is not None
+            else DEFAULT_MOTION_LIMITED_VELOCITY_SCALE * self.max_rotation_velocity
+        )
+        self.motion_limited_max_translation_acceleration = float(
+            motion_limited_max_translation_acceleration
+            if motion_limited_max_translation_acceleration is not None
+            else DEFAULT_MOTION_LIMITED_ACCELERATION_SCALE * self.motion_limited_max_translation_velocity
+        )
+        self.motion_limited_max_rotation_acceleration = float(
+            motion_limited_max_rotation_acceleration
+            if motion_limited_max_rotation_acceleration is not None
+            else DEFAULT_MOTION_LIMITED_ACCELERATION_SCALE * self.motion_limited_max_rotation_velocity
+        )
+        self.max_torque_rate = float(max_torque_rate)
+        self.control_hz = POLICY_HZ
+        self.max_translation_step = self.max_translation_velocity / self.control_hz
+        self.max_rotation_step = self.max_rotation_velocity / self.control_hz
         self.reference_name = _validate_reference_name(reference_name)
         self.control_mode = _validate_control_mode(control_mode)
         self.nullspace_enabled = bool(nullspace_enabled)
@@ -128,6 +335,7 @@ class _NoRobotBackend:
         self.nullspace_pinv = _validate_nullspace_pinv(nullspace_pinv)
         self.nullspace_projector = _validate_nullspace_projector(nullspace_projector)
         self.nullspace_lambda = float(nullspace_lambda)
+        self.task_constraint_mask = _validate_task_constraint_mask(task_constraint_mask)
         self._queue: queue.Queue[np.ndarray] = queue.Queue()
         self._state = np.array([0.0, 0.0, 0.0, math.pi, 0.0, 0.0, GRIPPER_WIDTH_MAX, GRIPPER_WIDTH_MAX], dtype=np.float64)
         self._stop = threading.Event()
@@ -162,8 +370,8 @@ class _NoRobotBackend:
                     action = self._queue.get_nowait()
                 except queue.Empty:
                     action = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0], dtype=np.float64)
-                self._state[:3] += np.clip(action[:3], -1.0, 1.0) * self.max_translation_step
-                self._state[3:6] += np.clip(action[3:6], -6.0, 6.0) * self.max_rotation_step / 6.0
+                self._state[:3] += np.clip(action[:3], -self.max_translation_step, self.max_translation_step)
+                self._state[3:6] += np.clip(action[3:6], -self.max_rotation_step, self.max_rotation_step)
                 self._state[6:] = 0.0 if action[6] > 0.0 else GRIPPER_WIDTH_MAX
                 if max_duration > 0.0 and time.monotonic() - start >= max_duration:
                     break
@@ -201,7 +409,7 @@ class _NoRobotBackend:
 
     def get_trace_since(self, after: int = 0) -> np.ndarray:
         del after
-        return np.zeros((0, 26), dtype=np.float64)
+        return np.zeros((0, 47), dtype=np.float64)
 
     def clear_trace(self) -> None:
         pass
@@ -230,8 +438,15 @@ class FrankaEnv:
         *,
         home_q: np.ndarray | None = None,
         reset_duration: float = 5.0,
-        max_translation_step: float = 0.1,
-        max_rotation_step: float = math.pi / 4.0,
+        max_translation_velocity: float = DEFAULT_MAX_TRANSLATION_VELOCITY,
+        max_rotation_velocity: float = DEFAULT_MAX_ROTATION_VELOCITY,
+        max_translation_goal_error: float = DEFAULT_MAX_TRANSLATION_GOAL_ERROR,
+        max_rotation_goal_error: float = DEFAULT_MAX_ROTATION_GOAL_ERROR,
+        motion_limited_max_translation_velocity: float | None = None,
+        motion_limited_max_rotation_velocity: float | None = None,
+        motion_limited_max_translation_acceleration: float | None = None,
+        motion_limited_max_rotation_acceleration: float | None = None,
+        max_torque_rate: float = DEFAULT_MAX_TORQUE_RATE,
         stiffness: np.ndarray | None = None,
         damping: np.ndarray | None = None,
         reference_name: str = "min_jerk",
@@ -244,13 +459,14 @@ class FrankaEnv:
         nullspace_pinv: str = "plain",
         nullspace_projector: str = "kinematic",
         nullspace_lambda: float = 0.05,
+        task_constraint_mask: np.ndarray | None = None,
         reset_speed_factor: float = 0.5,
         trace_capacity_sec: float = 180.0,
         use_gripper: bool = True,
         gripper_speed: float = GRIPPER_SPEED,
         gripper_force: float = GRIPPER_FORCE,
         no_robot: bool = False,
-        no_cameras: bool = False,
+        no_cameras: bool = True,
         cam1_serial: str | None = DEFAULT_CAM1_SERIAL,
         cam2_serial: str | None = DEFAULT_CAM2_SERIAL,
         print_events: bool = True,
@@ -259,12 +475,36 @@ class FrankaEnv:
         log_root: pathlib.Path | str | None = None,
         log_subdir: str = "runs",
         print_timing_summary: bool = True,
-        **_unused,
     ):
-        del no_cameras
         self.robot_ip = robot_ip
-        self.max_translation_step = float(max_translation_step)
-        self.max_rotation_step = float(max_rotation_step)
+        self.max_translation_velocity = float(max_translation_velocity)
+        self.max_rotation_velocity = float(max_rotation_velocity)
+        self.max_translation_goal_error = float(max_translation_goal_error)
+        self.max_rotation_goal_error = float(max_rotation_goal_error)
+        self.motion_limited_max_translation_velocity = float(
+            motion_limited_max_translation_velocity
+            if motion_limited_max_translation_velocity is not None
+            else DEFAULT_MOTION_LIMITED_VELOCITY_SCALE * self.max_translation_velocity
+        )
+        self.motion_limited_max_rotation_velocity = float(
+            motion_limited_max_rotation_velocity
+            if motion_limited_max_rotation_velocity is not None
+            else DEFAULT_MOTION_LIMITED_VELOCITY_SCALE * self.max_rotation_velocity
+        )
+        self.motion_limited_max_translation_acceleration = float(
+            motion_limited_max_translation_acceleration
+            if motion_limited_max_translation_acceleration is not None
+            else DEFAULT_MOTION_LIMITED_ACCELERATION_SCALE * self.motion_limited_max_translation_velocity
+        )
+        self.motion_limited_max_rotation_acceleration = float(
+            motion_limited_max_rotation_acceleration
+            if motion_limited_max_rotation_acceleration is not None
+            else DEFAULT_MOTION_LIMITED_ACCELERATION_SCALE * self.motion_limited_max_rotation_velocity
+        )
+        self.max_torque_rate = float(max_torque_rate)
+        self.control_hz = POLICY_HZ
+        self.max_translation_step = self.max_translation_velocity / self.control_hz
+        self.max_rotation_step = self.max_rotation_velocity / self.control_hz
         self.reset_duration = float(reset_duration)
         self.reset_speed_factor = float(reset_speed_factor)
         self.reference_name = _validate_reference_name(reference_name)
@@ -286,11 +526,16 @@ class FrankaEnv:
         self.nullspace_pinv = _validate_nullspace_pinv(nullspace_pinv)
         self.nullspace_projector = _validate_nullspace_projector(nullspace_projector)
         self.nullspace_lambda = float(nullspace_lambda)
-        self.action_config = ActionConfig(self.max_translation_step, self.max_rotation_step)
+        self.task_constraint_mask = _validate_task_constraint_mask(task_constraint_mask)
+        self.action_config = ActionConfig(self.max_translation_velocity, self.max_rotation_velocity, self.control_hz)
         self.no_robot = bool(no_robot)
+        self.no_cameras = bool(no_cameras)
         self.robot = None if self.no_robot else object()
         self.cam1_serial = cam1_serial
         self.cam2_serial = cam2_serial
+        self._cameras: DualD435 | None = None if self.no_cameras else DualD435(cam1_serial, cam2_serial)
+        if self._cameras is not None:
+            self._cameras.start()
         self.print_events = bool(print_events)
         self.auto_record = (not self.no_robot) if auto_record is None else bool(auto_record)
         self.save_recording = bool(save_recording)
@@ -301,18 +546,28 @@ class FrankaEnv:
         self._policy_tick = 0
         self._last_torque_print_trace_head = 0
         self._last_gripper_target: float = GRIPPER_WIDTH_MAX
+        self._last_gripper_width: float = GRIPPER_WIDTH_MAX
         self._gripper_enabled = False
-        self._gripper_ctx = mp.get_context("spawn")
         self._gripper_command_queue = None
         self._gripper_status_queue = None
-        self._gripper_process = None
+        self._gripper_thread = None
+        self._gripper_speed = float(gripper_speed)
+        self._gripper_force = float(gripper_force)
         self.commanded_pose_array = np.zeros(6, dtype=np.float64)
         self.ee_force_torque = np.zeros(6, dtype=np.float64)
+        self._last_goal_rotation_error = np.zeros(3, dtype=np.float64)
 
         if self.no_robot:
             self._backend = _NoRobotBackend(
-                self.max_translation_step,
-                self.max_rotation_step,
+                self.max_translation_velocity,
+                self.max_rotation_velocity,
+                self.max_translation_goal_error,
+                self.max_rotation_goal_error,
+                self.motion_limited_max_translation_velocity,
+                self.motion_limited_max_rotation_velocity,
+                self.motion_limited_max_translation_acceleration,
+                self.motion_limited_max_rotation_acceleration,
+                self.max_torque_rate,
                 self.reference_name,
                 self.control_mode,
                 self.home_q,
@@ -325,6 +580,7 @@ class FrankaEnv:
                 self.nullspace_pinv,
                 self.nullspace_projector,
                 self.nullspace_lambda,
+                self.task_constraint_mask,
             )
         else:
             from control._franka_backend import RealtimeFrankaBackend
@@ -333,6 +589,11 @@ class FrankaEnv:
                 self.robot_ip,
                 self.max_translation_step,
                 self.max_rotation_step,
+                self.motion_limited_max_translation_velocity,
+                self.motion_limited_max_rotation_velocity,
+                self.motion_limited_max_translation_acceleration,
+                self.motion_limited_max_rotation_acceleration,
+                self.max_torque_rate,
                 self.reference_name,
                 self.control_mode,
                 self.trace_capacity_sec,
@@ -346,24 +607,33 @@ class FrankaEnv:
                 self.nullspace_pinv,
                 self.nullspace_projector,
                 self.nullspace_lambda,
+                self.task_constraint_mask,
             )
             if use_gripper:
                 self._start_gripper_worker(float(gripper_speed), float(gripper_force))
         self._refresh_status_from_state()
 
     def _start_gripper_worker(self, speed: float, force: float) -> None:
-        self._gripper_command_queue = self._gripper_ctx.Queue(maxsize=1)
-        self._gripper_status_queue = self._gripper_ctx.Queue(maxsize=1)
-        self._gripper_process = self._gripper_ctx.Process(
+        self._gripper_command_queue = queue.Queue(maxsize=1)
+        self._gripper_status_queue = queue.Queue(maxsize=1)
+        self._gripper_thread = threading.Thread(
             target=_gripper_worker,
             args=(self.robot_ip, self._gripper_command_queue, self._gripper_status_queue, speed, force),
             daemon=True,
         )
-        self._gripper_process.start()
+        self._gripper_thread.start()
         try:
-            ok, message = self._gripper_status_queue.get(timeout=GRIPPER_CONNECT_TIMEOUT)
+            startup = self._gripper_status_queue.get(timeout=GRIPPER_CONNECT_TIMEOUT)
+            if len(startup) >= 3:
+                ok, message, width = startup[0], startup[1], startup[2]
+            else:
+                ok, message = startup
+                width = GRIPPER_WIDTH_MAX
         except queue.Empty:
-            ok, message = False, "startup timeout"
+            worker = self._gripper_thread
+            alive = bool(worker is not None and worker.is_alive())
+            ok, message, width = False, f"startup timeout (thread_alive={alive})", GRIPPER_WIDTH_MAX
+        self._last_gripper_width = float(np.clip(width, 0.0, GRIPPER_WIDTH_MAX))
         self._gripper_enabled = bool(ok)
         if self._gripper_enabled:
             print("  [夹爪] worker 已启动")
@@ -372,22 +642,25 @@ class FrankaEnv:
             self._stop_gripper_worker()
 
     def _stop_gripper_worker(self) -> None:
-        if self._gripper_process is None:
-            return
-        if self._gripper_command_queue is not None:
+        thread = self._gripper_thread
+        command_queue = self._gripper_command_queue
+        self._gripper_thread = None
+        self._gripper_command_queue = None
+        self._gripper_status_queue = None
+        self._gripper_enabled = False
+        if command_queue is not None:
             try:
-                self._gripper_command_queue.put_nowait(None)
+                command_queue.put_nowait(None)
             except Exception:
                 pass
-        self._gripper_process.join(timeout=2.0)
-        if self._gripper_process.is_alive():
-            self._gripper_process.terminate()
-            self._gripper_process.join(timeout=1.0)
-        self._gripper_process = None
-        self._gripper_enabled = False
+        if thread is not None:
+            thread.join(timeout=2.0)
+            if thread.is_alive():
+                print("  [夹爪] worker 线程未在 2s 内退出", flush=True)
 
     def _set_gripper_target(self, target: float) -> None:
         target = float(np.clip(target, 0.0, GRIPPER_WIDTH_MAX))
+        self._drain_gripper_status_queue()
         self._last_gripper_target = target
         if not self._gripper_enabled or self._gripper_command_queue is None:
             return
@@ -407,20 +680,25 @@ class FrankaEnv:
             self._last_torque_print_trace_head = self.read_trace_head()
         except Exception:
             return ""
-        if trace.shape[0] == 0 or trace.shape[1] < 26:
+        if trace.shape[0] == 0 or trace.shape[1] < 47:
             return ""
 
-        tau = trace[:, 19:26]
-        tau_max = np.max(tau, axis=0)
+        tau_cmd = trace[:, 19:26]
+        tau_desired = trace[:, 26:33]
+        tau_j_d = trace[:, 33:40]
+        tau_j = trace[:, 40:47]
+        tau_max = np.max(np.abs(tau_cmd), axis=0)
         tau_text = ", ".join(f"{value:+.3f}" for value in tau_max)
-        if tau.shape[0] < 2:
-            return f" tau_max=[{tau_text}] max_d_tau=n/a"
+        frame_index = trace.shape[0] - 1
+        jd_rate = float("nan")
+        jd_rate_joint = 0
+        if frame_index > 0:
+            diff = np.abs(tau_j_d[frame_index] - tau_j_d[frame_index - 1])
+            flat_idx = int(np.argmax(diff))
+            jd_rate = diff[flat_idx]
+            jd_rate_joint = flat_idx + 1
 
-        delta = np.abs(np.diff(tau, axis=0))
-        flat_index = int(np.argmax(delta))
-        frame_index, joint_index = np.unravel_index(flat_index, delta.shape)
-        del frame_index
-        return f" tau_max=[{tau_text}] max_d_tau={delta.max():.3f}@J{joint_index + 1}"
+        return f" tau_abs_max=[{tau_text}] jd_rate={jd_rate:.3f}@J{jd_rate_joint}"
 
     def _print_action_event(self, action: np.ndarray) -> None:
         if not self.print_events:
@@ -442,11 +720,66 @@ class FrankaEnv:
             flush=True,
         )
 
+    def _drain_gripper_status_queue(self) -> None:
+        if self._gripper_status_queue is None:
+            return
+        while True:
+            try:
+                item = self._gripper_status_queue.get_nowait()
+            except queue.Empty:
+                return
+            if isinstance(item, tuple) and len(item) >= 2 and item[0] == "state":
+                self._last_gripper_width = float(np.clip(item[1], 0.0, GRIPPER_WIDTH_MAX))
+
     def _refresh_status_from_state(self) -> np.ndarray:
         state = self.get_robot_state_vector()
         self.commanded_pose_array = state[:6].copy()
+        self._last_goal_rotation_error = np.zeros(3, dtype=np.float64)
         self.ee_force_torque = np.zeros(6, dtype=np.float64)
         return state
+
+    @staticmethod
+    def _clamp_norm(value: np.ndarray, limit: float) -> np.ndarray:
+        vector = np.asarray(value, dtype=np.float64)
+        norm = float(np.linalg.norm(vector))
+        if norm <= limit or norm < 1e-12:
+            return vector.copy()
+        return vector * (limit / norm)
+
+    def _prepare_cartesian_action(self, action: np.ndarray) -> np.ndarray:
+        transformed = transform_action(action, self.action_config)
+        current_goal = np.asarray(self.commanded_pose_array, dtype=np.float64).copy()
+        if current_goal.shape != (6,):
+            current_goal = self.get_robot_state_vector()[:6].copy()
+        actual_state = self.get_robot_state_vector()[:6].copy()
+
+        candidate_position = current_goal[:3] + transformed[:3]
+        limited_position = actual_state[:3] + self._clamp_norm(
+            candidate_position - actual_state[:3], self.max_translation_goal_error
+        )
+
+        current_rotation = rotvec_to_matrix(current_goal[3:6])
+        actual_rotation = rotvec_to_matrix(actual_state[3:6])
+        candidate_rotation = rotvec_to_matrix(transformed[3:6]) @ current_rotation
+        rotation_error = matrix_to_rotvec_continuous(
+            candidate_rotation @ actual_rotation.T, self._last_goal_rotation_error
+        )
+        self._last_goal_rotation_error = rotation_error.copy()
+        limited_rotation = rotvec_to_matrix(
+            self._clamp_norm(rotation_error, self.max_rotation_goal_error)
+        ) @ actual_rotation
+
+        limited_goal = np.zeros(6, dtype=np.float64)
+        limited_goal[:3] = limited_position
+        limited_goal[3:6] = matrix_to_rotvec_continuous(limited_rotation, current_goal[3:6])
+
+        limited_action = transformed.copy()
+        limited_action[:3] = limited_goal[:3] - current_goal[:3]
+        limited_action[3:6] = matrix_to_rotvec_continuous(
+            limited_rotation @ current_rotation.T, transformed[3:6]
+        )
+        self.commanded_pose_array = limited_goal
+        return limited_action
 
     def enqueue_action_block(self, action_block: np.ndarray) -> None:
         block = np.asarray(action_block, dtype=np.float64)
@@ -458,8 +791,14 @@ class FrankaEnv:
             )
         self._print_action_event(first)
         if self.control_mode == "cartesian":
-            transformed = transform_action(first, self.action_config)
-            self._set_gripper_target(transformed[6])
+            if block.ndim == 1:
+                transformed = self._prepare_cartesian_action(first)
+                self._set_gripper_target(transformed[6])
+                block = transformed
+            else:
+                transformed_rows = np.stack([self._prepare_cartesian_action(row) for row in block], axis=0)
+                self._set_gripper_target(transformed_rows[-1, 6])
+                block = transformed_rows
         else:
             self._set_gripper_target(GRIPPER_WIDTH_MAX if first[7] <= 0.0 else 0.0)
         self._backend.enqueue_action(block)
@@ -541,8 +880,13 @@ class FrankaEnv:
         finally:
             self._finalize_auto_recording()
 
+    def check_control_error(self) -> None:
+        self._backend.wait()
+
     def stop(self) -> None:
         self.stop_control()
+        if self._cameras is not None:
+            self._cameras.stop()
         self._stop_gripper_worker()
 
     def read_trace_head(self) -> int:
@@ -672,8 +1016,16 @@ class FrankaEnv:
                 run_paths.metadata_json,
                 {
                     "reference": self.reference_name,
+                    "max_translation_velocity": self.max_translation_velocity,
+                    "max_rotation_velocity": self.max_rotation_velocity,
                     "max_translation_step": self.max_translation_step,
                     "max_rotation_step": self.max_rotation_step,
+                    "max_translation_goal_error": self.max_translation_goal_error,
+                    "max_rotation_goal_error": self.max_rotation_goal_error,
+                    "max_translation_goal_error": self.max_translation_goal_error,
+                    "max_rotation_goal_error": self.max_rotation_goal_error,
+                    "max_torque_rate": self.max_torque_rate,
+                    "task_constraint_mask": self.task_constraint_mask.tolist(),
                     "reset_duration": self.reset_duration,
                     "reset_speed_factor": self.reset_speed_factor,
                     "sample_count": len(recorder.rows),
@@ -705,10 +1057,12 @@ class FrankaEnv:
         self._refresh_status_from_state()
 
     def get_robot_state_vector(self) -> np.ndarray:
+        self._drain_gripper_status_queue()
         state = np.asarray(self._backend.get_robot_state_vector(), dtype=np.float64).copy()
         if state.shape[0] >= 8:
-            state[6] = self._last_gripper_target
-            state[7] = self._last_gripper_target
+            half_width = float(np.clip(self._last_gripper_width, 0.0, GRIPPER_WIDTH_MAX)) / 2.0
+            state[6] = half_width
+            state[7] = -half_width
         return state
 
     def get_control_status(self) -> dict[str, object]:
@@ -720,13 +1074,20 @@ class FrankaEnv:
             "pending_action_count": self.get_pending_action_count(),
         }
 
+    def get_camera_frames(self) -> tuple[np.ndarray, np.ndarray]:
+        if self._cameras is None:
+            black = np.zeros((CAMERA_HEIGHT, CAMERA_WIDTH, 3), dtype=np.uint8)
+            return black.copy(), black.copy()
+        return self._cameras.get_frames()
+
     def get_observation(self, prompt: str = ""):
         state = self._refresh_status_from_state()
+        img1, img2 = self.get_camera_frames()
         obs = {
             "prompt": prompt,
-            "observation/state": state,
-            "observation/joints": np.zeros(7, dtype=np.float64),
+            "observation/image": _resize_observation_image(img1),
+            "observation/wrist_image": _resize_observation_image(img2),
+            "observation/state": state.astype(np.float64),
+            "observation/joints": self.get_joint_positions().astype(np.float64),
         }
-        img1 = np.zeros((480, 640, 3), dtype=np.uint8)
-        img2 = np.zeros((480, 640, 3), dtype=np.uint8)
         return obs, img1, img2

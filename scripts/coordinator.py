@@ -72,7 +72,9 @@ class Args:
     no_cameras: bool = False
     use_gripper: bool = True
     save_recording: bool = False
+    startup_home: bool = True
     control_hz: float = 10.0
+    reference: str | None = None
     reference_name: str = "min_jerk"
     nullspace_enabled: bool = False
     nullspace_q_target: tuple[float, float, float, float, float, float, float] | None = None
@@ -82,11 +84,21 @@ class Args:
     nullspace_projector: str = "kinematic"
     nullspace_lambda: float = 0.05
     step_warn_ms: float = 20.0
+    rtc_enabled: bool = False
+    rtc_execution_horizon: int = 5
+    rtc_inference_delay: int = 3
 
     def __post_init__(self) -> None:
         self.policy_type = self.policy_type.lower().strip()
         if self.policy_type not in {"openpi", "cosmos"}:
             raise ValueError("policy_type must be 'openpi' or 'cosmos'")
+        if not str(self.log_subdir or "").strip():
+            self.log_subdir = self.policy_type
+        if self.reference is not None:
+            self.reference_name = str(self.reference)
+        self.reference_name = self.reference_name.lower().strip()
+        if self.reference_name not in {"min_jerk", "linear", "cubic", "motion_limited"}:
+            raise ValueError("reference must be one of 'min_jerk', 'linear', 'cubic', or 'motion_limited'")
         self.nullspace_pinv = self.nullspace_pinv.lower().strip()
         if self.nullspace_pinv not in {"plain", "damped"}:
             raise ValueError("nullspace_pinv must be 'plain' or 'damped'")
@@ -95,6 +107,8 @@ class Args:
             raise ValueError("nullspace_projector must be 'kinematic' or 'dynamic'")
         if self.replan_steps is None:
             self.replan_steps = 16 if self.policy_type == "cosmos" else 5
+        self.rtc_execution_horizon = max(1, int(self.rtc_execution_horizon))
+        self.rtc_inference_delay = max(0, int(self.rtc_inference_delay))
 
 
 class Coordinator:
@@ -109,6 +123,9 @@ class Coordinator:
 
         self._action_plan: collections.deque[np.ndarray] = collections.deque()
         self._action_plan_lock = threading.Lock()
+        self._rtc_model_plan: collections.deque[np.ndarray] = collections.deque()
+        self._rtc_model_plan_lock = threading.Lock()
+        self._rtc_model_plan_activation_count = 0
         self._client_lock = threading.Lock()
         self._client: WebsocketClientPolicy | None = None
         self._infer_lock = threading.Lock()
@@ -146,6 +163,7 @@ class Coordinator:
         self._latest_infer_keys: list[str] | None = None
         self._latest_future_wrist_shape: list[int] | None = None
         self._latest_future_primary_shape: list[int] | None = None
+        self._latest_rtc_model_tail_shape: list[int] | None = None
         self._telemetry_lock = threading.Lock()
 
         self._ws_clients: set[WebSocket] = set()
@@ -168,6 +186,9 @@ class Coordinator:
             nullspace_projector=args.nullspace_projector,
             nullspace_lambda=args.nullspace_lambda,
         )
+        if args.startup_home and not args.no_robot:
+            logger.info("Startup homing Franka before serving UI")
+            self._env.reset()
         self._control_timing_profiler: RealtimeTimingProfiler | None = None
         self._connect_client()
 
@@ -218,7 +239,6 @@ class Coordinator:
                 self._state = State.IDLE
                 logger.info("State -> IDLE")
         self._clear_action_runtime()
-        self._reset_policy_client("stop")
 
     def cmd_home(self) -> None:
         with self._state_lock:
@@ -248,6 +268,7 @@ class Coordinator:
             self._latest_action_transformed = None
             self._latest_infer_ms = None
             self._latest_total_ms = None
+            self._latest_rtc_model_tail_shape = None
 
     def _bump_infer_generation(self) -> None:
         with self._infer_lock:
@@ -268,10 +289,17 @@ class Coordinator:
     def _clear_action_plan(self) -> None:
         with self._action_plan_lock:
             self._action_plan.clear()
+        with self._rtc_model_plan_lock:
+            self._rtc_model_plan.clear()
+            self._rtc_model_plan_activation_count = 0
 
     def _action_plan_len(self) -> int:
         with self._action_plan_lock:
             return len(self._action_plan)
+
+    def _rtc_model_plan_len(self) -> int:
+        with self._rtc_model_plan_lock:
+            return len(self._rtc_model_plan)
 
     def _pop_planned_action(self) -> np.ndarray | None:
         with self._action_plan_lock:
@@ -282,6 +310,32 @@ class Coordinator:
     def _extend_action_plan(self, chunk: list[np.ndarray]) -> None:
         with self._action_plan_lock:
             self._action_plan.extend(chunk)
+
+    def _set_rtc_model_plan(self, chunk: list[np.ndarray], *, activate_after_steps: int) -> None:
+        with self._rtc_model_plan_lock:
+            self._rtc_model_plan = collections.deque(step.copy() for step in chunk)
+            self._rtc_model_plan_activation_count = max(0, int(activate_after_steps))
+            remaining = len(self._rtc_model_plan)
+            dims = len(self._rtc_model_plan[0]) if self._rtc_model_plan else 0
+        with self._telemetry_lock:
+            self._latest_rtc_model_tail_shape = [remaining, dims]
+
+    def _consume_rtc_model_step(self) -> None:
+        with self._rtc_model_plan_lock:
+            if self._rtc_model_plan_activation_count > 0:
+                self._rtc_model_plan_activation_count -= 1
+            elif self._rtc_model_plan:
+                self._rtc_model_plan.popleft()
+            remaining = len(self._rtc_model_plan)
+            dims = len(self._rtc_model_plan[0]) if self._rtc_model_plan else 0
+        with self._telemetry_lock:
+            self._latest_rtc_model_tail_shape = [remaining, dims]
+
+    def _snapshot_rtc_model_tail(self) -> np.ndarray | None:
+        with self._rtc_model_plan_lock:
+            if not self._rtc_model_plan:
+                return None
+            return np.stack([step.copy() for step in self._rtc_model_plan], axis=0)
 
     def _allocate_session_dir(self) -> pathlib.Path:
         log_subdir = self.log_subdir
@@ -327,6 +381,9 @@ class Coordinator:
             self._session_dir = self._allocate_session_dir()
             self._recording = True
             self._record_start_time = time.time()
+            session_dir = self._session_dir
+        if session_dir is not None:
+            self._write_session_metadata(session_dir, status="recording")
         logger.info("Auto-recording started: %s", self._session_dir)
 
     def _stop_session_logging(self) -> None:
@@ -345,22 +402,57 @@ class Coordinator:
             session_dir = self._session_dir
             self._session_dir = None
 
-        if session_dir is None or not frames1:
+        if session_dir is None:
+            logger.warning("Session logging stopped without an allocated session directory")
             return
+        save_thread = threading.Thread(
+            target=self._save_session_logging,
+            args=(session_dir, frames1, frames2, frames3, frames4, tele_log),
+            daemon=False,
+        )
+        save_thread.start()
+        logger.info("Session save queued: %s frames=%d telemetry=%d", session_dir, len(frames1), len(tele_log))
+
+    def _write_session_metadata(self, session_dir: pathlib.Path, *, status: str) -> None:
+        metadata = {
+            "status": status,
+            "policy_type": self._args.policy_type,
+            "prompt": self._prompt,
+            "log_subdir": self.log_subdir,
+            "control_hz": self._args.control_hz,
+            "reference_name": self._args.reference_name,
+            "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        with open(session_dir / "metadata.json", "w", encoding="utf-8") as f:
+            json.dump(metadata, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+
+    def _save_session_logging(
+        self,
+        session_dir: pathlib.Path,
+        frames1: list[np.ndarray],
+        frames2: list[np.ndarray],
+        frames3: list[np.ndarray],
+        frames4: list[np.ndarray],
+        tele_log: list[dict[str, Any]],
+    ) -> None:
         try:
+            self._write_session_metadata(session_dir, status="saved")
+            with open(session_dir / "telemetry.jsonl", "w", encoding="utf-8") as f:
+                for entry in tele_log:
+                    f.write(json.dumps(entry, ensure_ascii=False) + "\n")
             fps = max(1.0, float(self._args.control_hz))
-            imageio.mimwrite(str(session_dir / "cam1.mp4"), frames1, fps=fps, codec="libx264", pixelformat="yuv420p")
-            imageio.mimwrite(str(session_dir / "cam2.mp4"), frames2, fps=fps, codec="libx264", pixelformat="yuv420p")
+            if frames1:
+                imageio.mimwrite(str(session_dir / "cam1.mp4"), frames1, fps=fps, codec="libx264", pixelformat="yuv420p")
+            if frames2:
+                imageio.mimwrite(str(session_dir / "cam2.mp4"), frames2, fps=fps, codec="libx264", pixelformat="yuv420p")
             if frames3:
                 imageio.mimwrite(str(session_dir / "cam3.mp4"), frames3, fps=fps, codec="libx264", pixelformat="yuv420p")
             if frames4:
                 imageio.mimwrite(str(session_dir / "cam4.mp4"), frames4, fps=fps, codec="libx264", pixelformat="yuv420p")
-            with open(session_dir / "telemetry.jsonl", "w", encoding="utf-8") as f:
-                for entry in tele_log:
-                    f.write(json.dumps(entry, ensure_ascii=False) + "\n")
             logger.info("Session saved to %s", session_dir)
         except Exception as exc:
-            logger.error("Failed to save session: %s", exc)
+            logger.exception("Failed to save session %s: %s", session_dir, exc)
 
     def run_control_loop(self) -> None:
         dt = 1.0 / max(1e-6, float(self._args.control_hz))
@@ -403,6 +495,7 @@ class Coordinator:
         telemetry_ms = (time.perf_counter() - telemetry_start) * 1000.0
         record_start = time.perf_counter()
         self._record_frames(img1_raw, img2_raw)
+        self._record_tick_telemetry()
         record_ms = (time.perf_counter() - record_start) * 1000.0
 
         action_ms = 0.0
@@ -421,7 +514,7 @@ class Coordinator:
         else:
             if self._env.is_control_running():
                 self._env.stop_control()
-            self._env.hold_pose()
+            self._env.clear_actions()
 
         total_ms = (time.perf_counter() - step_start) * 1000.0
         if total_ms >= float(self._args.step_warn_ms):
@@ -459,17 +552,26 @@ class Coordinator:
 
     def _run_action_step(self, obs: dict) -> None:
         if self._env.robot is not None and not self._env.is_control_running():
+            try:
+                self._env.check_control_error()
+            except Exception:
+                logger.exception("Franka torque control exited unexpectedly; State -> IDLE")
+                self._clear_action_plan()
+                self._clear_action_runtime()
+                with self._state_lock:
+                    self._state = State.IDLE
+                return
             logger.info("Starting Franka torque control on RUNNING state")
             self._control_timing_profiler = RealtimeTimingProfiler(capacity=12000)
             self._env.start_control(
-                home_first=True,
+                home_first=False,
                 reference_name=self._args.reference_name,
                 timing_profiler=self._control_timing_profiler,
             )
             return
 
         plan_len = self._action_plan_len()
-        prefetch_threshold = max(1, int(self._args.replan_steps or 1) // 2)
+        prefetch_threshold = self._get_prefetch_threshold()
         if plan_len <= prefetch_threshold:
             self._request_infer_async(obs)
 
@@ -477,9 +579,11 @@ class Coordinator:
         if action is None:
             return
         raw_action = action.copy()
-        action[:6] /= 100.0  # 前6维除以100
-        self._env.enqueue_action(action)
-        transformed = transform_action(action)
+        exec_action = action.copy()
+        exec_action[:6] /= 100.0  # 前6维除以100
+        self._env.enqueue_action(exec_action)
+        self._consume_rtc_model_step()
+        transformed = transform_action(exec_action, self._env.action_config)
         with self._telemetry_lock:
             self._latest_action = raw_action.tolist()
             self._latest_action_transformed = transformed.tolist()
@@ -491,6 +595,14 @@ class Coordinator:
             copied[key] = value.copy() if isinstance(value, np.ndarray) else value
         return copied
 
+    def _get_prefetch_threshold(self) -> int:
+        if self._use_rtc():
+            return min(max(1, int(self._args.replan_steps or 1)), max(1, int(self._args.rtc_inference_delay)))
+        return max(1, int(self._args.replan_steps or 1) // 2)
+
+    def _use_rtc(self) -> bool:
+        return self._args.policy_type == "openpi" and bool(self._args.rtc_enabled)
+
     def _request_infer_async(self, obs: dict) -> bool:
         with self._infer_lock:
             if self._infer_running:
@@ -498,6 +610,7 @@ class Coordinator:
             self._infer_running = True
             generation = self._infer_generation
         infer_obs = self._copy_obs_for_inference(obs)
+        self._attach_rtc_request(infer_obs)
         self._infer_thread = threading.Thread(
             target=self._infer_action_plan_worker,
             args=(infer_obs, generation),
@@ -506,31 +619,48 @@ class Coordinator:
         self._infer_thread.start()
         return True
 
+    def _attach_rtc_request(self, obs: dict) -> None:
+        if not self._use_rtc():
+            return
+        prev_chunk_left_over = self._snapshot_rtc_model_tail()
+        if prev_chunk_left_over is None or len(prev_chunk_left_over) == 0:
+            return
+        obs["rtc"] = {
+            "enabled": True,
+            "prev_chunk_left_over": prev_chunk_left_over.astype(np.float32, copy=False),
+            "inference_delay": int(self._args.rtc_inference_delay),
+            "execution_horizon": int(self._args.rtc_execution_horizon),
+        }
+
     def _infer_action_plan_worker(self, obs: dict, generation: int) -> None:
         try:
-            chunk = self._infer_action_chunk(obs)
+            chunk, rtc_model_chunk = self._infer_action_chunk(obs)
             if not chunk:
                 return
             if generation != self._current_infer_generation() or self.state != State.RUNNING:
                 return
+            queued_before_extend = self._action_plan_len()
             self._extend_action_plan(chunk)
+            if rtc_model_chunk is not None:
+                self._set_rtc_model_plan(rtc_model_chunk, activate_after_steps=queued_before_extend)
         finally:
             self._set_infer_running(False)
 
-    def _infer_action_chunk(self, obs: dict) -> list[np.ndarray]:
+    def _infer_action_chunk(self, obs: dict) -> tuple[list[np.ndarray], list[np.ndarray] | None]:
         if self._client is None:
             self._connect_client()
         if self._client is None:
             logger.warning("推理服务不可用，切回 IDLE")
             with self._state_lock:
                 self._state = State.IDLE
-            return []
+            return [], None
         try:
             t0 = time.time()
             with self._client_lock:
                 result = self._client.infer(obs)
             total_ms = (time.time() - t0) * 1000.0
             chunk = self._coerce_action_chunk(result["actions"])
+            rtc_model_chunk = self._coerce_rtc_model_chunk(result)
             timing = result.get("server_timing", {})
             infer_ms = timing.get("infer_ms")
             with self._telemetry_lock:
@@ -538,14 +668,14 @@ class Coordinator:
                 self._latest_infer_ms = infer_ms
                 self._latest_infer_keys = sorted(str(k) for k in result.keys())
                 self._update_policy_specific_outputs(result)
-            return chunk
+            return chunk, rtc_model_chunk
         except Exception as exc:
             logger.warning("推理请求失败，切回 IDLE: %s", exc)
             self._clear_action_runtime()
             self._reset_policy_client("infer_error")
             with self._state_lock:
                 self._state = State.IDLE
-            return []
+            return [], None
 
     def _coerce_action_chunk(self, actions: Any) -> list[np.ndarray]:
         arr = np.asarray(actions, dtype=np.float64)
@@ -555,6 +685,20 @@ class Coordinator:
             raise ValueError(f"Expected actions with shape (H, 7), got {arr.shape}")
         target_len = max(1, int(self._args.replan_steps or 1))
         return [row.astype(np.float64).copy() for row in arr[:target_len]]
+
+    def _coerce_rtc_model_chunk(self, result: dict) -> list[np.ndarray] | None:
+        rtc_payload = result.get("rtc")
+        if not isinstance(rtc_payload, dict):
+            return None
+        model_actions = rtc_payload.get("model_actions")
+        if model_actions is None:
+            return None
+        arr = np.asarray(model_actions, dtype=np.float64)
+        if arr.ndim == 1:
+            arr = arr.reshape(1, -1)
+        if arr.ndim != 2 or arr.shape[1] <= 0:
+            raise ValueError(f"Expected rtc.model_actions with shape (H, A), got {arr.shape}")
+        return [row.astype(np.float64).copy() for row in arr]
 
     def _update_policy_specific_outputs(self, result: dict) -> None:
         if self._args.policy_type != "cosmos":
@@ -602,7 +746,7 @@ class Coordinator:
         self._latest_future_wrist = coerce_rgb_frame(future_wrist)
         self._latest_future_primary = coerce_rgb_frame(future_primary)
 
-    def _record_action_telemetry(self) -> None:
+    def _record_tick_telemetry(self) -> None:
         with self._record_lock:
             if not self._recording:
                 return
@@ -611,6 +755,7 @@ class Coordinator:
             control_status = self._env.get_control_status()
             entry = {
                 "timestamp": round(time.time() - self._record_start_time, 3),
+                "event": "tick",
                 "reference_generator_state": self.state.value,
                 "prompt": prompt,
                 "state": self._latest_state,
@@ -623,6 +768,38 @@ class Coordinator:
                 "total_time_ms": self._latest_total_ms,
                 "pending_action_count": self._env.get_pending_action_count(),
                 "queued_plan_count": self._action_plan_len(),
+                "rtc_model_tail_count": self._rtc_model_plan_len(),
+                **control_status,
+            }
+            if self._args.policy_type == "cosmos":
+                entry["value_prediction"] = self._latest_value_prediction
+                entry["proprio"] = self._latest_proprio
+                entry["future_proprio"] = self._latest_future_proprio
+            self._telemetry_log.append(entry)
+
+    def _record_action_telemetry(self) -> None:
+        with self._record_lock:
+            if not self._recording:
+                return
+            with self._prompt_lock:
+                prompt = self._prompt
+            control_status = self._env.get_control_status()
+            entry = {
+                "timestamp": round(time.time() - self._record_start_time, 3),
+                "event": "action",
+                "reference_generator_state": self.state.value,
+                "prompt": prompt,
+                "state": self._latest_state,
+                "joint_state": self._latest_joints,
+                "target_pose": self._latest_target_pose,
+                "ee_force_torque": self._latest_ee_force_torque,
+                "action_raw": self._latest_action,
+                "action_transformed": self._latest_action_transformed,
+                "inference_time_ms": self._latest_infer_ms,
+                "total_time_ms": self._latest_total_ms,
+                "pending_action_count": self._env.get_pending_action_count(),
+                "queued_plan_count": self._action_plan_len(),
+                "rtc_model_tail_count": self._rtc_model_plan_len(),
                 **control_status,
             }
             if self._args.policy_type == "cosmos":
@@ -661,6 +838,11 @@ class Coordinator:
                 "server_connected": self._client is not None,
                 "pending_action_count": self._env.get_pending_action_count(),
                 "queued_plan_count": self._action_plan_len(),
+                "rtc_model_tail_count": self._rtc_model_plan_len(),
+                "rtc_enabled": self._use_rtc(),
+                "rtc_inference_delay": self._args.rtc_inference_delay if self._use_rtc() else None,
+                "rtc_execution_horizon": self._args.rtc_execution_horizon if self._use_rtc() else None,
+                "rtc_model_tail_shape": self._latest_rtc_model_tail_shape,
                 **control_status,
                 "async_chunk_enabled": True,
                 "async_infer_running": self._is_infer_running(),
@@ -762,7 +944,6 @@ def build_app(coordinator: Coordinator) -> FastAPI:
                 "log_session_dir": display_log_path(coordinator._session_dir, LOGS_BASE_DIR),
                 "robot_connected": coordinator._env.robot is not None,
                 "server_connected": coordinator._client is not None,
-                "policy_type": coordinator._args.policy_type,
                 "last_infer_keys": coordinator._latest_infer_keys,
                 "future_wrist_shape": coordinator._latest_future_wrist_shape,
                 "future_primary_shape": coordinator._latest_future_primary_shape,
@@ -775,6 +956,11 @@ def build_app(coordinator: Coordinator) -> FastAPI:
                 "total_ms": coordinator._latest_total_ms,
                 "pending_action_count": coordinator._env.get_pending_action_count(),
                 "queued_plan_count": coordinator._action_plan_len(),
+                "rtc_model_tail_count": coordinator._rtc_model_plan_len(),
+                "rtc_enabled": coordinator._use_rtc(),
+                "rtc_inference_delay": coordinator._args.rtc_inference_delay if coordinator._use_rtc() else None,
+                "rtc_execution_horizon": coordinator._args.rtc_execution_horizon if coordinator._use_rtc() else None,
+                "rtc_model_tail_shape": coordinator._latest_rtc_model_tail_shape,
                 **control_status,
                 "async_chunk_enabled": True,
                 "async_infer_running": coordinator._is_infer_running(),

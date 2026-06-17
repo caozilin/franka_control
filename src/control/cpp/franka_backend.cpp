@@ -1,5 +1,6 @@
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
 
 #include <franka/control_types.h>
 #include <franka/duration.h>
@@ -35,11 +36,9 @@ using namespace franka_control::cpp;
 namespace {
 
 // time(1) + goal_xyz(3) + goal_rotvec(3) + ref_xyz(3) + ref_rotvec(3)
-// + actual_xyz(3) + actual_rotvec(3) + tau_cmd(7) = 26
-static constexpr int kTraceDim = 26;
+// + actual_xyz(3) + actual_rotvec(3) + tau_cmd(7) + tau_desired(7) + tau_j_d(7) + tau_j(7) = 47
+static constexpr int kTraceDim = 47;
 static constexpr int kDefaultTraceSeconds = 180;  // 1kHz × 180s
-static constexpr double kMaxTranslationGoalError = 0.03;
-static constexpr double kMaxRotationGoalError = kPi / 6.0;
 static constexpr std::array<double, 7> kJointLowerLimits{
     {-2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973}};
 static constexpr std::array<double, 7> kJointUpperLimits{
@@ -54,6 +53,15 @@ struct alignas(64) TraceFrame {
   double actual_xyz[3];
   double actual_rotvec[3];
   double tau_cmd[7];
+  double tau_desired[7];
+  double tau_j_d[7];
+  double tau_j[7];
+};
+
+struct LatestRobotState {
+  std::array<double, 7> q{};
+  std::array<double, 8> pose{};
+  bool valid{false};
 };
 
 // Ring buffer: single writer (1kHz callback), single reader (Python GIL thread).
@@ -106,6 +114,17 @@ std::array<double, 7> array7FromArray(const py::array_t<double, py::array::c_sty
   return out;
 }
 
+std::array<double, 6> array6FromArray(const py::array_t<double, py::array::c_style | py::array::forcecast>& array,
+                                      const char* name) {
+  if (array.ndim() != 1 || array.shape(0) != 6) {
+    throw std::invalid_argument(std::string(name) + " must have shape (6,)");
+  }
+  std::array<double, 6> out{};
+  const auto* data = array.data();
+  for (size_t i = 0; i < 6; ++i) out[i] = data[i];
+  return out;
+}
+
 Matrix6d matrix6FromArray(const py::array_t<double, py::array::c_style | py::array::forcecast>& array,
                           const char* name) {
   if (array.ndim() != 2 || array.shape(0) != 6 || array.shape(1) != 6) {
@@ -131,6 +150,11 @@ class RealtimeFrankaBackend {
   RealtimeFrankaBackend(std::string robot_ip,
                         double max_translation_step,
                         double max_rotation_step,
+                        double motion_limited_max_translation_velocity,
+                        double motion_limited_max_rotation_velocity,
+                        double motion_limited_max_translation_acceleration,
+                        double motion_limited_max_rotation_acceleration,
+                        double max_torque_rate,
                         std::string reference_name,
                         std::string control_mode,
                         double trace_capacity_sec,
@@ -143,11 +167,17 @@ class RealtimeFrankaBackend {
                         double nullspace_damping,
                         std::string nullspace_pinv,
                         std::string nullspace_projector,
-                        double nullspace_lambda)
+                        double nullspace_lambda,
+                        py::array_t<double, py::array::c_style | py::array::forcecast> task_constraint_mask)
       : robot_ip_(std::move(robot_ip)),
         robot_(robot_ip_),
         max_translation_step_(max_translation_step),
         max_rotation_step_(max_rotation_step),
+        motion_limited_max_translation_velocity_(motion_limited_max_translation_velocity),
+        motion_limited_max_rotation_velocity_(motion_limited_max_rotation_velocity),
+        motion_limited_max_translation_acceleration_(motion_limited_max_translation_acceleration),
+        motion_limited_max_rotation_acceleration_(motion_limited_max_rotation_acceleration),
+        max_torque_rate_(max_torque_rate),
         reference_generator_(makeReferenceGenerator(reference_name)),
         control_mode_(std::move(control_mode)),
         home_q_(array7FromArray(home_q, "home_q")),
@@ -159,13 +189,15 @@ class RealtimeFrankaBackend {
                           nullspace_lambda,
                           nullspace_stiffness,
                           nullspace_damping,
-                          array7FromArray(nullspace_q_target, "nullspace_q_target")},
+                          array7FromArray(nullspace_q_target, "nullspace_q_target"),
+                          array6FromArray(task_constraint_mask, "task_constraint_mask")},
         trace_ring_(static_cast<size_t>(trace_capacity_sec > 0.0 ? trace_capacity_sec * 1000.0 : 1000)),
         timing_ring_(static_cast<size_t>(trace_capacity_sec > 0.0 ? trace_capacity_sec * 1000.0 : 1000)) {
     robot_.setCollisionBehavior({{20.0, 20.0, 18.0, 18.0, 16.0, 14.0, 12.0}},
                                 {{20.0, 20.0, 18.0, 18.0, 16.0, 14.0, 12.0}},
                                 {{20.0, 20.0, 20.0, 25.0, 25.0, 25.0}},
                                 {{20.0, 20.0, 20.0, 25.0, 25.0, 25.0}});
+    updateLatestRobotState(robot_.readOnce());
   }
 
   ~RealtimeFrankaBackend() { stop(); }
@@ -186,15 +218,15 @@ class RealtimeFrankaBackend {
     return action_queue_.size();
   }
 
-  py::array_t<double> get_joint_positions() {
-    const auto state = robot_.readOnce();
-    auto result = py::array_t<double>(static_cast<py::ssize_t>(7));
-    std::memcpy(result.mutable_data(), state.q.data(), 7 * sizeof(double));
-    return result;
+  std::vector<double> get_joint_positions() {
+    const auto cached = latestRobotState();
+    return {cached.q.begin(), cached.q.end()};
   }
 
   void start_control_loop(double max_duration) {
     if (running_.load()) throw std::runtime_error("control thread is already running");
+    joinControlThread(true);
+    throwIfError();
     stop_requested_.store(false);
     {
       std::lock_guard<std::mutex> lock(error_mutex_);
@@ -203,6 +235,7 @@ class RealtimeFrankaBackend {
     trace_ring_.clear();
     timing_ring_.clear();
     resetTraceContinuity();
+    updateLatestRobotState(robot_.readOnce());
     running_.store(true);
     control_thread_ = std::thread([this, max_duration]() {
       try {
@@ -230,8 +263,7 @@ class RealtimeFrankaBackend {
 
   void wait() {
     joinControlThread(true);
-    std::lock_guard<std::mutex> lock(error_mutex_);
-    if (!error_.empty()) throw std::runtime_error(error_);
+    throwIfError();
   }
 
   void stop() {
@@ -274,6 +306,9 @@ class RealtimeFrankaBackend {
       std::memcpy(out + 13, f.actual_xyz, sizeof(f.actual_xyz));
       std::memcpy(out + 16, f.actual_rotvec, sizeof(f.actual_rotvec));
       std::memcpy(out + 19, f.tau_cmd, sizeof(f.tau_cmd));
+      std::memcpy(out + 26, f.tau_desired, sizeof(f.tau_desired));
+      std::memcpy(out + 33, f.tau_j_d, sizeof(f.tau_j_d));
+      std::memcpy(out + 40, f.tau_j, sizeof(f.tau_j));
     }
     return result;
   }
@@ -338,6 +373,7 @@ class RealtimeFrankaBackend {
       JointMotionGenerator motion_generator(speed_factor, home_q_);
       robot_.control(motion_generator);
     }
+    updateLatestRobotState(robot_.readOnce());
   }
 
   void probe_model() {
@@ -347,18 +383,22 @@ class RealtimeFrankaBackend {
     (void)model.zeroJacobian(franka::Frame::kEndEffector, state);
   }
 
-  py::array_t<double> get_robot_state_vector() {
-    const auto state = robot_.readOnce();
-    const Pose pose = poseFromArray(state.O_T_EE);
-    const Eigen::Vector3d rotvec = matrixToRotvec(pose.block<3, 3>(0, 0));
-    std::array<double, 8> out{pose(0, 3), pose(1, 3), pose(2, 3), rotvec.x(), rotvec.y(), rotvec.z(),
-                             kGripperWidthMax, kGripperWidthMax};
-    auto result = py::array_t<double>(static_cast<py::ssize_t>(out.size()));
-    std::memcpy(result.mutable_data(), out.data(), out.size() * sizeof(double));
-    return result;
+  std::vector<double> get_robot_state_vector() {
+    const auto cached = latestRobotState();
+    return {cached.pose.begin(), cached.pose.end()};
   }
 
  private:
+  void throwIfError() {
+    std::string error;
+    {
+      std::lock_guard<std::mutex> lock(error_mutex_);
+      error = error_;
+      error_.clear();
+    }
+    if (!error.empty()) throw std::runtime_error(error);
+  }
+
   std::array<double, 7> popAction(TimingFrame* timing = nullptr) {
     const auto start = Clock::now();
     std::lock_guard<std::mutex> lock(action_mutex_);
@@ -380,6 +420,8 @@ class RealtimeFrankaBackend {
                        Eigen::Vector3d* segment_delta_rotvec,
                        Eigen::Vector3d* last_segment_rotvec,
                        TimingFrame* timing) {
+    static_cast<void>(elapsed);
+    static_cast<void>(actual_pose);
     *segment_start_pose = current_command_pose;
     const auto action = popAction(timing);
     Pose candidate = *segment_target_pose;
@@ -391,18 +433,7 @@ class RealtimeFrankaBackend {
     if (timing != nullptr) timing->fields[kTransformAction] += secondsSince(start);
 
     start = Clock::now();
-    Pose limited = candidate;
-    const Eigen::Vector3d position_error =
-        candidate.block<3, 1>(0, 3) - actual_pose.block<3, 1>(0, 3);
-    limited.block<3, 1>(0, 3) =
-        actual_pose.block<3, 1>(0, 3) + clampNorm(position_error, kMaxTranslationGoalError);
-
-    const Eigen::Vector3d rotation_error = matrixToRotvecContinuous(
-        candidate.block<3, 3>(0, 0) * actual_pose.block<3, 3>(0, 0).transpose(), last_goal_rotation_error_);
-    last_goal_rotation_error_ = rotation_error;
-    limited.block<3, 3>(0, 0) =
-        rotvecToMatrix(clampNorm(rotation_error, kMaxRotationGoalError)) * actual_pose.block<3, 3>(0, 0);
-    *segment_target_pose = limited;
+    *segment_target_pose = candidate;
     if (timing != nullptr) timing->fields[kUpdatePoseGoal] += secondsSince(start);
 
     start = Clock::now();
@@ -411,11 +442,6 @@ class RealtimeFrankaBackend {
     *segment_delta_rotvec = matrixToRotvecContinuous(
         segment_target_pose->block<3, 3>(0, 0) * segment_start_pose->block<3, 3>(0, 0).transpose(), *last_segment_rotvec);
     *last_segment_rotvec = *segment_delta_rotvec;
-
-    // Clamp position delta to max linear velocity per control period
-    *segment_delta_translation = clampNorm(*segment_delta_translation, kMaxRefLinearVelocity * kPolicyPeriod);
-    // Clamp rotation delta to max angular velocity per control period
-    *segment_delta_rotvec = clampNorm(*segment_delta_rotvec, kMaxRefAngularVelocity * kPolicyPeriod);
 
     segment_start_time_ = elapsed;
     if (timing != nullptr) timing->fields[kControllerUpdateGoal] += secondsSince(start);
@@ -445,13 +471,14 @@ class RealtimeFrankaBackend {
       Eigen::Vector3d v_des = Eigen::Vector3d::Zero();
       if (position_distance >= 1e-12) {
         const Eigen::Vector3d direction = position_error / position_distance;
-        const double v_allow = std::sqrt(std::max(0.0, 2.0 * kMaxRefLinearAcceleration * position_distance));
+        const double v_allow = std::sqrt(
+            std::max(0.0, 2.0 * motion_limited_max_translation_acceleration_ * position_distance));
         const double v_step_allow = position_distance / dt;
-        v_des = direction * std::min(std::min(kMaxRefLinearVelocity, v_allow), v_step_allow);
+        v_des = direction * std::min(std::min(motion_limited_max_translation_velocity_, v_allow), v_step_allow);
       }
 
-      *a_ref = clampNorm((v_des - *v_ref) / dt, kMaxRefLinearAcceleration);
-      *v_ref = clampNorm(*v_ref + *a_ref * dt, kMaxRefLinearVelocity);
+      *a_ref = clampNorm((v_des - *v_ref) / dt, motion_limited_max_translation_acceleration_);
+      *v_ref = clampNorm(*v_ref + *a_ref * dt, motion_limited_max_translation_velocity_);
 
       const Eigen::Vector3d p_next = p_ref + *v_ref * dt;
       if (position_distance >= 1e-12 && position_error.dot(p_goal - p_next) <= 0.0) {
@@ -477,13 +504,14 @@ class RealtimeFrankaBackend {
       Eigen::Vector3d omega_des = Eigen::Vector3d::Zero();
       if (rotation_distance >= 1e-12) {
         const Eigen::Vector3d direction = phi / rotation_distance;
-        const double omega_allow = std::sqrt(std::max(0.0, 2.0 * kMaxRefAngularAcceleration * rotation_distance));
+        const double omega_allow = std::sqrt(
+            std::max(0.0, 2.0 * motion_limited_max_rotation_acceleration_ * rotation_distance));
         const double omega_step_allow = rotation_distance / dt;
-        omega_des = direction * std::min(std::min(kMaxRefAngularVelocity, omega_allow), omega_step_allow);
+        omega_des = direction * std::min(std::min(motion_limited_max_rotation_velocity_, omega_allow), omega_step_allow);
       }
 
-      *alpha_ref = clampNorm((omega_des - *omega_ref) / dt, kMaxRefAngularAcceleration);
-      *omega_ref = clampNorm(*omega_ref + *alpha_ref * dt, kMaxRefAngularVelocity);
+      *alpha_ref = clampNorm((omega_des - *omega_ref) / dt, motion_limited_max_rotation_acceleration_);
+      *omega_ref = clampNorm(*omega_ref + *alpha_ref * dt, motion_limited_max_rotation_velocity_);
 
       const Eigen::Vector3d rotation_step = *omega_ref * dt;
       if (rotation_distance >= 1e-12 && phi.dot(rotation_step) >= rotation_distance * rotation_distance) {
@@ -558,7 +586,7 @@ class RealtimeFrankaBackend {
       const Vector7d coriolis = vector7FromArray(model.coriolis(state));
       const Vector7d tau_desired = joint_stiffness.cwiseProduct(command_q - q) +
                                    joint_damping.cwiseProduct(command_dq - dq) + coriolis;
-      const Vector7d tau_limited = limitTorqueRate(tau_desired, state.tau_J_d, dt);
+      const Vector7d tau_limited = limitTorqueRate(tau_desired, state.tau_J_d, dt, max_torque_rate_);
       franka::Torques command(arrayFromVector7(tau_limited));
       if (stop_requested_.load() || (max_duration > 0.0 && elapsed >= max_duration)) {
         return franka::MotionFinished(command);
@@ -602,6 +630,7 @@ class RealtimeFrankaBackend {
       ++step_count;
       timing.elapsed = elapsed;
       timing.robot_dt = dt;
+      updateLatestRobotState(state);
 
       auto start = Clock::now();
       while (elapsed + 1e-12 >= next_policy_time) {
@@ -660,12 +689,15 @@ class RealtimeFrankaBackend {
       timing.fields[kControllerPoseError] += secondsSince(start);
 
       start = Clock::now();
-      const Vector7d tau_task = jacobian.transpose() * (-stiffness_ * error + damping_ * (desired_velocity - jacobian * dq));
+      const Vector6d task_wrench =
+          maskTaskVector(-stiffness_ * error + damping_ * (desired_velocity - jacobian * dq), nullspace_config_);
+      const Vector7d tau_task = jacobian.transpose() * task_wrench;
       timing.fields[kControllerWrenchTorque] += secondsSince(start);
 
       start = Clock::now();
       const Vector7d tau_null = computeNullspaceTorque(jacobian, mass_ptr, q, dq, nullspace_config_);
-      const Vector7d tau_limited = limitTorqueRate(tau_task + tau_null + coriolis, state.tau_J_d, dt);
+      const Vector7d tau_desired = tau_task + tau_null + coriolis;
+      const Vector7d tau_limited = limitTorqueRate(tau_desired, state.tau_J_d, dt, max_torque_rate_);
       timing.fields[kControllerTorqueLimit] += secondsSince(start);
 
       start = Clock::now();
@@ -693,7 +725,12 @@ class RealtimeFrankaBackend {
         fill_xyz_rotvec(frame.goal_xyz, frame.goal_rotvec, segment_target_pose, prev_goal_rotvec_);
         fill_xyz_rotvec(frame.ref_xyz, frame.ref_rotvec, command_pose, prev_ref_rotvec_);
         fill_xyz_rotvec(frame.actual_xyz, frame.actual_rotvec, actual, prev_actual_rotvec_);
-        for (Eigen::Index i = 0; i < 7; ++i) frame.tau_cmd[i] = tau_limited[i];
+        for (Eigen::Index i = 0; i < 7; ++i) {
+          frame.tau_cmd[i] = tau_limited[i];
+          frame.tau_desired[i] = tau_desired[i];
+          frame.tau_j_d[i] = state.tau_J_d[static_cast<size_t>(i)];
+          frame.tau_j[i] = state.tau_J[static_cast<size_t>(i)];
+        }
         trace_ring_.write(frame);
         timing.fields[kRawTraceWrite] += secondsSince(start);
       }
@@ -717,6 +754,11 @@ class RealtimeFrankaBackend {
   franka::Robot robot_;
   double max_translation_step_;
   double max_rotation_step_;
+  double motion_limited_max_translation_velocity_;
+  double motion_limited_max_rotation_velocity_;
+  double motion_limited_max_translation_acceleration_;
+  double motion_limited_max_rotation_acceleration_;
+  double max_torque_rate_;
   std::shared_ptr<ReferenceGenerator> reference_generator_;
   std::string control_mode_;
   double joint_min_jerk_duration_{0.25};
@@ -737,7 +779,32 @@ class RealtimeFrankaBackend {
   Eigen::Vector3d prev_goal_rotvec_{Eigen::Vector3d::Zero()};
   Eigen::Vector3d prev_ref_rotvec_{Eigen::Vector3d::Zero()};
   Eigen::Vector3d prev_actual_rotvec_{Eigen::Vector3d::Zero()};
-  Eigen::Vector3d last_goal_rotation_error_{Eigen::Vector3d::Zero()};
+  mutable std::mutex latest_robot_state_mutex_;
+  LatestRobotState latest_robot_state_{};
+
+  void updateLatestRobotState(const franka::RobotState& state) {
+    const Pose pose = poseFromArray(state.O_T_EE);
+    const Eigen::Vector3d rotvec = matrixToRotvec(pose.block<3, 3>(0, 0));
+    LatestRobotState latest;
+    std::copy(state.q.begin(), state.q.end(), latest.q.begin());
+    latest.pose = {pose(0, 3), pose(1, 3), pose(2, 3), rotvec.x(), rotvec.y(), rotvec.z(),
+                   kGripperWidthMax, kGripperWidthMax};
+    latest.valid = true;
+    std::lock_guard<std::mutex> lock(latest_robot_state_mutex_);
+    latest_robot_state_ = latest;
+  }
+
+  LatestRobotState latestRobotState() {
+    {
+      std::lock_guard<std::mutex> lock(latest_robot_state_mutex_);
+      if (latest_robot_state_.valid) return latest_robot_state_;
+    }
+    const auto state = robot_.readOnce();
+    updateLatestRobotState(state);
+    std::lock_guard<std::mutex> lock(latest_robot_state_mutex_);
+    return latest_robot_state_;
+  }
+
   void resetTraceContinuity() {
     const Eigen::Vector3d home_rotvec{kPi, 0.0, 0.0};
     prev_goal_rotvec_ = home_rotvec;
@@ -762,6 +829,7 @@ class RealtimeGripperBackend {
 
   bool command(double target, double speed, double force) const {
     static constexpr double kWidthTolerance = 0.003;
+    static_cast<void>(force);
     target = std::clamp(target, 0.0, kGripperWidthMax);
     try {
       const franka::GripperState state = gripper_.readOnce();
@@ -772,6 +840,7 @@ class RealtimeGripperBackend {
       }
     } catch (...) {
     }
+    // Close commands should use grasp so the gripper applies holding force once contact is made.
     if (target <= 1e-6) return gripper_.grasp(0.0, speed, force, 0.08, 0.08);
     return gripper_.move(target, speed);
   }
@@ -784,15 +853,23 @@ class RealtimeGripperBackend {
 
 PYBIND11_MODULE(_franka_backend, m) {
   py::class_<RealtimeFrankaBackend>(m, "RealtimeFrankaBackend")
-      .def(py::init<std::string, double, double, std::string, std::string, double,
+      .def(py::init<std::string, double, double, double, double, double, double, double, std::string, std::string,
+                    double,
                     py::array_t<double, py::array::c_style | py::array::forcecast>,
                     py::array_t<double, py::array::c_style | py::array::forcecast>,
                     py::array_t<double, py::array::c_style | py::array::forcecast>,
                     bool,
                     py::array_t<double, py::array::c_style | py::array::forcecast>,
-                    double, double, std::string, std::string, double>(),
+                    double, double, std::string, std::string, double,
+                    py::array_t<double, py::array::c_style | py::array::forcecast>>(),
            py::arg("robot_ip"), py::arg("max_translation_step"),
-           py::arg("max_rotation_step"), py::arg("reference_name"),
+           py::arg("max_rotation_step"),
+           py::arg("motion_limited_max_translation_velocity"),
+           py::arg("motion_limited_max_rotation_velocity"),
+           py::arg("motion_limited_max_translation_acceleration"),
+           py::arg("motion_limited_max_rotation_acceleration"),
+           py::arg("max_torque_rate"),
+           py::arg("reference_name"),
            py::arg("control_mode"), py::arg("trace_capacity_sec"), py::arg("home_q"),
            py::arg("stiffness"), py::arg("damping"),
            py::arg("nullspace_enabled"),
@@ -801,7 +878,8 @@ PYBIND11_MODULE(_franka_backend, m) {
            py::arg("nullspace_damping"),
            py::arg("nullspace_pinv"),
            py::arg("nullspace_projector"),
-           py::arg("nullspace_lambda"))
+           py::arg("nullspace_lambda"),
+           py::arg("task_constraint_mask"))
       .def("enqueue_action", &RealtimeFrankaBackend::enqueue_action)
       .def("clear_actions", &RealtimeFrankaBackend::clear_actions)
       .def("get_pending_action_count", &RealtimeFrankaBackend::get_pending_action_count)
@@ -824,7 +902,7 @@ PYBIND11_MODULE(_franka_backend, m) {
 
   py::class_<RealtimeGripperBackend>(m, "RealtimeGripperBackend")
       .def(py::init<std::string>(), py::arg("robot_ip"), py::call_guard<py::gil_scoped_release>())
-      .def("read_once", &RealtimeGripperBackend::read_once, py::call_guard<py::gil_scoped_release>())
+      .def("read_once", &RealtimeGripperBackend::read_once)
       .def("command", &RealtimeGripperBackend::command, py::arg("target"), py::arg("speed"), py::arg("force"),
            py::call_guard<py::gil_scoped_release>())
       .def("stop", &RealtimeGripperBackend::stop, py::call_guard<py::gil_scoped_release>());

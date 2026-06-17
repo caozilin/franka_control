@@ -12,6 +12,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from control.franka_env import FrankaEnv  # noqa: E402
+from utils import POLICY_HZ  # noqa: E402
 
 
 def parse_joint_vector(value: str) -> np.ndarray:
@@ -48,7 +49,7 @@ def main() -> int:
     print("[stage] constructing FrankaEnv", flush=True)
     env = FrankaEnv(
         robot_ip=args.ip,
-        max_translation_step=args.step,
+        max_translation_velocity=args.step * POLICY_HZ,
         no_robot=False,
         nullspace_enabled=args.nullspace_enabled,
         nullspace_q_target=args.nullspace_q_target,

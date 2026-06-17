@@ -3,14 +3,6 @@ source .venv/bin/activate
 
 cmake --build build -j2
 
-python tests/test_env_logic.py
-python examples/no_robot_env_smoke_test.py
-python examples/keyboard_no_robot_smoke_test.py
-python examples/ps4_no_robot_smoke_test.py
-python scripts/example_trajectory_record_and_analyze.py --no-robot --yes --reference min_jerk --scale 1.0 --settle 0.2
-python scripts/example_trajectory_record_and_analyze.py --no-robot --yes --reference linear --scale 1.0 --settle 0.2
-python scripts/example_trajectory_record_and_analyze.py --no-robot --yes --reference cubic --scale 1.0 --settle 0.2
-
 python examples/real_robot_env_smoke_test.py --ip 172.16.0.2
 python examples/move_forward_30cm.py --ip 172.16.0.2
 python scripts/example_trajectory_record_and_analyze.py --ip 172.16.0.2 --reference linear --scale 1.0 --nullspace-enabled
@@ -19,10 +11,21 @@ python scripts/joint_keyboard_control.py
 
 python scripts/key_control.py --reference motion_limited
 python scripts/key_control.py --reference motion_limited --save-recording
-python scripts/key_control.py --reference motion_limited --nullspace-enabled \
+python scripts/key_control.py --save-recording --nullspace-enabled \
 --nullspace-pinv plain \
 --nullspace-projector kinematic \
 --nullspace-stiffness 20.0 \
 --nullspace-damping 5.0 \
---nullspace-q-target "nan,nan,0.5,nan,nan,nan,nan"
+--nullspace-q-target "nan,-0.3,nan,nan,nan,nan,nan" \
+--release-task-dims ry
 
+python src/data_collection/data_recorder.py --reference linear \
+--collection_dir default
+
+# franka_control 连接 openpi 推理服务
+cd /home/k324/franka_my_code/franka_control
+source .venv/bin/activate
+python scripts/coordinator.py --policy_type openpi \
+--prompt "put the yellow cube on the red plate" \
+--reference motion_limited \
+--rtc-enabled

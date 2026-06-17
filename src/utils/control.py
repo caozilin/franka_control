@@ -24,8 +24,9 @@ REF_ANGULAR_VELOCITY_EPS = 0.001
 
 @dataclass
 class ActionConfig:
-    max_translation_step: float = 0.1
-    max_rotation_step: float = math.pi / 4.0
+    max_translation_velocity: float = 0.1
+    max_rotation_velocity: float = math.pi / 4.0
+    policy_hz: float = POLICY_HZ
     pos_clip: float = 1.0
     rot_clip: float = 6.0
 
@@ -33,8 +34,8 @@ class ActionConfig:
 def limit_torque_rate(tau_d: np.ndarray, tau_j_d: np.ndarray, dt: float) -> np.ndarray:
     tau_d = np.asarray(tau_d, dtype=np.float64)
     tau_j_d = np.asarray(tau_j_d, dtype=np.float64)
-    dt = max(float(dt), 1.0 / LOW_LEVEL_HZ)
-    max_delta = MAX_TORQUE_RATE * dt
+    del dt
+    max_delta = MAX_TORQUE_RATE / LOW_LEVEL_HZ
     delta = tau_d - tau_j_d
     clipped = np.clip(delta, -max_delta, max_delta)
     if np.any(clipped != delta):
@@ -56,9 +57,10 @@ def transform_action(action: np.ndarray, config: ActionConfig | None = None) -> 
     config = config or ActionConfig()
     action = np.asarray(action, dtype=np.float64)
     transformed = action.copy()
-    transformed[:3] = np.clip(transformed[:3], -config.pos_clip, config.pos_clip)
-    transformed[:3] *= config.max_translation_step / config.pos_clip
-    transformed[3:6] = np.clip(transformed[3:6], -config.rot_clip, config.rot_clip)
-    transformed[3:6] *= config.max_rotation_step / config.rot_clip
+    dt = 1.0 / max(1e-6, float(config.policy_hz))
+    max_translation_step = config.max_translation_velocity * dt
+    max_rotation_step = config.max_rotation_velocity * dt
+    transformed[:3] = np.clip(transformed[:3], -max_translation_step, max_translation_step)
+    transformed[3:6] = np.clip(transformed[3:6], -max_rotation_step, max_rotation_step)
     transformed[6] = 0.0 if transformed[6] > 0.0 else GRIPPER_WIDTH_MAX
     return transformed

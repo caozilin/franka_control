@@ -12,6 +12,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from analysis import analyze_trace_csv  # noqa: E402
 from recording import TraceRecorder, create_run_paths  # noqa: E402
 from utils.control import GRIPPER_WIDTH_MAX, transform_action  # noqa: E402
+from control.franka_env import FrankaEnv  # noqa: E402
 from utils.pose import matrix_to_pose_array, matrix_to_rotvec, rotvec_to_matrix  # noqa: E402
 
 
@@ -75,3 +76,25 @@ def test_trace_recorder_and_analysis_roundtrip(tmp_path: pathlib.Path) -> None:
     assert summary["duration_sec"] == 0.001
     assert summary["axes"]["x"]["max_abs_ref_minus_actual"] > 0.0
     assert summary["axes"]["rz"]["rmse_ref_minus_actual"] > 0.0
+
+
+def test_franka_env_task_constraint_mask_defaults_to_full_constraint() -> None:
+    env = FrankaEnv(no_robot=True, no_cameras=True, print_events=False)
+    np.testing.assert_array_equal(env.task_constraint_mask, np.ones(6, dtype=np.float64))
+    env.stop()
+
+
+def test_franka_env_task_constraint_mask_validates_shape_and_nonempty() -> None:
+    try:
+        FrankaEnv(no_robot=True, no_cameras=True, print_events=False, task_constraint_mask=np.ones(5, dtype=np.float64))
+    except ValueError as exc:
+        assert "shape (6,)" in str(exc)
+    else:
+        raise AssertionError("expected ValueError for invalid task_constraint_mask shape")
+
+    try:
+        FrankaEnv(no_robot=True, no_cameras=True, print_events=False, task_constraint_mask=np.zeros(6, dtype=np.float64))
+    except ValueError as exc:
+        assert "at least one constrained" in str(exc)
+    else:
+        raise AssertionError("expected ValueError for fully released task_constraint_mask")
