@@ -29,13 +29,12 @@ class ReferenceSpace(Enum):
     JOINT = "joint"
 
 
-def _readonly_vector(value, size: int, name: str) -> np.ndarray:
+def _vector(value, size: int, name: str) -> np.ndarray:
     vector = np.asarray(value, dtype=np.float64).copy()
     if vector.shape != (size,):
         raise ValueError(f"{name} must have shape ({size},); got {vector.shape}")
     if not np.all(np.isfinite(vector)):
         raise ValueError(f"{name} must contain only finite values")
-    vector.setflags(write=False)
     return vector
 
 
@@ -78,16 +77,14 @@ class CartesianDeltaCommand:
     frame: CoordinateFrame = CoordinateFrame.BASE
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "translation_m", _readonly_vector(self.translation_m, 3, "translation_m"))
+        object.__setattr__(self, "translation_m", _vector(self.translation_m, 3, "translation_m"))
         object.__setattr__(
             self,
             "rotation_vector_rad",
-            _readonly_vector(self.rotation_vector_rad, 3, "rotation_vector_rad"),
+            _vector(self.rotation_vector_rad, 3, "rotation_vector_rad"),
         )
         if not np.isfinite(self.gripper_command):
             raise ValueError("gripper_command must be finite")
-        if not isinstance(self.frame, CoordinateFrame):
-            raise TypeError("frame must be a CoordinateFrame")
 
     @classmethod
     def from_vector(
@@ -96,7 +93,7 @@ class CartesianDeltaCommand:
         *,
         frame: CoordinateFrame = CoordinateFrame.BASE,
     ) -> "CartesianDeltaCommand":
-        vector = _readonly_vector(value, POLICY_ACTION_DIM, "cartesian command")
+        vector = _vector(value, POLICY_ACTION_DIM, "cartesian command")
         return cls(vector[:3], vector[3:6], float(vector[6]), frame)
 
     def as_vector(self) -> np.ndarray:
@@ -116,14 +113,14 @@ class JointDeltaCommand:
         object.__setattr__(
             self,
             "joint_delta_rad",
-            _readonly_vector(self.joint_delta_rad, FRANKA_JOINT_DOF, "joint_delta_rad"),
+            _vector(self.joint_delta_rad, FRANKA_JOINT_DOF, "joint_delta_rad"),
         )
         if not np.isfinite(self.gripper_command):
             raise ValueError("gripper_command must be finite")
 
     @classmethod
     def from_vector(cls, value) -> "JointDeltaCommand":
-        vector = _readonly_vector(value, FRANKA_JOINT_DOF + 1, "joint command")
+        vector = _vector(value, FRANKA_JOINT_DOF + 1, "joint command")
         return cls(vector[:FRANKA_JOINT_DOF], float(vector[-1]))
 
     def as_vector(self) -> np.ndarray:
@@ -142,11 +139,9 @@ class PolicyActionSpec:
         scales = np.asarray((self.translation_scale_m, self.rotation_scale_rad), dtype=np.float64)
         if not np.all(np.isfinite(scales)) or np.any(scales <= 0.0):
             raise ValueError("policy action scales must be finite and positive")
-        if not isinstance(self.frame, CoordinateFrame):
-            raise TypeError("frame must be a CoordinateFrame")
 
     def decode_cartesian(self, action) -> CartesianDeltaCommand:
-        vector = _readonly_vector(action, POLICY_ACTION_DIM, "policy action")
+        vector = _vector(action, POLICY_ACTION_DIM, "policy action")
         return CartesianDeltaCommand(
             translation_m=vector[:3] * self.translation_scale_m,
             rotation_vector_rad=vector[3:6] * self.rotation_scale_rad,

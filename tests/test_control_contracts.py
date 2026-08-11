@@ -35,17 +35,15 @@ def test_policy_action_spec_decodes_existing_openpi_scale() -> None:
     assert command.as_vector()[6] == 1.0
 
 
-def test_command_contracts_copy_and_freeze_input_vectors() -> None:
+def test_command_contracts_copy_input_vectors() -> None:
     source = np.arange(7, dtype=np.float64)
     command = CartesianDeltaCommand.from_vector(source)
     source[:] = -1.0
 
     np.testing.assert_allclose(command.as_vector(), np.arange(7, dtype=np.float64))
-    assert not command.translation_m.flags.writeable
-    assert not command.rotation_vector_rad.flags.writeable
 
     joint = JointDeltaCommand.from_vector(np.arange(8, dtype=np.float64))
-    assert not joint.joint_delta_rad.flags.writeable
+    np.testing.assert_allclose(joint.as_vector(), np.arange(8, dtype=np.float64))
 
 
 @pytest.mark.parametrize(
