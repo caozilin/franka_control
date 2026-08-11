@@ -32,6 +32,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from client.websocket_client_policy import WebsocketClientPolicy
 from recording import RealtimeTimingProfiler
+from control.contracts import ControlRates, PolicyActionSpec
 from control.franka_env import DEFAULT_CAM1_SERIAL, DEFAULT_CAM2_SERIAL, FrankaEnv, ROBOT_IP
 from client.realtime_utils import (
     coerce_rgb_frame,
@@ -74,6 +75,8 @@ class Args:
     save_recording: bool = False
     startup_home: bool = True
     control_hz: float = 10.0
+    policy_translation_scale_m: float = 0.01
+    policy_rotation_scale_rad: float = 0.01
     reference: str | None = None
     reference_name: str = "min_jerk"
     nullspace_enabled: bool = False
@@ -109,11 +112,20 @@ class Args:
             self.replan_steps = 16 if self.policy_type == "cosmos" else 5
         self.rtc_execution_horizon = max(1, int(self.rtc_execution_horizon))
         self.rtc_inference_delay = max(0, int(self.rtc_inference_delay))
+        rates = ControlRates(policy_hz=float(self.control_hz), planner_hz=float(self.control_hz))
+        if abs(rates.policy_hz - 10.0) > 1e-9:
+            raise ValueError(
+                "control_hz must remain 10.0 until the C++ policy period is configurable"
+            )
 
 
 class Coordinator:
     def __init__(self, args: Args):
         self._args = args
+        self._policy_action_spec = PolicyActionSpec(
+            translation_scale_m=args.policy_translation_scale_m,
+            rotation_scale_rad=args.policy_rotation_scale_rad,
+        )
         self._state = State.IDLE
         self._state_lock = threading.Lock()
         self._prompt = args.prompt
@@ -579,8 +591,7 @@ class Coordinator:
         if action is None:
             return
         raw_action = action.copy()
-        exec_action = action.copy()
-        exec_action[:6] /= 100.0  # 前6维除以100
+        exec_action = self._policy_action_spec.decode_cartesian(action).as_vector()
         self._env.enqueue_action(exec_action)
         self._consume_rtc_model_step()
         transformed = transform_action(exec_action, self._env.action_config)

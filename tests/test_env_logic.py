@@ -28,7 +28,7 @@ def test_transform_action_matches_current_scaling() -> None:
     transformed = transform_action(action)
     np.testing.assert_allclose(
         transformed[:6],
-        np.array([0.1, -0.1, 0.05, math.pi / 4.0, -math.pi / 4.0, math.pi / 8.0], dtype=np.float64),
+        np.array([0.01, -0.01, 0.01, math.pi / 40.0, -math.pi / 40.0, math.pi / 40.0], dtype=np.float64),
     )
     assert transformed[6] == GRIPPER_WIDTH_MAX
 
