@@ -20,7 +20,6 @@ PS4：
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import math
 import pathlib
@@ -29,7 +28,6 @@ import threading
 import time
 from collections import deque
 
-import imageio
 import numpy as np
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -43,6 +41,7 @@ from data_collection.key_control import (
     DEFAULT_MAX_TORQUE_RATE,
     KeyboardController,
 )  # noqa: E402
+from data_collection.episode_io import Episode, EpisodeWriter  # noqa: E402
 
 
 class DataRecorder:
@@ -72,6 +71,7 @@ class DataRecorder:
         action_thresh_rot=None,
         action_scale=None,
         prompt=None,
+        episode_writer: EpisodeWriter | None = None,
     ) -> None:
         self.kc = key_control
         if collection_dir:
@@ -87,6 +87,7 @@ class DataRecorder:
         self.prompt = self.PROMPT if prompt is None else str(prompt)
         self.action_thresh_pos = float(action_thresh_pos if action_thresh_pos is not None else self.ACTION_THRESH_POS)
         self.action_thresh_rot = float(action_thresh_rot if action_thresh_rot is not None else self.ACTION_THRESH_ROT)
+        self.episode_writer = episode_writer or EpisodeWriter(self.collection_dir)
 
         self.is_recording = False
         self.recording_frames1: deque[np.ndarray] = deque(maxlen=self.max_frames)
@@ -159,42 +160,18 @@ class DataRecorder:
             self._last_trace_seq = int(latest_trace["seq_id"])
         print(f"  [录制] 当前轨迹已作废，不保存 ({discarded_frames} 帧)")
 
-    def _next_episode_dir(self) -> pathlib.Path:
-        task_dir = self.collection_dir / self.task_name
-        task_dir.mkdir(parents=True, exist_ok=True)
-        nums = []
-        for path in task_dir.iterdir():
-            if path.is_dir() and path.name.startswith("epo_"):
-                try:
-                    nums.append(int(path.name[4:]))
-                except ValueError:
-                    pass
-        epo_dir = task_dir / f"epo_{(max(nums) + 1) if nums else 1}"
-        epo_dir.mkdir(parents=True, exist_ok=True)
-        return epo_dir
-
     def _save_trajectory(self, frames1: list[np.ndarray], frames2: list[np.ndarray], data: list[dict]) -> None:
-        epo_dir = self._next_episode_dir()
-        meta = dict(
+        episode = Episode(
+            frames1=frames1,
+            frames2=frames2,
+            data=data,
             task_name=self.task_name,
             collect_hz=self.collect_hz,
             max_frames=self.max_frames,
-            num_frames=len(frames1),
             action_scale=self.action_scale,
             prompt=self.prompt,
-            frames=data,
         )
-        try:
-            imageio.mimwrite(str(epo_dir / "cam1.mp4"), frames1, fps=self.collect_hz, codec="libx264", pixelformat="yuv420p")
-            imageio.mimwrite(str(epo_dir / "cam2.mp4"), frames2, fps=self.collect_hz, codec="libx264", pixelformat="yuv420p")
-            print(f"  [保存] 视频: {epo_dir}")
-        except Exception as exc:
-            logging.error("视频保存失败: %s", exc)
-
-        path_json = epo_dir / "data.json"
-        with path_json.open("w", encoding="utf-8") as output_file:
-            json.dump(meta, output_file, ensure_ascii=False, indent=2)
-            output_file.write("\n")
+        self.episode_writer.save(episode)
 
         with self._stats_lock:
             self.stats["trajectories_saved"] += 1
@@ -202,7 +179,6 @@ class DataRecorder:
             saved = self.stats["trajectories_saved"]
             total = self.stats["total_frames"]
             skipped = self.stats["skipped_frames"]
-        print(f"  [保存] JSON: {path_json} ({len(data)} 帧)")
         print(
             f"  [统计] 已保存 {saved} 段, "
             f"总帧 {total}, 跳过 {skipped} 帧"
