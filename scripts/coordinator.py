@@ -31,6 +31,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from client.websocket_client_policy import WebsocketClientPolicy
+from orchestration import ActionPlanScheduler, RTCConfig
 from recording import RealtimeTimingProfiler
 from control.contracts import ControlRates, PolicyActionSpec
 from control.franka_env import DEFAULT_CAM1_SERIAL, DEFAULT_CAM2_SERIAL, FrankaEnv, ROBOT_IP
@@ -133,11 +134,14 @@ class Coordinator:
         self._log_subdir = normalize_log_subdir(args.log_subdir)
         self._log_config_lock = threading.Lock()
 
-        self._action_plan: collections.deque[np.ndarray] = collections.deque()
-        self._action_plan_lock = threading.Lock()
-        self._rtc_model_plan: collections.deque[np.ndarray] = collections.deque()
-        self._rtc_model_plan_lock = threading.Lock()
-        self._rtc_model_plan_activation_count = 0
+        self._action_scheduler = ActionPlanScheduler(
+            int(args.replan_steps or 1),
+            RTCConfig(
+                enabled=args.policy_type == "openpi" and bool(args.rtc_enabled),
+                execution_horizon=args.rtc_execution_horizon,
+                inference_delay=args.rtc_inference_delay,
+            ),
+        )
         self._client_lock = threading.Lock()
         self._client: WebsocketClientPolicy | None = None
         self._infer_lock = threading.Lock()
@@ -175,7 +179,6 @@ class Coordinator:
         self._latest_infer_keys: list[str] | None = None
         self._latest_future_wrist_shape: list[int] | None = None
         self._latest_future_primary_shape: list[int] | None = None
-        self._latest_rtc_model_tail_shape: list[int] | None = None
         self._telemetry_lock = threading.Lock()
 
         self._ws_clients: set[WebSocket] = set()
@@ -236,7 +239,7 @@ class Coordinator:
     def cmd_start(self) -> None:
         with self._state_lock:
             if self._state == State.IDLE:
-                self._clear_action_plan()
+                self._action_scheduler.clear()
                 self._bump_infer_generation()
                 self._state = State.RUNNING
                 logger.info("State -> RUNNING")
@@ -244,7 +247,7 @@ class Coordinator:
     def cmd_stop(self) -> None:
         with self._state_lock:
             if self._state == State.RUNNING:
-                self._clear_action_plan()
+                self._action_scheduler.clear()
                 self._bump_infer_generation()
                 self._env.clear_actions()
                 self._env.stop_control()
@@ -254,7 +257,7 @@ class Coordinator:
 
     def cmd_home(self) -> None:
         with self._state_lock:
-            self._clear_action_plan()
+            self._action_scheduler.clear()
             self._bump_infer_generation()
             self._env.clear_actions()
             self._state = State.HOMING
@@ -265,7 +268,7 @@ class Coordinator:
     def cmd_set_prompt(self, prompt: str) -> None:
         with self._prompt_lock:
             self._prompt = str(prompt)
-        self._clear_action_plan()
+        self._action_scheduler.clear()
         self._bump_infer_generation()
 
     def cmd_set_log_subdir(self, log_subdir: str) -> str:
@@ -280,7 +283,6 @@ class Coordinator:
             self._latest_action_transformed = None
             self._latest_infer_ms = None
             self._latest_total_ms = None
-            self._latest_rtc_model_tail_shape = None
 
     def _bump_infer_generation(self) -> None:
         with self._infer_lock:
@@ -297,57 +299,6 @@ class Coordinator:
     def _is_infer_running(self) -> bool:
         with self._infer_lock:
             return self._infer_running
-
-    def _clear_action_plan(self) -> None:
-        with self._action_plan_lock:
-            self._action_plan.clear()
-        with self._rtc_model_plan_lock:
-            self._rtc_model_plan.clear()
-            self._rtc_model_plan_activation_count = 0
-
-    def _action_plan_len(self) -> int:
-        with self._action_plan_lock:
-            return len(self._action_plan)
-
-    def _rtc_model_plan_len(self) -> int:
-        with self._rtc_model_plan_lock:
-            return len(self._rtc_model_plan)
-
-    def _pop_planned_action(self) -> np.ndarray | None:
-        with self._action_plan_lock:
-            if not self._action_plan:
-                return None
-            return self._action_plan.popleft()
-
-    def _extend_action_plan(self, chunk: list[np.ndarray]) -> None:
-        with self._action_plan_lock:
-            self._action_plan.extend(chunk)
-
-    def _set_rtc_model_plan(self, chunk: list[np.ndarray], *, activate_after_steps: int) -> None:
-        with self._rtc_model_plan_lock:
-            self._rtc_model_plan = collections.deque(step.copy() for step in chunk)
-            self._rtc_model_plan_activation_count = max(0, int(activate_after_steps))
-            remaining = len(self._rtc_model_plan)
-            dims = len(self._rtc_model_plan[0]) if self._rtc_model_plan else 0
-        with self._telemetry_lock:
-            self._latest_rtc_model_tail_shape = [remaining, dims]
-
-    def _consume_rtc_model_step(self) -> None:
-        with self._rtc_model_plan_lock:
-            if self._rtc_model_plan_activation_count > 0:
-                self._rtc_model_plan_activation_count -= 1
-            elif self._rtc_model_plan:
-                self._rtc_model_plan.popleft()
-            remaining = len(self._rtc_model_plan)
-            dims = len(self._rtc_model_plan[0]) if self._rtc_model_plan else 0
-        with self._telemetry_lock:
-            self._latest_rtc_model_tail_shape = [remaining, dims]
-
-    def _snapshot_rtc_model_tail(self) -> np.ndarray | None:
-        with self._rtc_model_plan_lock:
-            if not self._rtc_model_plan:
-                return None
-            return np.stack([step.copy() for step in self._rtc_model_plan], axis=0)
 
     def _allocate_session_dir(self) -> pathlib.Path:
         log_subdir = self.log_subdir
@@ -568,7 +519,7 @@ class Coordinator:
                 self._env.check_control_error()
             except Exception:
                 logger.exception("Franka torque control exited unexpectedly; State -> IDLE")
-                self._clear_action_plan()
+                self._action_scheduler.clear()
                 self._clear_action_runtime()
                 with self._state_lock:
                     self._state = State.IDLE
@@ -582,18 +533,16 @@ class Coordinator:
             )
             return
 
-        plan_len = self._action_plan_len()
-        prefetch_threshold = self._get_prefetch_threshold()
-        if plan_len <= prefetch_threshold:
+        if self._action_scheduler.should_prefetch():
             self._request_infer_async(obs)
 
-        action = self._pop_planned_action()
+        action = self._action_scheduler.pop_next()
         if action is None:
             return
         raw_action = action.copy()
         exec_action = self._policy_action_spec.decode_cartesian(action).as_vector()
         self._env.enqueue_action(exec_action)
-        self._consume_rtc_model_step()
+        self._action_scheduler.consume_executed_step()
         transformed = transform_action(exec_action, self._env.action_config)
         with self._telemetry_lock:
             self._latest_action = raw_action.tolist()
@@ -606,13 +555,8 @@ class Coordinator:
             copied[key] = value.copy() if isinstance(value, np.ndarray) else value
         return copied
 
-    def _get_prefetch_threshold(self) -> int:
-        if self._use_rtc():
-            return min(max(1, int(self._args.replan_steps or 1)), max(1, int(self._args.rtc_inference_delay)))
-        return max(1, int(self._args.replan_steps or 1) // 2)
-
     def _use_rtc(self) -> bool:
-        return self._args.policy_type == "openpi" and bool(self._args.rtc_enabled)
+        return self._action_scheduler.rtc.enabled
 
     def _request_infer_async(self, obs: dict) -> bool:
         with self._infer_lock:
@@ -631,17 +575,9 @@ class Coordinator:
         return True
 
     def _attach_rtc_request(self, obs: dict) -> None:
-        if not self._use_rtc():
-            return
-        prev_chunk_left_over = self._snapshot_rtc_model_tail()
-        if prev_chunk_left_over is None or len(prev_chunk_left_over) == 0:
-            return
-        obs["rtc"] = {
-            "enabled": True,
-            "prev_chunk_left_over": prev_chunk_left_over.astype(np.float32, copy=False),
-            "inference_delay": int(self._args.rtc_inference_delay),
-            "execution_horizon": int(self._args.rtc_execution_horizon),
-        }
+        rtc_request = self._action_scheduler.rtc_request()
+        if rtc_request is not None:
+            obs["rtc"] = rtc_request
 
     def _infer_action_plan_worker(self, obs: dict, generation: int) -> None:
         try:
@@ -650,10 +586,14 @@ class Coordinator:
                 return
             if generation != self._current_infer_generation() or self.state != State.RUNNING:
                 return
-            queued_before_extend = self._action_plan_len()
-            self._extend_action_plan(chunk)
-            if rtc_model_chunk is not None:
-                self._set_rtc_model_plan(rtc_model_chunk, activate_after_steps=queued_before_extend)
+            self._action_scheduler.append_inference_result(chunk, rtc_model_chunk)
+        except Exception as exc:
+            logger.warning("Rejected inference action schedule, State -> IDLE: %s", exc)
+            self._action_scheduler.clear()
+            self._clear_action_runtime()
+            self._reset_policy_client("schedule_error")
+            with self._state_lock:
+                self._state = State.IDLE
         finally:
             self._set_infer_running(False)
 
@@ -761,6 +701,7 @@ class Coordinator:
         with self._record_lock:
             if not self._recording:
                 return
+            schedule = self._action_scheduler.snapshot()
             with self._prompt_lock:
                 prompt = self._prompt
             control_status = self._env.get_control_status()
@@ -778,8 +719,8 @@ class Coordinator:
                 "inference_time_ms": self._latest_infer_ms,
                 "total_time_ms": self._latest_total_ms,
                 "pending_action_count": self._env.get_pending_action_count(),
-                "queued_plan_count": self._action_plan_len(),
-                "rtc_model_tail_count": self._rtc_model_plan_len(),
+                "queued_plan_count": schedule.action_count,
+                "rtc_model_tail_count": schedule.rtc_model_count,
                 **control_status,
             }
             if self._args.policy_type == "cosmos":
@@ -792,6 +733,7 @@ class Coordinator:
         with self._record_lock:
             if not self._recording:
                 return
+            schedule = self._action_scheduler.snapshot()
             with self._prompt_lock:
                 prompt = self._prompt
             control_status = self._env.get_control_status()
@@ -809,8 +751,8 @@ class Coordinator:
                 "inference_time_ms": self._latest_infer_ms,
                 "total_time_ms": self._latest_total_ms,
                 "pending_action_count": self._env.get_pending_action_count(),
-                "queued_plan_count": self._action_plan_len(),
-                "rtc_model_tail_count": self._rtc_model_plan_len(),
+                "queued_plan_count": schedule.action_count,
+                "rtc_model_tail_count": schedule.rtc_model_count,
                 **control_status,
             }
             if self._args.policy_type == "cosmos":
@@ -826,6 +768,7 @@ class Coordinator:
             session_dir = self._session_dir
             recording = self._recording
         with self._telemetry_lock:
+            schedule = self._action_scheduler.snapshot()
             future_wrist = self._latest_future_wrist
             future_primary = self._latest_future_primary
             control_status = self._env.get_control_status()
@@ -848,12 +791,12 @@ class Coordinator:
                 "robot_connected": self._env.robot is not None,
                 "server_connected": self._client is not None,
                 "pending_action_count": self._env.get_pending_action_count(),
-                "queued_plan_count": self._action_plan_len(),
-                "rtc_model_tail_count": self._rtc_model_plan_len(),
+                "queued_plan_count": schedule.action_count,
+                "rtc_model_tail_count": schedule.rtc_model_count,
                 "rtc_enabled": self._use_rtc(),
                 "rtc_inference_delay": self._args.rtc_inference_delay if self._use_rtc() else None,
                 "rtc_execution_horizon": self._args.rtc_execution_horizon if self._use_rtc() else None,
-                "rtc_model_tail_shape": self._latest_rtc_model_tail_shape,
+                "rtc_model_tail_shape": list(schedule.rtc_model_shape),
                 **control_status,
                 "async_chunk_enabled": True,
                 "async_infer_running": self._is_infer_running(),
@@ -946,6 +889,7 @@ def build_app(coordinator: Coordinator) -> FastAPI:
     @app.get("/status")
     async def status() -> dict:
         with coordinator._telemetry_lock:
+            schedule = coordinator._action_scheduler.snapshot()
             control_status = coordinator._env.get_control_status()
             data = {
                 "reference_generator_state": coordinator.state.value,
@@ -966,12 +910,12 @@ def build_app(coordinator: Coordinator) -> FastAPI:
                 "infer_ms": coordinator._latest_infer_ms,
                 "total_ms": coordinator._latest_total_ms,
                 "pending_action_count": coordinator._env.get_pending_action_count(),
-                "queued_plan_count": coordinator._action_plan_len(),
-                "rtc_model_tail_count": coordinator._rtc_model_plan_len(),
+                "queued_plan_count": schedule.action_count,
+                "rtc_model_tail_count": schedule.rtc_model_count,
                 "rtc_enabled": coordinator._use_rtc(),
                 "rtc_inference_delay": coordinator._args.rtc_inference_delay if coordinator._use_rtc() else None,
                 "rtc_execution_horizon": coordinator._args.rtc_execution_horizon if coordinator._use_rtc() else None,
-                "rtc_model_tail_shape": coordinator._latest_rtc_model_tail_shape,
+                "rtc_model_tail_shape": list(schedule.rtc_model_shape),
                 **control_status,
                 "async_chunk_enabled": True,
                 "async_infer_running": coordinator._is_infer_running(),
