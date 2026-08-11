@@ -13,7 +13,6 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <deque>
 #include <exception>
 #include <cstring>
 #include <memory>
@@ -33,6 +32,7 @@
 #include "utils/control.hpp"
 #include "utils/joint_motion_generator.hpp"
 #include "utils/pose.hpp"
+#include "utils/spsc_action_queue.hpp"
 #include "utils/timing.hpp"
 
 namespace py = pybind11;
@@ -43,6 +43,7 @@ namespace {
 // time(1) + goal_xyz(3) + goal_rotvec(3) + ref_xyz(3) + ref_rotvec(3)
 // + actual_xyz(3) + actual_rotvec(3) + tau_cmd(7) + tau_desired(7) + tau_j_d(7) + tau_j(7) = 47
 static constexpr int kTraceDim = 47;
+static constexpr std::size_t kActionQueueCapacity = 4096;
 static constexpr int kDefaultTraceSeconds = 180;  // 1kHz × 180s
 static constexpr std::array<double, 7> kJointLowerLimits{
     {-2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973}};
@@ -93,17 +94,24 @@ class TraceRing {
   std::atomic<uint64_t> write_head_{0};
 };
 
-std::array<double, 8> actionFromArray(const py::array_t<double, py::array::c_style | py::array::forcecast>& array) {
+std::vector<std::array<double, 8>> actionsFromArray(
+    const py::array_t<double, py::array::c_style | py::array::forcecast>& array) {
   if (array.ndim() == 1 && (array.shape(0) == 7 || array.shape(0) == 8)) {
     std::array<double, 8> out{};
     const auto* data = array.data();
     for (size_t i = 0; i < static_cast<size_t>(array.shape(0)); ++i) out[i] = data[i];
-    return out;
+    return {out};
   }
   if (array.ndim() == 2 && array.shape(0) > 0 && (array.shape(1) == 7 || array.shape(1) == 8)) {
-    std::array<double, 8> out{};
+    const auto rows = static_cast<size_t>(array.shape(0));
+    const auto columns = static_cast<size_t>(array.shape(1));
     const auto* data = array.data();
-    for (size_t i = 0; i < static_cast<size_t>(array.shape(1)); ++i) out[i] = data[i];
+    std::vector<std::array<double, 8>> out(rows);
+    for (size_t row = 0; row < rows; ++row) {
+      for (size_t column = 0; column < columns; ++column) {
+        out[row][column] = data[row * columns + column];
+      }
+    }
     return out;
   }
   throw std::invalid_argument("action must have shape (7,), (8,), (N, 7), or (N, 8)");
@@ -204,20 +212,15 @@ class RealtimeFrankaBackend {
   ~RealtimeFrankaBackend() { stop(); }
 
   void enqueue_action(py::array_t<double, py::array::c_style | py::array::forcecast> action) {
-    const auto parsed = actionFromArray(action);
-    std::lock_guard<std::mutex> lock(action_mutex_);
-    action_queue_.push_back(parsed);
+    const auto parsed = actionsFromArray(action);
+    if (!action_queue_.tryPushBlock(parsed.data(), parsed.size())) {
+      throw std::overflow_error("realtime action queue capacity exceeded");
+    }
   }
 
-  void clear_actions() {
-    std::lock_guard<std::mutex> lock(action_mutex_);
-    action_queue_.clear();
-  }
+  void clear_actions() { action_queue_.clear(); }
 
-  size_t get_pending_action_count() const {
-    std::lock_guard<std::mutex> lock(action_mutex_);
-    return action_queue_.size();
-  }
+  size_t get_pending_action_count() const { return action_queue_.size(); }
 
   std::vector<double> get_joint_positions() {
     const auto cached = latestRobotState();
@@ -402,11 +405,10 @@ class RealtimeFrankaBackend {
 
   std::array<double, 7> popAction(TimingFrame* timing = nullptr) {
     const auto start = Clock::now();
-    std::lock_guard<std::mutex> lock(action_mutex_);
+    std::array<double, 8> queued{};
+    const bool has_action = action_queue_.pop(queued);
     if (timing != nullptr) timing->fields[kActionGet] += secondsSince(start);
-    if (action_queue_.empty()) return {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0};
-    const auto queued = action_queue_.front();
-    action_queue_.pop_front();
+    if (!has_action) return {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0};
     std::array<double, 7> action{};
     for (size_t i = 0; i < 7; ++i) action[i] = queued[i];
     return action;
@@ -414,10 +416,8 @@ class RealtimeFrankaBackend {
 
   std::array<double, 7> popAccumulatedJointAction() {
     std::array<double, 7> action{};
-    std::lock_guard<std::mutex> lock(action_mutex_);
-    while (!action_queue_.empty()) {
-      const auto next = action_queue_.front();
-      action_queue_.pop_front();
+    std::array<double, 8> next{};
+    while (action_queue_.pop(next)) {
       for (size_t i = 0; i < 7; ++i) action[i] += next[i];
     }
     return action;
@@ -599,8 +599,7 @@ class RealtimeFrankaBackend {
   Matrix6d stiffness_;
   Matrix6d damping_;
   NullspaceConfig nullspace_config_;
-  mutable std::mutex action_mutex_;
-  std::deque<std::array<double, 8>> action_queue_;
+  SpscActionQueue<8, kActionQueueCapacity> action_queue_;
   std::thread control_thread_;
   std::atomic<bool> running_{false};
   std::atomic<bool> stop_requested_{false};
