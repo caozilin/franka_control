@@ -30,6 +30,7 @@
 #include "tracker/cartesian_impedance_tracker.hpp"
 #include "tracker/joint_impedance_tracker.hpp"
 #include "utils/control.hpp"
+#include "utils/atomic_robot_state.hpp"
 #include "utils/joint_motion_generator.hpp"
 #include "utils/pose.hpp"
 #include "utils/spsc_action_queue.hpp"
@@ -62,12 +63,6 @@ struct alignas(64) TraceFrame {
   double tau_desired[7];
   double tau_j_d[7];
   double tau_j[7];
-};
-
-struct LatestRobotState {
-  std::array<double, 7> q{};
-  std::array<double, 8> pose{};
-  bool valid{false};
 };
 
 // Ring buffer: single writer (1kHz callback), single reader (Python GIL thread).
@@ -610,8 +605,7 @@ class RealtimeFrankaBackend {
   Eigen::Vector3d prev_goal_rotvec_{Eigen::Vector3d::Zero()};
   Eigen::Vector3d prev_ref_rotvec_{Eigen::Vector3d::Zero()};
   Eigen::Vector3d prev_actual_rotvec_{Eigen::Vector3d::Zero()};
-  mutable std::mutex latest_robot_state_mutex_;
-  LatestRobotState latest_robot_state_{};
+  AtomicRobotStateSnapshot latest_robot_state_;
 
   void updateLatestRobotState(const franka::RobotState& state) {
     const Pose pose = poseFromArray(state.O_T_EE);
@@ -621,19 +615,15 @@ class RealtimeFrankaBackend {
     latest.pose = {pose(0, 3), pose(1, 3), pose(2, 3), rotvec.x(), rotvec.y(), rotvec.z(),
                    kGripperWidthMax, kGripperWidthMax};
     latest.valid = true;
-    std::lock_guard<std::mutex> lock(latest_robot_state_mutex_);
-    latest_robot_state_ = latest;
+    latest_robot_state_.store(latest);
   }
 
   LatestRobotState latestRobotState() {
-    {
-      std::lock_guard<std::mutex> lock(latest_robot_state_mutex_);
-      if (latest_robot_state_.valid) return latest_robot_state_;
-    }
+    const LatestRobotState cached = latest_robot_state_.load();
+    if (cached.valid) return cached;
     const auto state = robot_.readOnce();
     updateLatestRobotState(state);
-    std::lock_guard<std::mutex> lock(latest_robot_state_mutex_);
-    return latest_robot_state_;
+    return latest_robot_state_.load();
   }
 
   void resetTraceContinuity() {

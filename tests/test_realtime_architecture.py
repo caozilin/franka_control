@@ -46,3 +46,16 @@ def test_action_mailbox_is_bounded_lock_free_and_accepts_complete_blocks() -> No
     assert "parsed.data(), parsed.size()" in backend
     assert "action_mutex_" not in backend
     assert "std::deque" not in backend
+
+
+def test_robot_state_uses_consistent_lock_free_snapshot() -> None:
+    snapshot = CPP / "utils" / "atomic_robot_state.hpp"
+    assert snapshot.is_file()
+
+    snapshot_source = snapshot.read_text(encoding="utf-8")
+    backend = (CPP / "franka_backend.cpp").read_text(encoding="utf-8")
+    assert "AtomicRobotStateSnapshot" in snapshot_source
+    assert "sequence_.fetch_add" in snapshot_source
+    assert "latest_robot_state_.store(latest)" in backend
+    assert "latest_robot_state_.load()" in backend
+    assert "latest_robot_state_mutex_" not in backend
