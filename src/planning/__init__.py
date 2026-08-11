@@ -1,3 +1,21 @@
-from planning.sqp import ConstraintValues, FullSpaceSQPSolver, SQPSettings
+from planning.sqp import (
+    AxisTask,
+    BaselineSQPPlanner,
+    ConstraintValues,
+    FullSpaceSQPSolver,
+    SQPObjectiveSettings,
+    SQPSettings,
+    TargetPose,
+    TaskKind,
+)
 
-__all__ = ["ConstraintValues", "FullSpaceSQPSolver", "SQPSettings"]
+__all__ = [
+    "AxisTask",
+    "BaselineSQPPlanner",
+    "ConstraintValues",
+    "FullSpaceSQPSolver",
+    "SQPObjectiveSettings",
+    "SQPSettings",
+    "TargetPose",
+    "TaskKind",
+]

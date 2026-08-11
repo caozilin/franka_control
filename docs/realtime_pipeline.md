@@ -43,6 +43,19 @@ reference generator or tracker.  If the non-realtime producer is delayed, the
 reference generator finishes or holds its current safe target while the 1 kHz
 pipeline continues to run.
 
+The baseline SQP path is therefore:
+
+```text
+Python Cartesian action -> BaselineSQPPlanner at 10 Hz
+                        -> absolute q target
+                        -> FrankaEnv.enqueue_joint_target()
+                        -> 1 kHz JointMinJerkReferenceGenerator + tracker
+```
+
+Joint deltas and absolute SQP waypoints use distinct backend queues. This keeps
+the existing joint teleoperation contract intact and prevents optimizer output
+from being accumulated as a delta.
+
 ## Linux verification
 
 The C++ extension is built and exercised on the Franka workstation because it

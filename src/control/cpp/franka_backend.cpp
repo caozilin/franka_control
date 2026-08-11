@@ -260,9 +260,19 @@ class RealtimeFrankaBackend {
     }
   }
 
-  void clear_actions() { action_queue_.clear(); }
+  void enqueue_joint_target(py::array_t<double, py::array::c_style | py::array::forcecast> target) {
+    const auto parsed = array7FromArray(target, "joint_target");
+    if (!joint_target_queue_.tryPush(parsed)) {
+      throw std::overflow_error("realtime joint target queue capacity exceeded");
+    }
+  }
 
-  size_t get_pending_action_count() const { return action_queue_.size(); }
+  void clear_actions() {
+    action_queue_.clear();
+    joint_target_queue_.clear();
+  }
+
+  size_t get_pending_action_count() const { return action_queue_.size() + joint_target_queue_.size(); }
 
   std::vector<double> get_joint_positions() {
     const auto cached = latestRobotState();
@@ -465,6 +475,16 @@ class RealtimeFrankaBackend {
     return action;
   }
 
+  bool popLatestJointTarget(std::array<double, 7>& target) {
+    std::array<double, 7> next{};
+    bool found = false;
+    while (joint_target_queue_.pop(next)) {
+      target = next;
+      found = true;
+    }
+    return found;
+  }
+
   void runJointMinJerkImpedanceLoop(double max_duration, double segment_duration) {
     auto model = robot_.loadModel();
     const franka::RobotState initial_state = robot_.readOnce();
@@ -483,7 +503,12 @@ class RealtimeFrankaBackend {
       updateLatestRobotState(state);
 
       while (elapsed + 1e-12 >= next_policy_time) {
-        reference.acceptDelta(popAccumulatedJointAction(), elapsed);
+        std::array<double, 7> target{};
+        if (popLatestJointTarget(target)) {
+          reference.acceptTarget(target, elapsed);
+        } else {
+          reference.acceptDelta(popAccumulatedJointAction(), elapsed);
+        }
         next_policy_time += config_.policy_period_s;
       }
 
@@ -646,6 +671,7 @@ class RealtimeFrankaBackend {
   NullspaceConfig nullspace_config_;
   BackendConfig config_;
   SpscActionQueue<8, kActionQueueCapacity> action_queue_;
+  SpscActionQueue<7, kActionQueueCapacity> joint_target_queue_;
   std::thread control_thread_;
   std::atomic<bool> running_{false};
   std::atomic<bool> stop_requested_{false};
@@ -771,6 +797,7 @@ PYBIND11_MODULE(_franka_backend, m) {
            py::arg("task_constraint_mask"),
            py::arg("backend_config"))
       .def("enqueue_action", &RealtimeFrankaBackend::enqueue_action)
+      .def("enqueue_joint_target", &RealtimeFrankaBackend::enqueue_joint_target)
       .def("clear_actions", &RealtimeFrankaBackend::clear_actions)
       .def("get_pending_action_count", &RealtimeFrankaBackend::get_pending_action_count)
       .def("get_joint_positions", &RealtimeFrankaBackend::get_joint_positions)

@@ -31,6 +31,14 @@ class JointMinJerkReferenceGenerator {
     segment_start_time_ = elapsed;
   }
 
+  void acceptTarget(const std::array<double, 7>& target, double elapsed) {
+    segment_start_q_ = command_q_;
+    for (Eigen::Index i = 0; i < 7; ++i) {
+      segment_target_q_[i] = std::clamp(target[static_cast<size_t>(i)], lower_[i], upper_[i]);
+    }
+    segment_start_time_ = elapsed;
+  }
+
   JointReferenceSample sample(double elapsed) {
     const double alpha = std::clamp((elapsed - segment_start_time_) / duration_, 0.0, 1.0);
     const double alpha2 = alpha * alpha;

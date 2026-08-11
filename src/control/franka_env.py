@@ -254,7 +254,7 @@ class _NoRobotBackend:
         task_constraint_mask: np.ndarray | None = None,
         control_hz: float = POLICY_HZ,
     ):
-        del home_q, stiffness, damping, nullspace_q_target
+        del stiffness, damping, nullspace_q_target
         self.max_translation_velocity = float(max_translation_velocity)
         self.max_rotation_velocity = float(max_rotation_velocity)
         self.max_translation_goal_error = float(max_translation_goal_error)
@@ -293,6 +293,9 @@ class _NoRobotBackend:
         self.nullspace_lambda = float(nullspace_lambda)
         self.task_constraint_mask = _validate_task_constraint_mask(task_constraint_mask)
         self._queue: queue.Queue[np.ndarray] = queue.Queue()
+        self._joint_target_queue: queue.Queue[np.ndarray] = queue.Queue()
+        self._home_q = np.asarray(home_q if home_q is not None else DEFAULT_HOME_Q, dtype=np.float64).copy()
+        self._joint_positions = self._home_q.copy()
         self._state = np.array([0.0, 0.0, 0.0, math.pi, 0.0, 0.0, GRIPPER_WIDTH_MAX, GRIPPER_WIDTH_MAX], dtype=np.float64)
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -301,18 +304,26 @@ class _NoRobotBackend:
         action = np.asarray(action, dtype=np.float64)
         self._queue.put((action[0] if action.ndim == 2 else action).copy())
 
+    def enqueue_joint_target(self, target: np.ndarray) -> None:
+        self._joint_target_queue.put(np.asarray(target, dtype=np.float64).copy())
+
     def clear_actions(self) -> None:
         while True:
             try:
                 self._queue.get_nowait()
             except queue.Empty:
+                break
+        while True:
+            try:
+                self._joint_target_queue.get_nowait()
+            except queue.Empty:
                 return
 
     def get_pending_action_count(self) -> int:
-        return int(self._queue.qsize())
+        return int(self._queue.qsize() + self._joint_target_queue.qsize())
 
     def get_joint_positions(self) -> np.ndarray:
-        return np.zeros(7, dtype=np.float64)
+        return self._joint_positions.copy()
 
     def start_control_loop(self, max_duration: float = -1.0) -> None:
         if self.is_running():
@@ -322,13 +333,25 @@ class _NoRobotBackend:
         def run() -> None:
             start = time.monotonic()
             while not self._stop.is_set():
+                latest_target = None
+                while True:
+                    try:
+                        latest_target = self._joint_target_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                if latest_target is not None:
+                    self._joint_positions = latest_target.copy()
                 try:
                     action = self._queue.get_nowait()
                 except queue.Empty:
                     action = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0], dtype=np.float64)
-                self._state[:3] += np.clip(action[:3], -self.max_translation_step, self.max_translation_step)
-                self._state[3:6] += np.clip(action[3:6], -self.max_rotation_step, self.max_rotation_step)
-                self._state[6:] = 0.0 if action[6] > 0.0 else GRIPPER_WIDTH_MAX
+                if self.control_mode == "joint" and action.shape == (8,):
+                    self._joint_positions += action[:7]
+                    self._state[6:] = 0.0 if action[7] > 0.0 else GRIPPER_WIDTH_MAX
+                else:
+                    self._state[:3] += np.clip(action[:3], -self.max_translation_step, self.max_translation_step)
+                    self._state[3:6] += np.clip(action[3:6], -self.max_rotation_step, self.max_rotation_step)
+                    self._state[6:] = 0.0 if action[6] > 0.0 else GRIPPER_WIDTH_MAX
                 if max_duration > 0.0 and time.monotonic() - start >= max_duration:
                     break
                 time.sleep(0.1)
@@ -355,6 +378,7 @@ class _NoRobotBackend:
     def reset(self, speed_factor: float = 0.5, reset_duration: float = -1.0) -> None:
         del speed_factor, reset_duration
         self.clear_actions()
+        self._joint_positions = self._home_q.copy()
         self._state = np.array([0.0, 0.0, 0.0, math.pi, 0.0, 0.0, GRIPPER_WIDTH_MAX, GRIPPER_WIDTH_MAX], dtype=np.float64)
 
     def get_robot_state_vector(self) -> np.ndarray:
@@ -800,6 +824,17 @@ class FrankaEnv:
 
     def enqueue_action(self, action: np.ndarray) -> None:
         self.enqueue_action_block(action)
+
+    def enqueue_joint_target(self, target: np.ndarray, *, gripper_target: float | None = None) -> None:
+        if self.control_mode != "joint":
+            raise RuntimeError("joint targets require control_mode='joint'")
+        target = np.asarray(target, dtype=np.float64)
+        if target.shape != (7,):
+            raise ValueError(f"joint target must have shape (7,); got {target.shape}")
+        if gripper_target is not None:
+            self._set_gripper_target(float(gripper_target))
+        self._backend.enqueue_joint_target(target)
+        self._policy_tick += 1
 
     def clear_actions(self) -> None:
         if hasattr(self._backend, "clear_actions"):
