@@ -35,6 +35,14 @@ from orchestration import ActionPlanScheduler, RTCConfig
 from recording import RealtimeTimingProfiler
 from control.contracts import ControlRates, PolicyActionSpec
 from control.franka_env import DEFAULT_CAM1_SERIAL, DEFAULT_CAM2_SERIAL, FrankaEnv, ROBOT_IP
+from planning import (
+    AxisTask,
+    BaselineSQPPlanner,
+    SQPObjectiveSettings,
+    SQPSettings,
+    ShadowSQPPlanner,
+    TaskKind,
+)
 from client.realtime_utils import (
     coerce_rgb_frame,
     encode_jpeg_b64,
@@ -43,6 +51,7 @@ from client.realtime_utils import (
     shape_list,
 )
 from utils.control import transform_action
+from utils.pose import rotvec_to_matrix
 
 LOGS_BASE_DIR = pathlib.Path(__file__).resolve().parents[1] / "logs"
 STATIC_DIR_BASE = ROOT / "src" / "static"
@@ -76,8 +85,35 @@ class Args:
     save_recording: bool = False
     startup_home: bool = True
     control_hz: float = 10.0
+    planner_mode: str = "direct"
     policy_translation_scale_m: float = 0.01
     policy_rotation_scale_rad: float = 0.01
+    joint_reference_duration_s: float = 0.25
+    joint_stiffness: tuple[float, float, float, float, float, float, float] = (80.0, 80.0, 80.0, 60.0, 25.0, 15.0, 10.0)
+    joint_damping: tuple[float, float, float, float, float, float, float] = (17.8885, 17.8885, 17.8885, 15.4919, 10.0, 7.7460, 6.3246)
+    max_torque_rate: float = 1000.0
+    sqp_max_iterations: int = 20
+    sqp_max_time_s: float = 0.095
+    sqp_derivative_epsilon: float = 1e-7
+    sqp_step_tolerance: float = 1e-7
+    sqp_position_tolerance: float = 1e-5
+    sqp_rotation_tolerance: float = 1e-4
+    sqp_inequality_tolerance: float = 1e-7
+    sqp_trust_region: float = 0.35
+    sqp_merit_penalty: float = 1000.0
+    sqp_line_search_iterations: int = 12
+    sqp_qp_iterations: int = 32
+    sqp_velocity_weight: float = 0.7
+    sqp_acceleration_weight: float = 0.5
+    sqp_jerk_weight: float = 0.3
+    sqp_joint_limit_weight: float = 0.1
+    sqp_manipulability_weight: float = 1.0
+    sqp_self_collision_weight: float = 0.01
+    sqp_tolerance_weight: float = 1.0
+    rotation_ranged_axes: tuple[bool, bool, bool] = (False, False, False)
+    rotation_limits_deg: tuple[float, float, float] = (30.0, 30.0, 45.0)
+    tolerance_frame_rotvec: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    shadow_stage: str = "default"
     reference: str | None = None
     reference_name: str = "min_jerk"
     nullspace_enabled: bool = False
@@ -96,6 +132,9 @@ class Args:
         self.policy_type = self.policy_type.lower().strip()
         if self.policy_type not in {"openpi", "cosmos"}:
             raise ValueError("policy_type must be 'openpi' or 'cosmos'")
+        self.planner_mode = self.planner_mode.lower().strip()
+        if self.planner_mode not in {"direct", "baseline_sqp", "shadow_sqp"}:
+            raise ValueError("planner_mode must be 'direct', 'baseline_sqp', or 'shadow_sqp'")
         if not str(self.log_subdir or "").strip():
             self.log_subdir = self.policy_type
         if self.reference is not None:
@@ -166,6 +205,7 @@ class Coordinator:
         self._latest_action_transformed: list | None = None
         self._latest_infer_ms: float | None = None
         self._latest_total_ms: float | None = None
+        self._latest_sqp: dict[str, Any] | None = None
         self._latest_ee_force_torque: list | None = None
         self._latest_value_prediction: float | None = None
         self._latest_proprio: Any = None
@@ -188,6 +228,11 @@ class Coordinator:
             no_cameras=args.no_cameras,
             use_gripper=args.use_gripper,
             control_hz=args.control_hz,
+            control_mode="joint" if args.planner_mode != "direct" else "cartesian",
+            joint_min_jerk_duration=args.joint_reference_duration_s,
+            joint_stiffness=np.asarray(args.joint_stiffness, dtype=np.float64),
+            joint_damping=np.asarray(args.joint_damping, dtype=np.float64),
+            max_torque_rate=args.max_torque_rate,
             save_recording=args.save_recording,
             reference_name=args.reference_name,
             nullspace_enabled=args.nullspace_enabled,
@@ -198,6 +243,46 @@ class Coordinator:
             nullspace_projector=args.nullspace_projector,
             nullspace_lambda=args.nullspace_lambda,
         )
+        self._sqp_planner: BaselineSQPPlanner | ShadowSQPPlanner | None = None
+        self._sqp_axis_tasks: tuple[AxisTask, ...] | None = None
+        self._tolerance_frame = rotvec_to_matrix(np.asarray(args.tolerance_frame_rotvec, dtype=np.float64))
+        self._ranged_axes = np.asarray(args.rotation_ranged_axes, dtype=bool)
+        self._rotation_limits = np.radians(np.asarray(args.rotation_limits_deg, dtype=np.float64))
+        if args.planner_mode != "direct":
+            baseline = BaselineSQPPlanner(
+                solver_settings=SQPSettings(
+                    max_iterations=args.sqp_max_iterations,
+                    max_time_s=args.sqp_max_time_s,
+                    derivative_epsilon=args.sqp_derivative_epsilon,
+                    step_tolerance=args.sqp_step_tolerance,
+                    position_tolerance=args.sqp_position_tolerance,
+                    rotation_tolerance=args.sqp_rotation_tolerance,
+                    inequality_tolerance=args.sqp_inequality_tolerance,
+                    trust_region=args.sqp_trust_region,
+                    merit_penalty=args.sqp_merit_penalty,
+                    max_line_search_iterations=args.sqp_line_search_iterations,
+                    max_qp_iterations=args.sqp_qp_iterations,
+                ),
+                objective_settings=SQPObjectiveSettings(
+                    velocity_weight=args.sqp_velocity_weight,
+                    acceleration_weight=args.sqp_acceleration_weight,
+                    jerk_weight=args.sqp_jerk_weight,
+                    joint_limit_weight=args.sqp_joint_limit_weight,
+                    manipulability_weight=args.sqp_manipulability_weight,
+                    self_collision_weight=args.sqp_self_collision_weight,
+                    tolerance_weight=args.sqp_tolerance_weight,
+                ),
+            )
+            self._sqp_planner = ShadowSQPPlanner(baseline) if args.planner_mode == "shadow_sqp" else baseline
+            tasks = [AxisTask(TaskKind.SPECIFIC) for _ in range(6)]
+            for axis, ranged in enumerate(self._ranged_axes):
+                if ranged:
+                    tasks[axis + 3] = AxisTask(
+                        TaskKind.FLAT_RANGE,
+                        lower=-self._rotation_limits[axis],
+                        upper=self._rotation_limits[axis],
+                    )
+            self._sqp_axis_tasks = tuple(tasks)
         if args.startup_home and not args.no_robot:
             logger.info("Startup homing Franka before serving UI")
             self._env.reset()
@@ -237,6 +322,8 @@ class Coordinator:
         with self._state_lock:
             if self._state == State.IDLE:
                 self._action_scheduler.clear()
+                if self._sqp_planner is not None:
+                    self._sqp_planner.reset(self._env.get_joint_positions())
                 self._bump_infer_generation()
                 self._state = State.RUNNING
                 logger.info("State -> RUNNING")
@@ -280,6 +367,7 @@ class Coordinator:
             self._latest_action_transformed = None
             self._latest_infer_ms = None
             self._latest_total_ms = None
+            self._latest_sqp = None
 
     def _bump_infer_generation(self) -> None:
         with self._infer_lock:
@@ -380,7 +468,13 @@ class Coordinator:
             "prompt": self._prompt,
             "log_subdir": self.log_subdir,
             "control_hz": self._args.control_hz,
+            "planner_mode": self._args.planner_mode,
             "reference_name": self._args.reference_name,
+            "args": {
+                key: value
+                for key, value in dataclasses.asdict(self._args).items()
+                if key != "api_key"
+            },
             "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
         with open(session_dir / "metadata.json", "w", encoding="utf-8") as f:
@@ -538,12 +632,54 @@ class Coordinator:
             return
         raw_action = action.copy()
         exec_action = self._policy_action_spec.decode_cartesian(action).as_vector()
-        self._env.enqueue_action(exec_action)
-        self._action_scheduler.consume_executed_step()
         transformed = transform_action(exec_action, self._env.action_config)
+        sqp_telemetry = None
+        if self._sqp_planner is None:
+            self._env.enqueue_action(exec_action)
+        else:
+            measured_q = self._env.get_joint_positions()
+            if isinstance(self._sqp_planner, ShadowSQPPlanner):
+                with self._prompt_lock:
+                    semantic_key = (self._prompt, self._args.shadow_stage)
+                shadow_plan = self._sqp_planner.step(
+                    measured_q,
+                    transformed[:6],
+                    tolerance_frame=self._tolerance_frame,
+                    ranged_axes=self._ranged_axes,
+                    rotation_limits=self._rotation_limits,
+                    semantic_key=semantic_key,
+                    axis_tasks=self._sqp_axis_tasks,
+                )
+                plan = shadow_plan.baseline
+                sqp_telemetry = {
+                    "shadow_anchor_reset": shadow_plan.shadow.anchor_reset,
+                    "shadow_strict_residual_rad": shadow_plan.shadow.non_tolerance_residual_rad,
+                }
+            else:
+                plan = self._sqp_planner.step(
+                    measured_q,
+                    transformed[:6],
+                    axis_tasks=self._sqp_axis_tasks,
+                    tolerance_rotation=self._tolerance_frame,
+                )
+            self._env.enqueue_joint_target(plan.q, gripper_target=float(transformed[6]))
+            sqp_telemetry = {
+                **(sqp_telemetry or {}),
+                "status": plan.solver.status,
+                "feasible": plan.solver.feasible,
+                "converged": plan.solver.converged,
+                "iterations": plan.solver.iterations,
+                "qp_iterations": plan.solver.qp_iterations,
+                "elapsed_ms": plan.solver.elapsed_ms,
+                "position_residual": plan.solver.constraints.position_residual,
+                "rotation_residual": plan.solver.constraints.rotation_residual,
+                "tolerance_violation": plan.solver.constraints.inequality_violation,
+            }
+        self._action_scheduler.consume_executed_step()
         with self._telemetry_lock:
             self._latest_action = raw_action.tolist()
             self._latest_action_transformed = transformed.tolist()
+            self._latest_sqp = sqp_telemetry
         self._record_action_telemetry()
 
     def _copy_obs_for_inference(self, obs: dict) -> dict:
@@ -713,6 +849,7 @@ class Coordinator:
                 "ee_force_torque": self._latest_ee_force_torque,
                 "action_raw": self._latest_action,
                 "action_transformed": self._latest_action_transformed,
+                "sqp": self._latest_sqp,
                 "inference_time_ms": self._latest_infer_ms,
                 "total_time_ms": self._latest_total_ms,
                 "pending_action_count": self._env.get_pending_action_count(),
@@ -745,6 +882,7 @@ class Coordinator:
                 "ee_force_torque": self._latest_ee_force_torque,
                 "action_raw": self._latest_action,
                 "action_transformed": self._latest_action_transformed,
+                "sqp": self._latest_sqp,
                 "inference_time_ms": self._latest_infer_ms,
                 "total_time_ms": self._latest_total_ms,
                 "pending_action_count": self._env.get_pending_action_count(),
@@ -783,6 +921,7 @@ class Coordinator:
                 "ee_force_torque": self._latest_ee_force_torque,
                 "action_raw": self._latest_action,
                 "action_transformed": self._latest_action_transformed,
+                "sqp": self._latest_sqp,
                 "infer_ms": self._latest_infer_ms,
                 "total_ms": self._latest_total_ms,
                 "robot_connected": self._env.robot is not None,
@@ -904,6 +1043,7 @@ def build_app(coordinator: Coordinator) -> FastAPI:
                 "target_pose": coordinator._latest_target_pose,
                 "action_raw": coordinator._latest_action,
                 "action_transformed": coordinator._latest_action_transformed,
+                "sqp": coordinator._latest_sqp,
                 "infer_ms": coordinator._latest_infer_ms,
                 "total_ms": coordinator._latest_total_ms,
                 "pending_action_count": coordinator._env.get_pending_action_count(),

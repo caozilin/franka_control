@@ -37,11 +37,13 @@ class TargetPose:
 
 @dataclass(frozen=True)
 class SQPObjectiveSettings:
+    rotation_weight: float = 10.0
     velocity_weight: float = 0.7
     acceleration_weight: float = 0.5
     jerk_weight: float = 0.3
     joint_limit_weight: float = 0.1
     manipulability_weight: float = 1.0
+    self_collision_weight: float = 0.01
     tolerance_weight: float = 1.0
 
 
@@ -58,6 +60,47 @@ def _groove(value: float, *, width: float, quadratic: float) -> float:
 
 def _groove_derivative(value: float, *, width: float, quadratic: float) -> float:
     return float(np.exp(-0.5 * (value / width) ** 2) * value / (width * width) + 2.0 * quadratic * value)
+
+
+def _swamp(
+    value: np.ndarray,
+    lower: np.ndarray | float,
+    upper: np.ndarray | float,
+    *,
+    wall_height: float,
+    polynomial: float,
+    power: int,
+) -> np.ndarray:
+    scaled = (2.0 * value - lower - upper) / (upper - lower)
+    wall_scale = (-1.0 / np.log(0.05)) ** (1.0 / power)
+    exponent = -np.minimum(np.power(np.abs(scaled) / wall_scale, power), 700.0)
+    return (wall_height + polynomial * scaled * scaled) * (1.0 - np.exp(exponent)) - 1.0
+
+
+def _segment_distances(points: np.ndarray) -> np.ndarray:
+    distances = []
+    for first in range(points.shape[0] - 1):
+        for second in range(first + 2, points.shape[0] - 1):
+            a0, a1 = points[first], points[first + 1]
+            b0, b1 = points[second], points[second + 1]
+            u, v, w = a1 - a0, b1 - b0, a0 - b0
+            uu, uv, vv = float(u @ u), float(u @ v), float(v @ v)
+            uw, vw = float(u @ w), float(v @ w)
+            denominator = uu * vv - uv * uv
+            candidates = []
+            if denominator > 1e-14:
+                s = (uv * vw - vv * uw) / denominator
+                t = (uu * vw - uv * uw) / denominator
+                if 0.0 <= s <= 1.0 and 0.0 <= t <= 1.0:
+                    candidates.append((s, t))
+            if vv > 1e-14:
+                candidates.extend(((0.0, np.clip(vw / vv, 0.0, 1.0)), (1.0, np.clip((vw + uv) / vv, 0.0, 1.0))))
+            if uu > 1e-14:
+                candidates.extend(((np.clip(-uw / uu, 0.0, 1.0), 0.0), (np.clip((uv - uw) / uu, 0.0, 1.0), 1.0)))
+            if not candidates:
+                candidates.append((0.0, 0.0))
+            distances.append(min(float(np.linalg.norm(w + s * u - t * v)) for s, t in candidates))
+    return np.asarray(distances, dtype=np.float64)
 
 
 class BaselineSQPPlanner:
@@ -173,20 +216,39 @@ class BaselineSQPPlanner:
             "jerk": settings.jerk_weight
             * _groove(float(np.linalg.norm(q - 3.0 * seed + 3.0 * previous - previous2)), width=0.1, quadratic=10.0),
         }
-        centre = 0.5 * (self.kinematics.joint_lower + self.kinematics.joint_upper)
-        half_range = 0.5 * (self.kinematics.joint_upper - self.kinematics.joint_lower)
-        normalized = (q - centre) / half_range
-        parts["joint_limits"] = settings.joint_limit_weight * float(np.sum(np.power(np.abs(normalized), 20)))
+        joint_limits = _swamp(
+            q,
+            self.kinematics.joint_lower,
+            self.kinematics.joint_upper,
+            wall_height=10.0,
+            polynomial=10.0,
+            power=20,
+        )
+        parts["joint_limits"] = settings.joint_limit_weight * (float(np.sum(joint_limits)) + q.size)
         state = self.kinematics.evaluate(q)
         parts["manipulability"] = settings.manipulability_weight * _groove(
             state.manipulability - 1.0, width=0.5, quadratic=0.1
         )
+        if settings.self_collision_weight != 0.0:
+            clearances = _segment_distances(state.link_points) - 0.05
+            collision = _swamp(
+                clearances,
+                0.02,
+                1.5,
+                wall_height=60.0,
+                polynomial=0.0001,
+                power=30,
+            )
+            parts["self_collision"] = settings.self_collision_weight * (
+                float(np.sum(collision)) + collision.size
+            ) - 1.70
         error = self.kinematics.pose_error(state, target.position, target.rotation, tolerance_rotation)
         for index in range(3, 6):
             task = tasks[index]
             if task.kind in self._RANGED and task.preference_weight > 0.0:
                 parts[f"pose_{index}_intent"] = (
                     settings.tolerance_weight
+                    * settings.rotation_weight
                     * task.preference_weight
                     * _groove(float(error[index] - task.preference_goal), width=0.1, quadratic=10.0)
                 )
@@ -216,17 +278,6 @@ class BaselineSQPPlanner:
         add_radial(settings.acceleration_weight, q - 2.0 * seed + previous)
         add_radial(settings.jerk_weight, q - 3.0 * seed + 3.0 * previous - previous2)
 
-        centre = 0.5 * (self.kinematics.joint_lower + self.kinematics.joint_upper)
-        half_range = 0.5 * (self.kinematics.joint_upper - self.kinematics.joint_lower)
-        normalized = (q - centre) / half_range
-        gradient += (
-            settings.joint_limit_weight
-            * 20.0
-            * np.power(np.abs(normalized), 19)
-            * np.sign(normalized)
-            / half_range
-        )
-
         state = self.kinematics.evaluate(q)
         error = self.kinematics.pose_error(state, target.position, target.rotation, tolerance_rotation)
         error_jacobian = self.kinematics.pose_error_jacobian(state, target.rotation, tolerance_rotation)
@@ -236,21 +287,47 @@ class BaselineSQPPlanner:
                 residual = float(error[index] - task.preference_goal)
                 gradient += (
                     settings.tolerance_weight
+                    * settings.rotation_weight
                     * task.preference_weight
                     * _groove_derivative(residual, width=0.1, quadratic=10.0)
                     * error_jacobian[index]
                 )
 
-        if settings.manipulability_weight != 0.0:
-            base = _groove(state.manipulability - 1.0, width=0.5, quadratic=0.1)
+        if settings.joint_limit_weight != 0.0 or settings.manipulability_weight != 0.0 or settings.self_collision_weight != 0.0:
+            def expensive_cost(value: np.ndarray) -> float:
+                evaluated = self.kinematics.evaluate(value)
+                total = 0.0
+                if settings.joint_limit_weight != 0.0:
+                    total += settings.joint_limit_weight * float(np.sum(_swamp(
+                        value,
+                        self.kinematics.joint_lower,
+                        self.kinematics.joint_upper,
+                        wall_height=10.0,
+                        polynomial=10.0,
+                        power=20,
+                    )))
+                if settings.manipulability_weight != 0.0:
+                    total += settings.manipulability_weight * _groove(
+                        evaluated.manipulability - 1.0, width=0.5, quadratic=0.1
+                    )
+                if settings.self_collision_weight != 0.0:
+                    clearances = _segment_distances(evaluated.link_points) - 0.05
+                    total += settings.self_collision_weight * float(np.sum(_swamp(
+                        clearances,
+                        0.02,
+                        1.5,
+                        wall_height=60.0,
+                        polynomial=0.0001,
+                        power=30,
+                    )))
+                return total
+
+            base = expensive_cost(q)
             epsilon = self.solver.settings.derivative_epsilon
             for index in range(7):
                 probe = q.copy()
                 probe[index] += epsilon
-                changed = self.kinematics.evaluate(probe).manipulability
-                gradient[index] += settings.manipulability_weight * (
-                    _groove(changed - 1.0, width=0.5, quadratic=0.1) - base
-                ) / epsilon
+                gradient[index] += (expensive_cost(probe) - base) / epsilon
         return gradient
 
     def solve_target(

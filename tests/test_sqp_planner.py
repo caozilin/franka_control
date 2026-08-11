@@ -44,6 +44,7 @@ def test_baseline_sqp_reaches_small_hard_pose_target() -> None:
     error = planner.kinematics.pose_error(reached, target.position, target.rotation)
     assert np.max(np.abs(error[:3])) <= planner.solver.settings.position_tolerance
     assert np.max(np.abs(error[3:])) <= planner.solver.settings.rotation_tolerance
+    assert "self_collision" in plan.solver.task_costs
 
 
 def test_no_robot_backend_accepts_absolute_joint_target() -> None:
