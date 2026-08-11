@@ -58,3 +58,12 @@ cmake --build build -j2
 
 Active-motion verification must only follow a successful zero-action hold and
 requires an available user stop.
+
+## Python-side tuning
+
+Experiment parameters are passed when constructing `FrankaEnv`; changing them
+does not require rebuilding the C++ extension. This includes `control_hz`,
+Cartesian and joint stiffness/damping, reference limits and convergence
+thresholds, torque-rate limits, collision thresholds, joint min-jerk duration,
+nullspace settings, and gripper command tolerances. C++ keeps only numerical
+constants and Franka hardware limits fixed.

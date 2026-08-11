@@ -17,7 +17,7 @@ class ReferenceGenerator {
  public:
   virtual ~ReferenceGenerator() = default;
   virtual const char* name() const = 0;
-  virtual ReferenceWeights weights(double raw_alpha) const = 0;
+  virtual ReferenceWeights weights(double raw_alpha, double duration) const = 0;
 };
 
 std::shared_ptr<ReferenceGenerator> makeReferenceGenerator(const std::string& name);

@@ -59,3 +59,17 @@ def test_robot_state_uses_consistent_lock_free_snapshot() -> None:
     assert "latest_robot_state_.store(latest)" in backend
     assert "latest_robot_state_.load()" in backend
     assert "latest_robot_state_mutex_" not in backend
+
+
+def test_realtime_experiment_parameters_come_from_python() -> None:
+    backend = (CPP / "franka_backend.cpp").read_text(encoding="utf-8")
+    reference = (CPP / "reference" / "cartesian_reference.hpp").read_text(encoding="utf-8")
+    tracker = (CPP / "tracker" / "joint_impedance_tracker.hpp").read_text(encoding="utf-8")
+    types = (CPP / "utils" / "types.hpp").read_text(encoding="utf-8")
+
+    assert 'config["policy_period_s"]' in backend
+    assert "config_.joint_min_jerk_duration_s" in backend
+    assert "config_.collision_lower_torque" in backend
+    assert "position_epsilon_" in reference
+    assert "JointImpedanceTracker(Vector7d stiffness, Vector7d damping)" in tracker
+    assert "kPolicyPeriod" not in types

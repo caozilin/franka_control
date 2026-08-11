@@ -147,6 +147,51 @@ Matrix6d matrix6FromArray(const py::array_t<double, py::array::c_style | py::arr
   return out;
 }
 
+template <size_t N>
+std::array<double, N> fixedArrayFromHandle(py::handle value, const char* name) {
+  auto array = py::array_t<double, py::array::c_style | py::array::forcecast>::ensure(value);
+  if (!array || array.ndim() != 1 || array.shape(0) != static_cast<py::ssize_t>(N)) {
+    throw std::invalid_argument(std::string(name) + " has the wrong shape");
+  }
+  std::array<double, N> out{};
+  std::copy(array.data(), array.data() + N, out.begin());
+  return out;
+}
+
+struct BackendConfig {
+  double policy_period_s;
+  double joint_min_jerk_duration_s;
+  std::array<double, 7> joint_stiffness;
+  std::array<double, 7> joint_damping;
+  double reference_position_epsilon;
+  double reference_linear_velocity_epsilon;
+  double reference_rotation_epsilon;
+  double reference_angular_velocity_epsilon;
+  std::array<double, 7> collision_lower_torque;
+  std::array<double, 7> collision_upper_torque;
+  std::array<double, 6> collision_lower_force;
+  std::array<double, 6> collision_upper_force;
+  double gripper_width_max;
+};
+
+BackendConfig backendConfigFromDict(const py::dict& config) {
+  return {
+      config["policy_period_s"].cast<double>(),
+      config["joint_min_jerk_duration_s"].cast<double>(),
+      fixedArrayFromHandle<7>(config["joint_stiffness"], "joint_stiffness"),
+      fixedArrayFromHandle<7>(config["joint_damping"], "joint_damping"),
+      config["reference_position_epsilon"].cast<double>(),
+      config["reference_linear_velocity_epsilon"].cast<double>(),
+      config["reference_rotation_epsilon"].cast<double>(),
+      config["reference_angular_velocity_epsilon"].cast<double>(),
+      fixedArrayFromHandle<7>(config["collision_lower_torque"], "collision_lower_torque"),
+      fixedArrayFromHandle<7>(config["collision_upper_torque"], "collision_upper_torque"),
+      fixedArrayFromHandle<6>(config["collision_lower_force"], "collision_lower_force"),
+      fixedArrayFromHandle<6>(config["collision_upper_force"], "collision_upper_force"),
+      config["gripper_width_max"].cast<double>(),
+  };
+}
+
 }  // namespace
 
 class RealtimeFrankaBackend {
@@ -172,7 +217,8 @@ class RealtimeFrankaBackend {
                         std::string nullspace_pinv,
                         std::string nullspace_projector,
                         double nullspace_lambda,
-                        py::array_t<double, py::array::c_style | py::array::forcecast> task_constraint_mask)
+                        py::array_t<double, py::array::c_style | py::array::forcecast> task_constraint_mask,
+                        py::dict backend_config)
       : robot_ip_(std::move(robot_ip)),
         robot_(robot_ip_),
         max_translation_step_(max_translation_step),
@@ -195,12 +241,13 @@ class RealtimeFrankaBackend {
                           nullspace_damping,
                           array7FromArray(nullspace_q_target, "nullspace_q_target"),
                           array6FromArray(task_constraint_mask, "task_constraint_mask")},
+        config_(backendConfigFromDict(backend_config)),
         trace_ring_(static_cast<size_t>(trace_capacity_sec > 0.0 ? trace_capacity_sec * 1000.0 : 1000)),
         timing_ring_(static_cast<size_t>(trace_capacity_sec > 0.0 ? trace_capacity_sec * 1000.0 : 1000)) {
-    robot_.setCollisionBehavior({{20.0, 20.0, 18.0, 18.0, 16.0, 14.0, 12.0}},
-                                {{20.0, 20.0, 18.0, 18.0, 16.0, 14.0, 12.0}},
-                                {{20.0, 20.0, 20.0, 25.0, 25.0, 25.0}},
-                                {{20.0, 20.0, 20.0, 25.0, 25.0, 25.0}});
+    robot_.setCollisionBehavior(config_.collision_lower_torque,
+                                config_.collision_upper_torque,
+                                config_.collision_lower_force,
+                                config_.collision_upper_force);
     updateLatestRobotState(robot_.readOnce());
   }
 
@@ -424,7 +471,8 @@ class RealtimeFrankaBackend {
     JointMinJerkReferenceGenerator reference(
         segment_duration, vector7FromArray(kJointLowerLimits), vector7FromArray(kJointUpperLimits));
     reference.reset(vector7FromArray(initial_state.q));
-    JointImpedanceTracker tracker;
+    JointImpedanceTracker tracker(
+        vector7FromArray(config_.joint_stiffness), vector7FromArray(config_.joint_damping));
     TorqueRateLimiter safety(max_torque_rate_);
     double elapsed = 0.0;
     double next_policy_time = 0.0;
@@ -436,7 +484,7 @@ class RealtimeFrankaBackend {
 
       while (elapsed + 1e-12 >= next_policy_time) {
         reference.acceptDelta(popAccumulatedJointAction(), elapsed);
-        next_policy_time += kPolicyPeriod;
+        next_policy_time += config_.policy_period_s;
       }
 
       const JointReferenceSample reference_sample = reference.sample(elapsed);
@@ -455,7 +503,7 @@ class RealtimeFrankaBackend {
 
   void runControlLoop(double max_duration) {
     if (control_mode_ == "joint") {
-      runJointMinJerkImpedanceLoop(max_duration, joint_min_jerk_duration_);
+      runJointMinJerkImpedanceLoop(max_duration, config_.joint_min_jerk_duration_s);
       return;
     }
 
@@ -464,7 +512,10 @@ class RealtimeFrankaBackend {
     CartesianReferenceGenerator reference(
         reference_generator_, max_translation_step_, max_rotation_step_,
         motion_limited_max_translation_velocity_, motion_limited_max_rotation_velocity_,
-        motion_limited_max_translation_acceleration_, motion_limited_max_rotation_acceleration_);
+        motion_limited_max_translation_acceleration_, motion_limited_max_rotation_acceleration_,
+        config_.policy_period_s, config_.reference_position_epsilon,
+        config_.reference_linear_velocity_epsilon, config_.reference_rotation_epsilon,
+        config_.reference_angular_velocity_epsilon);
     reference.reset(poseFromArray(initial_state.O_T_EE));
     CartesianImpedanceTracker tracker(stiffness_, damping_, nullspace_config_);
     TorqueRateLimiter safety(max_torque_rate_);
@@ -483,7 +534,7 @@ class RealtimeFrankaBackend {
       auto start = Clock::now();
       while (elapsed + 1e-12 >= next_policy_time) {
         reference.acceptAction(popAction(&timing), elapsed);
-        next_policy_time += kPolicyPeriod;
+        next_policy_time += config_.policy_period_s;
       }
       timing.fields[kPolicyTotal] += secondsSince(start);
 
@@ -589,11 +640,11 @@ class RealtimeFrankaBackend {
   double max_torque_rate_;
   std::shared_ptr<ReferenceGenerator> reference_generator_;
   std::string control_mode_;
-  double joint_min_jerk_duration_{0.25};
   std::array<double, 7> home_q_;
   Matrix6d stiffness_;
   Matrix6d damping_;
   NullspaceConfig nullspace_config_;
+  BackendConfig config_;
   SpscActionQueue<8, kActionQueueCapacity> action_queue_;
   std::thread control_thread_;
   std::atomic<bool> running_{false};
@@ -613,7 +664,7 @@ class RealtimeFrankaBackend {
     LatestRobotState latest;
     std::copy(state.q.begin(), state.q.end(), latest.q.begin());
     latest.pose = {pose(0, 3), pose(1, 3), pose(2, 3), rotvec.x(), rotvec.y(), rotvec.z(),
-                   kGripperWidthMax, kGripperWidthMax};
+                   config_.gripper_width_max, config_.gripper_width_max};
     latest.valid = true;
     latest_robot_state_.store(latest);
   }
@@ -636,7 +687,16 @@ class RealtimeFrankaBackend {
 
 class RealtimeGripperBackend {
  public:
-  explicit RealtimeGripperBackend(std::string robot_ip) : gripper_(std::move(robot_ip)) {}
+  RealtimeGripperBackend(std::string robot_ip,
+                         double width_tolerance,
+                         double close_threshold,
+                         double grasp_epsilon_inner,
+                         double grasp_epsilon_outer)
+      : gripper_(std::move(robot_ip)),
+        width_tolerance_(width_tolerance),
+        close_threshold_(close_threshold),
+        grasp_epsilon_inner_(grasp_epsilon_inner),
+        grasp_epsilon_outer_(grasp_epsilon_outer) {}
 
   py::dict read_once() const {
     const franka::GripperState state = [this]() {
@@ -652,20 +712,20 @@ class RealtimeGripperBackend {
   }
 
   bool command(double target, double speed, double force) const {
-    static constexpr double kWidthTolerance = 0.003;
-    static_cast<void>(force);
     target = std::clamp(target, 0.0, kGripperWidthMax);
     try {
       const franka::GripperState state = gripper_.readOnce();
-      if (target <= 1e-6) {
-        if (state.is_grasped || state.width <= kWidthTolerance) return true;
-      } else if (std::abs(state.width - target) <= kWidthTolerance) {
+      if (target <= close_threshold_) {
+        if (state.is_grasped || state.width <= width_tolerance_) return true;
+      } else if (std::abs(state.width - target) <= width_tolerance_) {
         return true;
       }
     } catch (...) {
     }
     // Close commands should use grasp so the gripper applies holding force once contact is made.
-    if (target <= 1e-6) return gripper_.grasp(0.0, speed, force, 0.08, 0.08);
+    if (target <= close_threshold_) {
+      return gripper_.grasp(0.0, speed, force, grasp_epsilon_inner_, grasp_epsilon_outer_);
+    }
     return gripper_.move(target, speed);
   }
 
@@ -673,6 +733,10 @@ class RealtimeGripperBackend {
 
  private:
   franka::Gripper gripper_;
+  double width_tolerance_;
+  double close_threshold_;
+  double grasp_epsilon_inner_;
+  double grasp_epsilon_outer_;
 };
 
 PYBIND11_MODULE(_franka_backend, m) {
@@ -685,7 +749,8 @@ PYBIND11_MODULE(_franka_backend, m) {
                     bool,
                     py::array_t<double, py::array::c_style | py::array::forcecast>,
                     double, double, std::string, std::string, double,
-                    py::array_t<double, py::array::c_style | py::array::forcecast>>(),
+                    py::array_t<double, py::array::c_style | py::array::forcecast>,
+                    py::dict>(),
            py::arg("robot_ip"), py::arg("max_translation_step"),
            py::arg("max_rotation_step"),
            py::arg("motion_limited_max_translation_velocity"),
@@ -703,7 +768,8 @@ PYBIND11_MODULE(_franka_backend, m) {
            py::arg("nullspace_pinv"),
            py::arg("nullspace_projector"),
            py::arg("nullspace_lambda"),
-           py::arg("task_constraint_mask"))
+           py::arg("task_constraint_mask"),
+           py::arg("backend_config"))
       .def("enqueue_action", &RealtimeFrankaBackend::enqueue_action)
       .def("clear_actions", &RealtimeFrankaBackend::clear_actions)
       .def("get_pending_action_count", &RealtimeFrankaBackend::get_pending_action_count)
@@ -725,7 +791,10 @@ PYBIND11_MODULE(_franka_backend, m) {
       .def("clear_trace", &RealtimeFrankaBackend::clear_trace);
 
   py::class_<RealtimeGripperBackend>(m, "RealtimeGripperBackend")
-      .def(py::init<std::string>(), py::arg("robot_ip"), py::call_guard<py::gil_scoped_release>())
+      .def(py::init<std::string, double, double, double, double>(),
+           py::arg("robot_ip"), py::arg("width_tolerance"), py::arg("close_threshold"),
+           py::arg("grasp_epsilon_inner"), py::arg("grasp_epsilon_outer"),
+           py::call_guard<py::gil_scoped_release>())
       .def("read_once", &RealtimeGripperBackend::read_once)
       .def("command", &RealtimeGripperBackend::command, py::arg("target"), py::arg("speed"), py::arg("force"),
            py::call_guard<py::gil_scoped_release>())

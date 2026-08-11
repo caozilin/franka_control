@@ -8,8 +8,9 @@ class MotionLimitedReferenceGenerator final : public ReferenceGenerator {
  public:
   const char* name() const override { return "motion_limited"; }
 
-  ReferenceWeights weights(double raw_alpha) const override {
+  ReferenceWeights weights(double raw_alpha, double duration) const override {
     (void)raw_alpha;
+    (void)duration;
     return {0.0, 0.0};
   }
 };

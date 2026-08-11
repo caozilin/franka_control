@@ -1,6 +1,6 @@
 #pragma once
 
-#include <cmath>
+#include <utility>
 
 #include "reference/reference_types.hpp"
 #include "utils/types.hpp"
@@ -9,10 +9,8 @@ namespace franka_control::cpp {
 
 class JointImpedanceTracker {
  public:
-  JointImpedanceTracker() {
-    stiffness_ << 80.0, 80.0, 80.0, 60.0, 25.0, 15.0, 10.0;
-    for (Eigen::Index i = 0; i < 7; ++i) damping_[i] = 2.0 * std::sqrt(stiffness_[i]);
-  }
+  JointImpedanceTracker(Vector7d stiffness, Vector7d damping)
+      : stiffness_(std::move(stiffness)), damping_(std::move(damping)) {}
 
   Vector7d compute(const Vector7d& q,
                    const Vector7d& dq,

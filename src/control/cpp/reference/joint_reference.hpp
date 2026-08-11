@@ -11,7 +11,7 @@ namespace franka_control::cpp {
 class JointMinJerkReferenceGenerator {
  public:
   JointMinJerkReferenceGenerator(double duration, const Vector7d& lower, const Vector7d& upper)
-      : duration_(std::max(duration, kPolicyPeriod)), lower_(lower), upper_(upper) {}
+      : duration_(duration), lower_(lower), upper_(upper) {}
 
   void reset(const Vector7d& initial_q) {
     command_q_ = initial_q;

@@ -35,6 +35,14 @@ DEFAULT_MAX_ROTATION_GOAL_ERROR = math.pi / 6.0
 DEFAULT_MOTION_LIMITED_VELOCITY_SCALE = 1.2
 DEFAULT_MOTION_LIMITED_ACCELERATION_SCALE = 5.0
 DEFAULT_MAX_TORQUE_RATE = 1000.0
+DEFAULT_JOINT_STIFFNESS = np.array([80.0, 80.0, 80.0, 60.0, 25.0, 15.0, 10.0], dtype=np.float64)
+DEFAULT_JOINT_DAMPING = 2.0 * np.sqrt(DEFAULT_JOINT_STIFFNESS)
+DEFAULT_REFERENCE_POSITION_EPSILON = 0.0005
+DEFAULT_REFERENCE_LINEAR_VELOCITY_EPSILON = 0.001
+DEFAULT_REFERENCE_ROTATION_EPSILON = 0.001
+DEFAULT_REFERENCE_ANGULAR_VELOCITY_EPSILON = 0.001
+DEFAULT_COLLISION_TORQUE = np.array([20.0, 20.0, 18.0, 18.0, 16.0, 14.0, 12.0], dtype=np.float64)
+DEFAULT_COLLISION_FORCE = np.array([20.0, 20.0, 20.0, 25.0, 25.0, 25.0], dtype=np.float64)
 
 DEFAULT_HOME_Q = np.array(
     [0.0, -math.pi / 4.0, 0.0, -3.0 * math.pi / 4.0, 0.0, math.pi / 2.0, math.pi / 4.0],
@@ -46,6 +54,10 @@ GRIPPER_SPEED = 0.08
 GRIPPER_FORCE = 60.0
 GRIPPER_CONNECT_TIMEOUT = 8.0
 GRIPPER_STATE_POLL_PERIOD = 1.0 / POLICY_HZ
+GRIPPER_WIDTH_TOLERANCE = 0.003
+GRIPPER_CLOSE_THRESHOLD = 1e-6
+GRIPPER_GRASP_EPSILON_INNER = 0.08
+GRIPPER_GRASP_EPSILON_OUTER = 0.08
 CAMERA_WIDTH = 640
 CAMERA_HEIGHT = 480
 CAMERA_FPS = 15
@@ -240,6 +252,7 @@ class _NoRobotBackend:
         nullspace_projector: str = "kinematic",
         nullspace_lambda: float = 0.05,
         task_constraint_mask: np.ndarray | None = None,
+        control_hz: float = POLICY_HZ,
     ):
         del home_q, stiffness, damping, nullspace_q_target
         self.max_translation_velocity = float(max_translation_velocity)
@@ -267,7 +280,7 @@ class _NoRobotBackend:
             else DEFAULT_MOTION_LIMITED_ACCELERATION_SCALE * self.motion_limited_max_rotation_velocity
         )
         self.max_torque_rate = float(max_torque_rate)
-        self.control_hz = POLICY_HZ
+        self.control_hz = float(control_hz)
         self.max_translation_step = self.max_translation_velocity / self.control_hz
         self.max_rotation_step = self.max_rotation_velocity / self.control_hz
         self.reference_name = _validate_reference_name(reference_name)
@@ -373,7 +386,7 @@ class _NoRobotBackend:
 
 
 class FrankaEnv:
-    """Python 10Hz high-level interface; realtime torque control runs inside the C++ extension."""
+    """Python high-level interface; realtime torque control runs in C++."""
 
     def __init__(
         self,
@@ -383,6 +396,7 @@ class FrankaEnv:
         reset_duration: float = 5.0,
         max_translation_velocity: float = DEFAULT_MAX_TRANSLATION_VELOCITY,
         max_rotation_velocity: float = DEFAULT_MAX_ROTATION_VELOCITY,
+        control_hz: float = POLICY_HZ,
         max_translation_goal_error: float = DEFAULT_MAX_TRANSLATION_GOAL_ERROR,
         max_rotation_goal_error: float = DEFAULT_MAX_ROTATION_GOAL_ERROR,
         motion_limited_max_translation_velocity: float | None = None,
@@ -395,6 +409,16 @@ class FrankaEnv:
         reference_name: str = "min_jerk",
         control_mode: str = "cartesian",
         joint_min_jerk_duration: float = 0.25,
+        joint_stiffness: np.ndarray | None = None,
+        joint_damping: np.ndarray | None = None,
+        reference_position_epsilon: float = DEFAULT_REFERENCE_POSITION_EPSILON,
+        reference_linear_velocity_epsilon: float = DEFAULT_REFERENCE_LINEAR_VELOCITY_EPSILON,
+        reference_rotation_epsilon: float = DEFAULT_REFERENCE_ROTATION_EPSILON,
+        reference_angular_velocity_epsilon: float = DEFAULT_REFERENCE_ANGULAR_VELOCITY_EPSILON,
+        collision_lower_torque: np.ndarray | None = None,
+        collision_upper_torque: np.ndarray | None = None,
+        collision_lower_force: np.ndarray | None = None,
+        collision_upper_force: np.ndarray | None = None,
         nullspace_enabled: bool = False,
         nullspace_q_target: np.ndarray | None = None,
         nullspace_stiffness: float = 10.0,
@@ -408,6 +432,10 @@ class FrankaEnv:
         use_gripper: bool = True,
         gripper_speed: float = GRIPPER_SPEED,
         gripper_force: float = GRIPPER_FORCE,
+        gripper_width_tolerance: float = GRIPPER_WIDTH_TOLERANCE,
+        gripper_close_threshold: float = GRIPPER_CLOSE_THRESHOLD,
+        gripper_grasp_epsilon_inner: float = GRIPPER_GRASP_EPSILON_INNER,
+        gripper_grasp_epsilon_outer: float = GRIPPER_GRASP_EPSILON_OUTER,
         no_robot: bool = False,
         no_cameras: bool = True,
         cam1_serial: str | None = DEFAULT_CAM1_SERIAL,
@@ -445,7 +473,9 @@ class FrankaEnv:
             else DEFAULT_MOTION_LIMITED_ACCELERATION_SCALE * self.motion_limited_max_rotation_velocity
         )
         self.max_torque_rate = float(max_torque_rate)
-        self.control_hz = POLICY_HZ
+        self.control_hz = float(control_hz)
+        if self.control_hz <= 0.0:
+            raise ValueError("control_hz must be positive")
         self.max_translation_step = self.max_translation_velocity / self.control_hz
         self.max_rotation_step = self.max_rotation_velocity / self.control_hz
         self.reset_duration = float(reset_duration)
@@ -453,6 +483,30 @@ class FrankaEnv:
         self.reference_name = _validate_reference_name(reference_name)
         self.control_mode = _validate_control_mode(control_mode)
         self.joint_min_jerk_duration = float(joint_min_jerk_duration)
+        if self.joint_min_jerk_duration <= 0.0:
+            raise ValueError("joint_min_jerk_duration must be positive")
+        self.joint_stiffness = np.asarray(
+            DEFAULT_JOINT_STIFFNESS if joint_stiffness is None else joint_stiffness, dtype=np.float64
+        )
+        self.joint_damping = np.asarray(
+            DEFAULT_JOINT_DAMPING if joint_damping is None else joint_damping, dtype=np.float64
+        )
+        self.reference_position_epsilon = float(reference_position_epsilon)
+        self.reference_linear_velocity_epsilon = float(reference_linear_velocity_epsilon)
+        self.reference_rotation_epsilon = float(reference_rotation_epsilon)
+        self.reference_angular_velocity_epsilon = float(reference_angular_velocity_epsilon)
+        self.collision_lower_torque = np.asarray(
+            DEFAULT_COLLISION_TORQUE if collision_lower_torque is None else collision_lower_torque, dtype=np.float64
+        )
+        self.collision_upper_torque = np.asarray(
+            DEFAULT_COLLISION_TORQUE if collision_upper_torque is None else collision_upper_torque, dtype=np.float64
+        )
+        self.collision_lower_force = np.asarray(
+            DEFAULT_COLLISION_FORCE if collision_lower_force is None else collision_lower_force, dtype=np.float64
+        )
+        self.collision_upper_force = np.asarray(
+            DEFAULT_COLLISION_FORCE if collision_upper_force is None else collision_upper_force, dtype=np.float64
+        )
         self.trace_capacity_sec = float(trace_capacity_sec)
         self.home_q = np.asarray(home_q if home_q is not None else DEFAULT_HOME_Q, dtype=np.float64)
         self.stiffness = np.asarray(stiffness if stiffness is not None else DEFAULT_STIFFNESS, dtype=np.float64)
@@ -494,6 +548,10 @@ class FrankaEnv:
         self._gripper_driver: AsyncGripperDriver | None = None
         self._gripper_speed = float(gripper_speed)
         self._gripper_force = float(gripper_force)
+        self.gripper_width_tolerance = float(gripper_width_tolerance)
+        self.gripper_close_threshold = float(gripper_close_threshold)
+        self.gripper_grasp_epsilon_inner = float(gripper_grasp_epsilon_inner)
+        self.gripper_grasp_epsilon_outer = float(gripper_grasp_epsilon_outer)
         self.commanded_pose_array = np.zeros(6, dtype=np.float64)
         self.ee_force_torque = np.zeros(6, dtype=np.float64)
         self._last_goal_rotation_error = np.zeros(3, dtype=np.float64)
@@ -522,6 +580,7 @@ class FrankaEnv:
                 self.nullspace_projector,
                 self.nullspace_lambda,
                 self.task_constraint_mask,
+                control_hz=self.control_hz,
             )
         else:
             from control._franka_backend import RealtimeFrankaBackend
@@ -549,12 +608,29 @@ class FrankaEnv:
                 self.nullspace_projector,
                 self.nullspace_lambda,
                 self.task_constraint_mask,
+                {
+                    "policy_period_s": 1.0 / self.control_hz,
+                    "joint_min_jerk_duration_s": self.joint_min_jerk_duration,
+                    "joint_stiffness": self.joint_stiffness,
+                    "joint_damping": self.joint_damping,
+                    "reference_position_epsilon": self.reference_position_epsilon,
+                    "reference_linear_velocity_epsilon": self.reference_linear_velocity_epsilon,
+                    "reference_rotation_epsilon": self.reference_rotation_epsilon,
+                    "reference_angular_velocity_epsilon": self.reference_angular_velocity_epsilon,
+                    "collision_lower_torque": self.collision_lower_torque,
+                    "collision_upper_torque": self.collision_upper_torque,
+                    "collision_lower_force": self.collision_lower_force,
+                    "collision_upper_force": self.collision_upper_force,
+                    "gripper_width_max": GRIPPER_WIDTH_MAX,
+                },
             )
             if use_gripper:
                 self._start_gripper_driver(float(gripper_speed), float(gripper_force))
         self._refresh_status_from_state()
 
     def _start_gripper_driver(self, speed: float, force: float) -> None:
+        from control._franka_backend import RealtimeGripperBackend
+
         driver = AsyncGripperDriver(
             self.robot_ip,
             speed=speed,
@@ -562,6 +638,13 @@ class FrankaEnv:
             width_max=GRIPPER_WIDTH_MAX,
             poll_period=GRIPPER_STATE_POLL_PERIOD,
             connect_timeout=GRIPPER_CONNECT_TIMEOUT,
+            backend_factory=lambda robot_ip: RealtimeGripperBackend(
+                robot_ip,
+                self.gripper_width_tolerance,
+                self.gripper_close_threshold,
+                self.gripper_grasp_epsilon_inner,
+                self.gripper_grasp_epsilon_outer,
+            ),
         )
         self._gripper_driver = driver
         try:

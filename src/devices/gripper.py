@@ -10,7 +10,7 @@ from typing import Any
 def _default_backend_factory(robot_ip: str):
     from control._franka_backend import RealtimeGripperBackend
 
-    return RealtimeGripperBackend(robot_ip)
+    return RealtimeGripperBackend(robot_ip, 0.003, 1e-6, 0.08, 0.08)
 
 
 class AsyncGripperDriver:

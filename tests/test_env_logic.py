@@ -84,6 +84,21 @@ def test_franka_env_task_constraint_mask_defaults_to_full_constraint() -> None:
     env.stop()
 
 
+def test_franka_env_control_rate_is_a_python_hyperparameter() -> None:
+    env = FrankaEnv(
+        no_robot=True,
+        no_cameras=True,
+        print_events=False,
+        control_hz=20.0,
+        max_translation_velocity=0.2,
+        max_rotation_velocity=1.0,
+    )
+    assert env.control_hz == 20.0
+    assert env.max_translation_step == 0.01
+    assert env.max_rotation_step == 0.05
+    env.stop()
+
+
 def test_franka_env_task_constraint_mask_validates_shape_and_nonempty() -> None:
     try:
         FrankaEnv(no_robot=True, no_cameras=True, print_events=False, task_constraint_mask=np.ones(5, dtype=np.float64))

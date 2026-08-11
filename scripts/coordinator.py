@@ -113,11 +113,7 @@ class Args:
             self.replan_steps = 16 if self.policy_type == "cosmos" else 5
         self.rtc_execution_horizon = max(1, int(self.rtc_execution_horizon))
         self.rtc_inference_delay = max(0, int(self.rtc_inference_delay))
-        rates = ControlRates(policy_hz=float(self.control_hz), planner_hz=float(self.control_hz))
-        if abs(rates.policy_hz - 10.0) > 1e-9:
-            raise ValueError(
-                "control_hz must remain 10.0 until the C++ policy period is configurable"
-            )
+        ControlRates(policy_hz=float(self.control_hz), planner_hz=float(self.control_hz))
 
 
 class Coordinator:
@@ -191,6 +187,7 @@ class Coordinator:
             no_robot=args.no_robot,
             no_cameras=args.no_cameras,
             use_gripper=args.use_gripper,
+            control_hz=args.control_hz,
             save_recording=args.save_recording,
             reference_name=args.reference_name,
             nullspace_enabled=args.nullspace_enabled,

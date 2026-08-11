@@ -23,14 +23,24 @@ class CartesianReferenceGenerator {
                               double max_translation_velocity,
                               double max_rotation_velocity,
                               double max_translation_acceleration,
-                              double max_rotation_acceleration)
+                              double max_rotation_acceleration,
+                              double segment_duration,
+                              double position_epsilon,
+                              double linear_velocity_epsilon,
+                              double rotation_epsilon,
+                              double angular_velocity_epsilon)
       : profile_(std::move(profile)),
         max_translation_step_(max_translation_step),
         max_rotation_step_(max_rotation_step),
         max_translation_velocity_(max_translation_velocity),
         max_rotation_velocity_(max_rotation_velocity),
         max_translation_acceleration_(max_translation_acceleration),
-        max_rotation_acceleration_(max_rotation_acceleration) {
+        max_rotation_acceleration_(max_rotation_acceleration),
+        segment_duration_(segment_duration),
+        position_epsilon_(position_epsilon),
+        linear_velocity_epsilon_(linear_velocity_epsilon),
+        rotation_epsilon_(rotation_epsilon),
+        angular_velocity_epsilon_(angular_velocity_epsilon) {
     if (profile_ == nullptr) throw std::invalid_argument("Cartesian reference profile cannot be null");
     motion_limited_ = std::string(profile_->name()) == "motion_limited";
   }
@@ -71,7 +81,8 @@ class CartesianReferenceGenerator {
     if (isMotionLimited()) {
       updateMotionLimited(dt, &desired_velocity);
     } else {
-      const auto weights = profile_->weights((elapsed - segment_start_time_) / kPolicyPeriod);
+      const auto weights = profile_->weights(
+          (elapsed - segment_start_time_) / segment_duration_, segment_duration_);
       command_pose_ = segment_start_pose_;
       command_pose_.block<3, 1>(0, 3) += weights.position * segment_delta_translation_;
       command_pose_.block<3, 3>(0, 0) =
@@ -98,7 +109,7 @@ class CartesianReferenceGenerator {
     const Eigen::Vector3d position_error = position_goal - position_reference;
     const double position_distance = position_error.norm();
 
-    if (position_distance < kRefPositionEps && linear_velocity_.norm() < kRefLinearVelocityEps) {
+    if (position_distance < position_epsilon_ && linear_velocity_.norm() < linear_velocity_epsilon_) {
       command_pose_.block<3, 1>(0, 3) = position_goal;
       linear_velocity_.setZero();
       linear_acceleration_.setZero();
@@ -127,7 +138,7 @@ class CartesianReferenceGenerator {
         last_rotation_error_);
     last_rotation_error_ = rotation_error;
     const double rotation_distance = rotation_error.norm();
-    if (rotation_distance < kRefRotationEps && angular_velocity_.norm() < kRefAngularVelocityEps) {
+    if (rotation_distance < rotation_epsilon_ && angular_velocity_.norm() < angular_velocity_epsilon_) {
       command_pose_.block<3, 3>(0, 0) = segment_target_pose_.block<3, 3>(0, 0);
       angular_velocity_.setZero();
       angular_acceleration_.setZero();
@@ -164,6 +175,11 @@ class CartesianReferenceGenerator {
   double max_rotation_velocity_;
   double max_translation_acceleration_;
   double max_rotation_acceleration_;
+  double segment_duration_;
+  double position_epsilon_;
+  double linear_velocity_epsilon_;
+  double rotation_epsilon_;
+  double angular_velocity_epsilon_;
   Pose command_pose_{Pose::Identity()};
   Pose segment_start_pose_{Pose::Identity()};
   Pose segment_target_pose_{Pose::Identity()};
