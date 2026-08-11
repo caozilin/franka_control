@@ -31,6 +31,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from client.websocket_client_policy import WebsocketClientPolicy
+from devices.pico import PicoMapperConfig, PicoPoseMapper, PicoUdpReceiver
 from orchestration import ActionPlanScheduler, RTCConfig
 from recording import RealtimeTimingProfiler
 from control.contracts import ControlRates, PolicyActionSpec
@@ -68,6 +69,7 @@ class State(enum.Enum):
 
 @dataclasses.dataclass
 class Args:
+    action_source: str = "policy"
     host: str = "100.96.2.67"
     port: int = 8000
     web_port: int = 8080
@@ -85,6 +87,19 @@ class Args:
     save_recording: bool = False
     startup_home: bool = True
     control_hz: float = 10.0
+    pico_bind_host: str = "0.0.0.0"
+    pico_port: int = 9010
+    pico_translation_scale: float = 0.5
+    pico_rotation_scale: float = 1.0
+    pico_grip_threshold: float = 0.5
+    pico_trigger_threshold: float = 0.5
+    pico_stale_timeout_s: float = 0.15
+    pico_require_both_grips: bool = True
+    pico_rotation_base_from_pico: tuple[float, float, float, float, float, float, float, float, float] = (
+        1.0, 0.0, 0.0,
+        0.0, 1.0, 0.0,
+        0.0, 0.0, 1.0,
+    )
     planner_mode: str = "direct"
     policy_translation_scale_m: float = 0.01
     policy_rotation_scale_rad: float = 0.01
@@ -129,6 +144,9 @@ class Args:
     rtc_inference_delay: int = 3
 
     def __post_init__(self) -> None:
+        self.action_source = self.action_source.lower().strip()
+        if self.action_source not in {"policy", "pico"}:
+            raise ValueError("action_source must be 'policy' or 'pico'")
         self.policy_type = self.policy_type.lower().strip()
         if self.policy_type not in {"openpi", "cosmos"}:
             raise ValueError("policy_type must be 'openpi' or 'cosmos'")
@@ -136,7 +154,7 @@ class Args:
         if self.planner_mode not in {"direct", "baseline_sqp", "shadow_sqp"}:
             raise ValueError("planner_mode must be 'direct', 'baseline_sqp', or 'shadow_sqp'")
         if not str(self.log_subdir or "").strip():
-            self.log_subdir = self.policy_type
+            self.log_subdir = self.policy_type if self.action_source == "policy" else "pico"
         if self.reference is not None:
             self.reference_name = str(self.reference)
         self.reference_name = self.reference_name.lower().strip()
@@ -172,7 +190,7 @@ class Coordinator:
         self._action_scheduler = ActionPlanScheduler(
             int(args.replan_steps or 1),
             RTCConfig(
-                enabled=args.policy_type == "openpi" and bool(args.rtc_enabled),
+                enabled=args.action_source == "policy" and args.policy_type == "openpi" and bool(args.rtc_enabled),
                 execution_horizon=args.rtc_execution_horizon,
                 inference_delay=args.rtc_inference_delay,
             ),
@@ -206,6 +224,7 @@ class Coordinator:
         self._latest_infer_ms: float | None = None
         self._latest_total_ms: float | None = None
         self._latest_sqp: dict[str, Any] | None = None
+        self._latest_pico: dict[str, Any] | None = None
         self._latest_ee_force_torque: list | None = None
         self._latest_value_prediction: float | None = None
         self._latest_proprio: Any = None
@@ -283,6 +302,29 @@ class Coordinator:
                         upper=self._rotation_limits[axis],
                     )
             self._sqp_axis_tasks = tuple(tasks)
+
+        self._pico_receiver: PicoUdpReceiver | None = None
+        self._pico_mapper: PicoPoseMapper | None = None
+        if args.action_source == "pico":
+            self._pico_receiver = PicoUdpReceiver(args.pico_bind_host, args.pico_port)
+            self._pico_mapper = PicoPoseMapper(
+                PicoMapperConfig(
+                    translation_scale=args.pico_translation_scale,
+                    rotation_scale=args.pico_rotation_scale,
+                    max_translation_step_m=self._env.max_translation_step,
+                    max_rotation_step_rad=self._env.max_rotation_step,
+                    grip_threshold=args.pico_grip_threshold,
+                    trigger_threshold=args.pico_trigger_threshold,
+                    stale_timeout_s=args.pico_stale_timeout_s,
+                    require_both_grips=args.pico_require_both_grips,
+                    rotation_base_from_pico=np.asarray(
+                        args.pico_rotation_base_from_pico,
+                        dtype=np.float64,
+                    ).reshape(3, 3),
+                )
+            )
+            self._pico_receiver.start()
+            logger.info("PICO UDP receiver listening on %s:%d", args.pico_bind_host, self._pico_receiver.port)
         if args.startup_home and not args.no_robot:
             logger.info("Startup homing Franka before serving UI")
             self._env.reset()
@@ -300,6 +342,8 @@ class Coordinator:
             return self._log_subdir
 
     def _connect_client(self) -> None:
+        if self._args.action_source != "policy":
+            return
         try:
             self._client = WebsocketClientPolicy(self._args.host, self._args.port, self._args.api_key)
         except Exception as exc:
@@ -307,6 +351,8 @@ class Coordinator:
             self._client = None
 
     def _reset_policy_client(self, reason: str) -> None:
+        if self._args.action_source != "policy":
+            return
         if self._client is None:
             self._connect_client()
             return
@@ -322,6 +368,8 @@ class Coordinator:
         with self._state_lock:
             if self._state == State.IDLE:
                 self._action_scheduler.clear()
+                if self._pico_mapper is not None:
+                    self._pico_mapper.reset()
                 if self._sqp_planner is not None:
                     self._sqp_planner.reset(self._env.get_joint_positions())
                 self._bump_infer_generation()
@@ -332,6 +380,8 @@ class Coordinator:
         with self._state_lock:
             if self._state == State.RUNNING:
                 self._action_scheduler.clear()
+                if self._pico_mapper is not None:
+                    self._pico_mapper.reset()
                 self._bump_infer_generation()
                 self._env.clear_actions()
                 self._env.stop_control()
@@ -342,6 +392,8 @@ class Coordinator:
     def cmd_home(self) -> None:
         with self._state_lock:
             self._action_scheduler.clear()
+            if self._pico_mapper is not None:
+                self._pico_mapper.reset()
             self._bump_infer_generation()
             self._env.clear_actions()
             self._state = State.HOMING
@@ -368,6 +420,12 @@ class Coordinator:
             self._latest_infer_ms = None
             self._latest_total_ms = None
             self._latest_sqp = None
+            self._latest_pico = None
+
+    def close(self) -> None:
+        if self._pico_receiver is not None:
+            self._pico_receiver.stop()
+        self._env.stop_control()
 
     def _bump_infer_generation(self) -> None:
         with self._infer_lock:
@@ -464,6 +522,7 @@ class Coordinator:
     def _write_session_metadata(self, session_dir: pathlib.Path, *, status: str) -> None:
         metadata = {
             "status": status,
+            "action_source": self._args.action_source,
             "policy_type": self._args.policy_type,
             "prompt": self._prompt,
             "log_subdir": self.log_subdir,
@@ -595,7 +654,7 @@ class Coordinator:
                 return
             self._record_frames1.append(img1_raw.copy())
             self._record_frames2.append(img2_raw.copy())
-            if self._args.policy_type == "cosmos":
+            if self._args.action_source == "policy" and self._args.policy_type == "cosmos":
                 with self._telemetry_lock:
                     fw = self._latest_future_wrist
                     fp = self._latest_future_primary
@@ -605,16 +664,17 @@ class Coordinator:
                     self._record_frames4.append(np.asarray(fp).copy())
 
     def _run_action_step(self, obs: dict) -> None:
-        if self._env.robot is not None and not self._env.is_control_running():
-            try:
-                self._env.check_control_error()
-            except Exception:
-                logger.exception("Franka torque control exited unexpectedly; State -> IDLE")
-                self._action_scheduler.clear()
-                self._clear_action_runtime()
-                with self._state_lock:
-                    self._state = State.IDLE
-                return
+        if not self._env.is_control_running():
+            if self._env.robot is not None:
+                try:
+                    self._env.check_control_error()
+                except Exception:
+                    logger.exception("Franka torque control exited unexpectedly; State -> IDLE")
+                    self._action_scheduler.clear()
+                    self._clear_action_runtime()
+                    with self._state_lock:
+                        self._state = State.IDLE
+                    return
             logger.info("Starting Franka torque control on RUNNING state")
             self._control_timing_profiler = RealtimeTimingProfiler(capacity=12000)
             self._env.start_control(
@@ -624,14 +684,19 @@ class Coordinator:
             )
             return
 
-        if self._action_scheduler.should_prefetch():
-            self._request_infer_async(obs)
-
-        action = self._action_scheduler.pop_next()
-        if action is None:
-            return
-        raw_action = action.copy()
-        exec_action = self._policy_action_spec.decode_cartesian(action).as_vector()
+        if self._args.action_source == "pico":
+            pico_action = self._next_pico_action()
+            if pico_action is None:
+                return
+            raw_action, exec_action = pico_action
+        else:
+            if self._action_scheduler.should_prefetch():
+                self._request_infer_async(obs)
+            action = self._action_scheduler.pop_next()
+            if action is None:
+                return
+            raw_action = action.copy()
+            exec_action = self._policy_action_spec.decode_cartesian(action).as_vector()
         transformed = transform_action(exec_action, self._env.action_config)
         sqp_telemetry = None
         if self._sqp_planner is None:
@@ -675,12 +740,46 @@ class Coordinator:
                 "rotation_residual": plan.solver.constraints.rotation_residual,
                 "tolerance_violation": plan.solver.constraints.inequality_violation,
             }
-        self._action_scheduler.consume_executed_step()
+        if self._args.action_source == "policy":
+            self._action_scheduler.consume_executed_step()
         with self._telemetry_lock:
             self._latest_action = raw_action.tolist()
             self._latest_action_transformed = transformed.tolist()
             self._latest_sqp = sqp_telemetry
         self._record_action_telemetry()
+
+    def _next_pico_action(self) -> tuple[np.ndarray, np.ndarray] | None:
+        assert self._pico_receiver is not None and self._pico_mapper is not None
+        snapshot = self._pico_receiver.latest()
+        command = self._pico_mapper.step(snapshot)
+        pico = {
+            "receiver_port": self._pico_receiver.port,
+            "packet_received": snapshot is not None,
+            "age_s": None if snapshot is None else snapshot.age_s(),
+        }
+        if snapshot is not None:
+            pico.update(
+                {
+                    "sequence": snapshot.packet.sequence,
+                    "session_id": snapshot.packet.session_id,
+                    "tracked": snapshot.packet.left.tracked and snapshot.packet.right.tracked,
+                    "left_grip": snapshot.packet.left.grip,
+                    "right_grip": snapshot.packet.right.grip,
+                    "right_trigger": snapshot.packet.right.trigger,
+                }
+            )
+        if command is not None:
+            pico.update(
+                {
+                    "motion_enabled": command.motion_enabled,
+                    "reanchored": command.reanchored,
+                }
+            )
+        with self._telemetry_lock:
+            self._latest_pico = pico
+        if command is None:
+            return None
+        return command.action.copy(), command.action.copy()
 
     def _copy_obs_for_inference(self, obs: dict) -> dict:
         copied = {}
@@ -850,6 +949,8 @@ class Coordinator:
                 "action_raw": self._latest_action,
                 "action_transformed": self._latest_action_transformed,
                 "sqp": self._latest_sqp,
+                "pico": self._latest_pico,
+                "action_source": self._args.action_source,
                 "inference_time_ms": self._latest_infer_ms,
                 "total_time_ms": self._latest_total_ms,
                 "pending_action_count": self._env.get_pending_action_count(),
@@ -883,6 +984,8 @@ class Coordinator:
                 "action_raw": self._latest_action,
                 "action_transformed": self._latest_action_transformed,
                 "sqp": self._latest_sqp,
+                "pico": self._latest_pico,
+                "action_source": self._args.action_source,
                 "inference_time_ms": self._latest_infer_ms,
                 "total_time_ms": self._latest_total_ms,
                 "pending_action_count": self._env.get_pending_action_count(),
@@ -922,6 +1025,8 @@ class Coordinator:
                 "action_raw": self._latest_action,
                 "action_transformed": self._latest_action_transformed,
                 "sqp": self._latest_sqp,
+                "pico": self._latest_pico,
+                "action_source": self._args.action_source,
                 "infer_ms": self._latest_infer_ms,
                 "total_ms": self._latest_total_ms,
                 "robot_connected": self._env.robot is not None,
@@ -1044,6 +1149,8 @@ def build_app(coordinator: Coordinator) -> FastAPI:
                 "action_raw": coordinator._latest_action,
                 "action_transformed": coordinator._latest_action_transformed,
                 "sqp": coordinator._latest_sqp,
+                "pico": coordinator._latest_pico,
+                "action_source": coordinator._args.action_source,
                 "infer_ms": coordinator._latest_infer_ms,
                 "total_ms": coordinator._latest_total_ms,
                 "pending_action_count": coordinator._env.get_pending_action_count(),
@@ -1074,6 +1181,10 @@ def build_app(coordinator: Coordinator) -> FastAPI:
     @app.on_event("startup")
     async def startup() -> None:
         asyncio.create_task(coordinator.stream_to_clients())
+
+    @app.on_event("shutdown")
+    async def shutdown() -> None:
+        coordinator.close()
 
     return app
 
