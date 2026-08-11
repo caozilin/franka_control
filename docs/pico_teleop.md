@@ -4,12 +4,27 @@ PICO 端只负责发送左右手柄的 tracking pose 和按键状态。本项目
 
 ## 当前映射
 
-- 使用右手柄的 grip pose（不是 aim/ray pose）控制末端六维增量。
-- 左右 Grip 同时按下才允许运动；首次按下只重设锚点，不产生跳变。
-- 松开任一 Grip 后停止运动，下次按下重新锚定。
+默认 `split` 模式：
+
+- 左手柄位置控制末端 XYZ 平移，左手柄姿态被忽略。
+- 右手柄姿态控制末端旋转，右手柄位置被忽略。
+- 左 Grip 是平移离合，右 Grip 是旋转离合；两个通道分别重锚，可以单独或同时操作。
+- 每个通道首次按下只重设自己的锚点，不产生跳变。
 - 右 Trigger 控制夹爪：超过阈值闭合，否则张开。
 - Primary、Secondary 和摇杆随协议接收并保留，当前不绑定机器人行为。
 - 超过 `pico_stale_timeout_s` 没有新包，或任一手柄丢失 tracking 时，不再生成动作。
+
+`single_6dof` baseline 使用右手柄 grip pose 控制全部六维增量，并沿用左右 Grip 同时使能的行为。两种模式都应使用 grip pose，而不是 aim/ray pose。
+
+通过命令行切换：
+
+```bash
+# 主方法，默认值
+--pico-mapping-mode split
+
+# 单手6D baseline
+--pico-mapping-mode single_6dof
+```
 
 PICO/Unity 通常以 60Hz 或 90Hz 发包。接收线程只保存最新包，coordinator 固定以 `control_hz=10` 消费，因此不会堆积旧位姿。
 
@@ -55,6 +70,7 @@ PICO/Unity 通常以 60Hz 或 90Hz 发包。接收线程只保存最新包，coo
 ```bash
 uv run python scripts/coordinator.py \
   --action-source pico \
+  --pico-mapping-mode split \
   --pico-bind-host 127.0.0.1 \
   --pico-port 9010 \
   --no-robot --no-cameras --no-use-gripper --no-startup-home
@@ -66,7 +82,7 @@ uv run python scripts/coordinator.py \
 uv run python examples/pico_udp_sender.py
 ```
 
-加 `--enable-motion` 会让示例右手柄沿 x 方向往复运动。即使是离线 backend，也应先在 coordinator 页面执行 Start；状态接口 `/status` 的 `pico` 字段会显示序号、包龄、tracking、Grip、Trigger 和重锚状态。
+加 `--enable-motion` 会让示例左手柄沿 x 方向往复运动。即使是离线 backend，也应先在 coordinator 页面执行 Start；状态接口 `/status` 的 `pico` 字段会显示当前映射模式、序号、包龄、tracking、Grip、Trigger 和重锚状态。
 
 ## 接入规划器
 
@@ -83,4 +99,4 @@ uv run python scripts/coordinator.py --action-source pico --planner-mode baselin
 uv run python scripts/coordinator.py --action-source pico --planner-mode shadow_sqp
 ```
 
-主要可调参数都在 coordinator 的 Python CLI：`pico_translation_scale`、`pico_rotation_scale`、Grip/Trigger 阈值、超时、坐标标定矩阵，以及现有全部 SQP、reference 和 1kHz tracker 参数。
+主要可调参数都在 coordinator 的 Python CLI：`pico_mapping_mode`、`pico_translation_scale`、`pico_rotation_scale`、Grip/Trigger 阈值、超时、坐标标定矩阵，以及现有全部 SQP、reference 和 1kHz tracker 参数。

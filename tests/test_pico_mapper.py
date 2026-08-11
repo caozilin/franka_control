@@ -25,6 +25,7 @@ def _quaternion_y(angle: float) -> np.ndarray:
 def _snapshot(
     *,
     sequence: int = 0,
+    left_position: tuple[float, float, float] = (0.0, 0.0, 0.0),
     right_position: tuple[float, float, float] = (0.0, 0.0, 0.0),
     right_orientation: np.ndarray | None = None,
     left_grip: float = 1.0,
@@ -49,14 +50,14 @@ def _snapshot(
     packet = PicoPacket(
         sequence,
         sequence / 60.0,
-        controller((0.0, 0.0, 0.0), identity, left_grip),
+        controller(left_position, identity, left_grip),
         controller(right_position, identity if right_orientation is None else right_orientation, right_grip, trigger),
     )
     return PicoSnapshot(packet, received)
 
 
 def test_dual_grip_reanchors_before_emitting_motion() -> None:
-    mapper = PicoPoseMapper()
+    mapper = PicoPoseMapper(PicoMapperConfig(mapping_mode="single_6dof"))
     first = mapper.step(_snapshot(sequence=1), now=10.0)
     moved = mapper.step(_snapshot(sequence=2, right_position=(0.02, 0.0, 0.0)), now=10.0)
 
@@ -67,7 +68,9 @@ def test_dual_grip_reanchors_before_emitting_motion() -> None:
 
 
 def test_mapper_clamps_without_losing_remaining_displacement() -> None:
-    mapper = PicoPoseMapper(PicoMapperConfig(translation_scale=1.0, max_translation_step_m=0.05))
+    mapper = PicoPoseMapper(
+        PicoMapperConfig(mapping_mode="single_6dof", translation_scale=1.0, max_translation_step_m=0.05)
+    )
     mapper.step(_snapshot(sequence=1), now=10.0)
     moved = _snapshot(sequence=2, right_position=(0.2, 0.0, 0.0))
     steps = [mapper.step(moved, now=10.0).action[0] for _ in range(4)]  # type: ignore[union-attr]
@@ -86,7 +89,7 @@ def test_unity_handedness_is_applied_to_rotation() -> None:
 
 
 def test_release_reanchors_and_trigger_controls_gripper() -> None:
-    mapper = PicoPoseMapper()
+    mapper = PicoPoseMapper(PicoMapperConfig(mapping_mode="single_6dof"))
     mapper.step(_snapshot(sequence=1), now=10.0)
     released = mapper.step(_snapshot(sequence=2, left_grip=0.0, trigger=1.0), now=10.0)
     reanchored = mapper.step(
@@ -104,3 +107,51 @@ def test_stale_or_invalid_tracking_emits_no_command() -> None:
     mapper = PicoPoseMapper(PicoMapperConfig(stale_timeout_s=0.1))
     assert mapper.step(_snapshot(received=1.0), now=1.2) is None
     assert mapper.step(_snapshot(tracked=False), now=10.0) is None
+
+
+def test_split_maps_left_position_and_right_orientation() -> None:
+    mapper = PicoPoseMapper(PicoMapperConfig(mapping_mode="split", max_rotation_step_rad=1.0))
+    mapper.step(_snapshot(sequence=1), now=10.0)
+    command = mapper.step(
+        _snapshot(
+            sequence=2,
+            left_position=(0.02, 0.0, 0.0),
+            right_position=(0.5, 0.0, 0.0),
+            right_orientation=_quaternion_y(0.2),
+        ),
+        now=10.0,
+    )
+
+    assert command is not None
+    np.testing.assert_allclose(command.action[:3], [0.01, 0.0, 0.0])
+    np.testing.assert_allclose(command.action[3:6], [0.0, -0.2, 0.0], atol=1e-10)
+
+
+def test_split_clutches_translation_and_rotation_independently() -> None:
+    mapper = PicoPoseMapper(PicoMapperConfig(mapping_mode="split", max_rotation_step_rad=1.0))
+    translation_anchor = mapper.step(_snapshot(sequence=1, right_grip=0.0), now=10.0)
+    translated = mapper.step(
+        _snapshot(sequence=2, left_position=(0.02, 0.0, 0.0), right_grip=0.0),
+        now=10.0,
+    )
+    rotation_anchor = mapper.step(
+        _snapshot(sequence=3, left_grip=0.0, right_orientation=_quaternion_y(0.2)),
+        now=10.0,
+    )
+    rotated = mapper.step(
+        _snapshot(
+            sequence=4,
+            left_position=(0.5, 0.0, 0.0),
+            left_grip=0.0,
+            right_orientation=_quaternion_y(0.3),
+        ),
+        now=10.0,
+    )
+
+    assert translation_anchor is not None and translation_anchor.reanchored
+    assert translated is not None
+    np.testing.assert_allclose(translated.action[:3], [0.01, 0.0, 0.0])
+    assert rotation_anchor is not None and rotation_anchor.reanchored
+    assert rotated is not None
+    np.testing.assert_allclose(rotated.action[:3], 0.0)
+    np.testing.assert_allclose(rotated.action[3:6], [0.0, -0.1, 0.0], atol=1e-10)

@@ -28,12 +28,12 @@ def _controller(position: tuple[float, float, float], grip: float = 1.0) -> Pico
     )
 
 
-def _send(sender: socket.socket, port: int, sequence: int, right_x: float) -> None:
+def _send(sender: socket.socket, port: int, sequence: int, left_x: float) -> None:
     packet = PicoPacket(
         sequence,
         time.time(),
+        _controller((left_x, 0.0, 0.0)),
         _controller((0.0, 0.0, 0.0)),
-        _controller((right_x, 0.0, 0.0)),
         session_id="coordinator-test",
     )
     sender.sendto(packet.to_json(), ("127.0.0.1", port))
@@ -66,6 +66,7 @@ def test_pico_source_runs_without_policy_server_or_robot() -> None:
     try:
         assert coordinator._client is None
         assert coordinator._pico_receiver is not None
+        assert coordinator._args.pico_mapping_mode == "split"
         coordinator._run_action_step({})
 
         _send(sender, coordinator._pico_receiver.port, 1, 0.0)

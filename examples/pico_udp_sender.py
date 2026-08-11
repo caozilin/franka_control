@@ -47,8 +47,8 @@ def main() -> None:
             packet = PicoPacket(
                 sequence,
                 time.time(),
-                controller((-0.2, 1.2, 0.3), grip),
-                controller((0.2 + 0.05 * math.sin(elapsed), 1.2, 0.3), grip),
+                controller((-0.2 + 0.05 * math.sin(elapsed), 1.2, 0.3), grip),
+                controller((0.2, 1.2, 0.3), grip),
                 session_id="synthetic",
             )
             sender.sendto(packet.to_json(), (args.host, args.port))

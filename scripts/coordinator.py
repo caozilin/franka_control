@@ -89,6 +89,7 @@ class Args:
     control_hz: float = 10.0
     pico_bind_host: str = "0.0.0.0"
     pico_port: int = 9010
+    pico_mapping_mode: str = "split"
     pico_translation_scale: float = 0.5
     pico_rotation_scale: float = 1.0
     pico_grip_threshold: float = 0.5
@@ -147,6 +148,9 @@ class Args:
         self.action_source = self.action_source.lower().strip()
         if self.action_source not in {"policy", "pico"}:
             raise ValueError("action_source must be 'policy' or 'pico'")
+        self.pico_mapping_mode = self.pico_mapping_mode.lower().strip()
+        if self.pico_mapping_mode not in {"single_6dof", "split"}:
+            raise ValueError("pico_mapping_mode must be 'single_6dof' or 'split'")
         self.policy_type = self.policy_type.lower().strip()
         if self.policy_type not in {"openpi", "cosmos"}:
             raise ValueError("policy_type must be 'openpi' or 'cosmos'")
@@ -309,6 +313,7 @@ class Coordinator:
             self._pico_receiver = PicoUdpReceiver(args.pico_bind_host, args.pico_port)
             self._pico_mapper = PicoPoseMapper(
                 PicoMapperConfig(
+                    mapping_mode=args.pico_mapping_mode,
                     translation_scale=args.pico_translation_scale,
                     rotation_scale=args.pico_rotation_scale,
                     max_translation_step_m=self._env.max_translation_step,
@@ -754,6 +759,7 @@ class Coordinator:
         command = self._pico_mapper.step(snapshot)
         pico = {
             "receiver_port": self._pico_receiver.port,
+            "mapping_mode": self._args.pico_mapping_mode,
             "packet_received": snapshot is not None,
             "age_s": None if snapshot is None else snapshot.age_s(),
         }
