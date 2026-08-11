@@ -5,8 +5,14 @@ from planning.sqp import (
     FullSpaceSQPSolver,
     SQPObjectiveSettings,
     SQPSettings,
+    ShadowSQPPlanner,
     TargetPose,
     TaskKind,
+)
+from planning.shadow_reference import (
+    ShadowOrientationDiagnostics,
+    ShadowOrientationReference,
+    project_historical_tolerance_bias,
 )
 
 __all__ = [
@@ -16,6 +22,10 @@ __all__ = [
     "FullSpaceSQPSolver",
     "SQPObjectiveSettings",
     "SQPSettings",
+    "ShadowOrientationDiagnostics",
+    "ShadowOrientationReference",
+    "ShadowSQPPlanner",
     "TargetPose",
     "TaskKind",
+    "project_historical_tolerance_bias",
 ]

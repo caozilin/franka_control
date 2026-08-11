@@ -8,6 +8,7 @@ import numpy as np
 from planning.sqp.kinematics import PandaKinematics
 from planning.sqp.solver import ConstraintValues, FullSpaceSQPSolver, SQPSolverResult
 from planning.sqp.types import SQPSettings
+from planning.shadow_reference import project_release_target
 from utils.pose import rotvec_to_matrix
 
 
@@ -293,7 +294,21 @@ class BaselineSQPPlanner:
             self._previous2 = previous.copy()
             self._previous = seed.copy()
             self._xopt = result.q.copy()
-        self._target = TargetPose(np.asarray(target.position).copy(), np.asarray(target.rotation).copy())
+        target_rotation = np.asarray(target.rotation).copy()
+        ranged = np.asarray([task.kind in self._RANGED for task in tasks[3:]], dtype=bool)
+        if tolerance_rotation is not None and np.any(ranged):
+            optimized_rotation = self.kinematics.evaluate(command).rotation
+            lower = np.asarray([task.lower for task in tasks[3:]], dtype=np.float64)
+            upper = np.asarray([task.upper for task in tasks[3:]], dtype=np.float64)
+            target_rotation, _ = project_release_target(
+                target_rotation,
+                optimized_rotation,
+                tolerance_rotation,
+                ranged,
+                lower,
+                upper,
+            )
+        self._target = TargetPose(np.asarray(target.position).copy(), target_rotation)
         return SQPPlan(command, self._target, result)
 
     def step(

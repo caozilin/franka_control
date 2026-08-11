@@ -56,6 +56,12 @@ Joint deltas and absolute SQP waypoints use distinct backend queues. This keeps
 the existing joint teleoperation contract intact and prevents optimizer output
 from being accumulated as a delta.
 
+Shadow SQP does not define a second optimizer. `ShadowOrientationReference`
+first removes historical rotation bias on strict axes, then `ShadowSQPPlanner`
+passes that corrected 10 Hz target to the same `BaselineSQPPlanner`. A semantic
+stage, tolerance mask, or tolerance-frame change reanchors the shadow at the
+last optimized orientation.
+
 ## Linux verification
 
 The C++ extension is built and exercised on the Franka workstation because it
