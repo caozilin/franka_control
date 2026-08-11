@@ -78,8 +78,9 @@ class TimingRing {
   explicit TimingRing(size_t capacity) : capacity_(capacity > 0 ? capacity : 1), ring_(capacity_) {}
 
   void write(const TimingFrame& frame) {
-    const uint64_t idx = write_head_.fetch_add(1, std::memory_order_release);
+    const uint64_t idx = write_head_.load(std::memory_order_relaxed);
     ring_[idx % capacity_] = frame;
+    write_head_.store(idx + 1, std::memory_order_release);
   }
 
   uint64_t head() const { return write_head_.load(std::memory_order_acquire); }

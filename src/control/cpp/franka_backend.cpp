@@ -23,8 +23,13 @@
 #include <string>
 #include <thread>
 
-#include "reference/reference_factory.hpp"
 #include "nullspace/nullspace_torque.hpp"
+#include "reference/cartesian_reference.hpp"
+#include "reference/joint_reference.hpp"
+#include "reference/reference_factory.hpp"
+#include "safety/torque_rate_limiter.hpp"
+#include "tracker/cartesian_impedance_tracker.hpp"
+#include "tracker/joint_impedance_tracker.hpp"
 #include "utils/control.hpp"
 #include "utils/joint_motion_generator.hpp"
 #include "utils/pose.hpp"
@@ -73,8 +78,9 @@ class TraceRing {
 
   void write(const TraceFrame& frame) {
     if (capacity_ == 0) return;
-    uint64_t idx = write_head_.fetch_add(1, std::memory_order_release);
+    const uint64_t idx = write_head_.load(std::memory_order_relaxed);
     ring_[idx % capacity_] = frame;
+    write_head_.store(idx + 1, std::memory_order_release);
   }
   uint64_t head() const { return write_head_.load(std::memory_order_acquire); }
   size_t capacity() const { return capacity_; }
@@ -138,11 +144,6 @@ Matrix6d matrix6FromArray(const py::array_t<double, py::array::c_style | py::arr
   return out;
 }
 
-Eigen::Vector3d clampNorm(const Eigen::Vector3d& value, double limit) {
-  const double norm = value.norm();
-  if (norm <= limit || norm < 1e-12) return value;
-  return value * (limit / norm);
-}
 }  // namespace
 
 class RealtimeFrankaBackend {
@@ -411,123 +412,6 @@ class RealtimeFrankaBackend {
     return action;
   }
 
-  void startNewSegment(double elapsed,
-                       const Pose& current_command_pose,
-                       const Pose& actual_pose,
-                       Pose* segment_start_pose,
-                       Pose* segment_target_pose,
-                       Eigen::Vector3d* segment_delta_translation,
-                       Eigen::Vector3d* segment_delta_rotvec,
-                       Eigen::Vector3d* last_segment_rotvec,
-                       TimingFrame* timing) {
-    static_cast<void>(elapsed);
-    static_cast<void>(actual_pose);
-    *segment_start_pose = current_command_pose;
-    const auto action = popAction(timing);
-    Pose candidate = *segment_target_pose;
-
-    auto start = Clock::now();
-    candidate.block<3, 1>(0, 3) += transformTranslation(action, max_translation_step_);
-    candidate.block<3, 3>(0, 0) =
-        rotvecToMatrix(transformRotation(action, max_rotation_step_)) * candidate.block<3, 3>(0, 0);
-    if (timing != nullptr) timing->fields[kTransformAction] += secondsSince(start);
-
-    start = Clock::now();
-    *segment_target_pose = candidate;
-    if (timing != nullptr) timing->fields[kUpdatePoseGoal] += secondsSince(start);
-
-    start = Clock::now();
-    *segment_delta_translation =
-        segment_target_pose->block<3, 1>(0, 3) - segment_start_pose->block<3, 1>(0, 3);
-    *segment_delta_rotvec = matrixToRotvecContinuous(
-        segment_target_pose->block<3, 3>(0, 0) * segment_start_pose->block<3, 3>(0, 0).transpose(), *last_segment_rotvec);
-    *last_segment_rotvec = *segment_delta_rotvec;
-
-    segment_start_time_ = elapsed;
-    if (timing != nullptr) timing->fields[kControllerUpdateGoal] += secondsSince(start);
-  }
-
-  void updateMotionLimitedReference(double dt,
-                                    const Pose& target_pose,
-                                    Pose* command_pose,
-                                    Vector6d* desired_velocity,
-                                    Eigen::Vector3d* v_ref,
-                                    Eigen::Vector3d* a_ref,
-                                    Eigen::Vector3d* omega_ref,
-                                    Eigen::Vector3d* alpha_ref,
-                                    Eigen::Vector3d* last_ref_rotation_error) {
-    desired_velocity->setZero();
-
-    const Eigen::Vector3d p_goal = target_pose.block<3, 1>(0, 3);
-    const Eigen::Vector3d p_ref = command_pose->block<3, 1>(0, 3);
-    const Eigen::Vector3d position_error = p_goal - p_ref;
-    const double position_distance = position_error.norm();
-
-    if (position_distance < kRefPositionEps && v_ref->norm() < kRefLinearVelocityEps) {
-      command_pose->block<3, 1>(0, 3) = p_goal;
-      v_ref->setZero();
-      a_ref->setZero();
-    } else {
-      Eigen::Vector3d v_des = Eigen::Vector3d::Zero();
-      if (position_distance >= 1e-12) {
-        const Eigen::Vector3d direction = position_error / position_distance;
-        const double v_allow = std::sqrt(
-            std::max(0.0, 2.0 * motion_limited_max_translation_acceleration_ * position_distance));
-        const double v_step_allow = position_distance / dt;
-        v_des = direction * std::min(std::min(motion_limited_max_translation_velocity_, v_allow), v_step_allow);
-      }
-
-      *a_ref = clampNorm((v_des - *v_ref) / dt, motion_limited_max_translation_acceleration_);
-      *v_ref = clampNorm(*v_ref + *a_ref * dt, motion_limited_max_translation_velocity_);
-
-      const Eigen::Vector3d p_next = p_ref + *v_ref * dt;
-      if (position_distance >= 1e-12 && position_error.dot(p_goal - p_next) <= 0.0) {
-        command_pose->block<3, 1>(0, 3) = p_goal;
-        v_ref->setZero();
-        a_ref->setZero();
-      } else {
-        command_pose->block<3, 1>(0, 3) = p_next;
-      }
-    }
-
-    const Eigen::Vector3d phi = matrixToRotvecContinuous(
-        target_pose.block<3, 3>(0, 0) * command_pose->block<3, 3>(0, 0).transpose(), *last_ref_rotation_error);
-    *last_ref_rotation_error = phi;
-    const double rotation_distance = phi.norm();
-
-    if (rotation_distance < kRefRotationEps && omega_ref->norm() < kRefAngularVelocityEps) {
-      command_pose->block<3, 3>(0, 0) = target_pose.block<3, 3>(0, 0);
-      omega_ref->setZero();
-      alpha_ref->setZero();
-      last_ref_rotation_error->setZero();
-    } else {
-      Eigen::Vector3d omega_des = Eigen::Vector3d::Zero();
-      if (rotation_distance >= 1e-12) {
-        const Eigen::Vector3d direction = phi / rotation_distance;
-        const double omega_allow = std::sqrt(
-            std::max(0.0, 2.0 * motion_limited_max_rotation_acceleration_ * rotation_distance));
-        const double omega_step_allow = rotation_distance / dt;
-        omega_des = direction * std::min(std::min(motion_limited_max_rotation_velocity_, omega_allow), omega_step_allow);
-      }
-
-      *alpha_ref = clampNorm((omega_des - *omega_ref) / dt, motion_limited_max_rotation_acceleration_);
-      *omega_ref = clampNorm(*omega_ref + *alpha_ref * dt, motion_limited_max_rotation_velocity_);
-
-      const Eigen::Vector3d rotation_step = *omega_ref * dt;
-      if (rotation_distance >= 1e-12 && phi.dot(rotation_step) >= rotation_distance * rotation_distance) {
-        command_pose->block<3, 3>(0, 0) = target_pose.block<3, 3>(0, 0);
-        omega_ref->setZero();
-        alpha_ref->setZero();
-        last_ref_rotation_error->setZero();
-      } else {
-        command_pose->block<3, 3>(0, 0) = rotvecToMatrix(rotation_step) * command_pose->block<3, 3>(0, 0);
-      }
-    }
-
-    desired_velocity->head<3>() = *v_ref;
-    desired_velocity->tail<3>() = *omega_ref;
-  }
-
   std::array<double, 7> popAccumulatedJointAction() {
     std::array<double, 7> action{};
     std::lock_guard<std::mutex> lock(action_mutex_);
@@ -540,53 +424,32 @@ class RealtimeFrankaBackend {
   }
 
   void runJointMinJerkImpedanceLoop(double max_duration, double segment_duration) {
-    const double duration = std::max(segment_duration, kPolicyPeriod);
-    const Vector7d joint_stiffness = (Vector7d() << 80.0, 80.0, 80.0, 60.0, 25.0, 15.0, 10.0).finished();
-    Vector7d joint_damping = Vector7d::Zero();
-    for (Eigen::Index i = 0; i < 7; ++i) joint_damping[i] = 2.0 * std::sqrt(joint_stiffness[i]);
-
     auto model = robot_.loadModel();
     const franka::RobotState initial_state = robot_.readOnce();
-    Vector7d command_q = vector7FromArray(initial_state.q);
-    Vector7d command_dq = Vector7d::Zero();
-    Vector7d segment_start_q = command_q;
-    Vector7d segment_target_q = command_q;
+    JointMinJerkReferenceGenerator reference(
+        segment_duration, vector7FromArray(kJointLowerLimits), vector7FromArray(kJointUpperLimits));
+    reference.reset(vector7FromArray(initial_state.q));
+    JointImpedanceTracker tracker;
+    TorqueRateLimiter safety(max_torque_rate_);
     double elapsed = 0.0;
     double next_policy_time = 0.0;
-    double segment_start_time = 0.0;
 
     robot_.control([&](const franka::RobotState& state, franka::Duration step) -> franka::Torques {
       const double dt = std::max(step.toSec(), 0.001);
       elapsed += dt;
+      updateLatestRobotState(state);
 
       while (elapsed + 1e-12 >= next_policy_time) {
-        const auto action = popAccumulatedJointAction();
-        bool has_action = false;
-        for (double value : action) has_action = has_action || std::abs(value) > 1e-12;
-        if (has_action) {
-          segment_start_q = command_q;
-          for (Eigen::Index i = 0; i < 7; ++i) {
-            segment_target_q[i] = std::clamp(segment_target_q[i] + action[static_cast<size_t>(i)],
-                                             kJointLowerLimits[static_cast<size_t>(i)],
-                                             kJointUpperLimits[static_cast<size_t>(i)]);
-          }
-          segment_start_time = elapsed;
-        }
+        reference.acceptDelta(popAccumulatedJointAction(), elapsed);
         next_policy_time += kPolicyPeriod;
       }
 
-      const double alpha = std::clamp((elapsed - segment_start_time) / duration, 0.0, 1.0);
-      const double weight = 10.0 * std::pow(alpha, 3.0) - 15.0 * std::pow(alpha, 4.0) + 6.0 * std::pow(alpha, 5.0);
-      const double dweight = (alpha >= 1.0) ? 0.0 : (30.0 * std::pow(alpha, 2.0) - 60.0 * std::pow(alpha, 3.0) + 30.0 * std::pow(alpha, 4.0)) / duration;
-      command_q = segment_start_q + weight * (segment_target_q - segment_start_q);
-      command_dq = dweight * (segment_target_q - segment_start_q);
-
+      const JointReferenceSample reference_sample = reference.sample(elapsed);
       const Vector7d q = vector7FromArray(state.q);
       const Vector7d dq = vector7FromArray(state.dq);
       const Vector7d coriolis = vector7FromArray(model.coriolis(state));
-      const Vector7d tau_desired = joint_stiffness.cwiseProduct(command_q - q) +
-                                   joint_damping.cwiseProduct(command_dq - dq) + coriolis;
-      const Vector7d tau_limited = limitTorqueRate(tau_desired, state.tau_J_d, dt, max_torque_rate_);
+      const Vector7d tau_desired = tracker.compute(q, dq, coriolis, reference_sample);
+      const Vector7d tau_limited = safety.apply(tau_desired, state.tau_J_d, dt);
       franka::Torques command(arrayFromVector7(tau_limited));
       if (stop_requested_.load() || (max_duration > 0.0 && elapsed >= max_duration)) {
         return franka::MotionFinished(command);
@@ -603,58 +466,34 @@ class RealtimeFrankaBackend {
 
     auto model = robot_.loadModel();
     const franka::RobotState initial_state = robot_.readOnce();
-    Pose command_pose = poseFromArray(initial_state.O_T_EE);
-    Pose segment_start_pose = command_pose;
-    Pose segment_target_pose = command_pose;
-    Eigen::Vector3d segment_delta_translation = Eigen::Vector3d::Zero();
-    Eigen::Vector3d segment_delta_rotvec = Eigen::Vector3d::Zero();
-    Eigen::Vector3d last_segment_rotvec = Eigen::Vector3d::Zero();
-    Eigen::Vector3d last_error_rotvec = Eigen::Vector3d::Zero();
-    Eigen::Vector3d v_ref = Eigen::Vector3d::Zero();
-    Eigen::Vector3d a_ref = Eigen::Vector3d::Zero();
-    Eigen::Vector3d omega_ref = Eigen::Vector3d::Zero();
-    Eigen::Vector3d alpha_ref = Eigen::Vector3d::Zero();
-    Eigen::Vector3d last_ref_rotation_error = Eigen::Vector3d::Zero();
+    CartesianReferenceGenerator reference(
+        reference_generator_, max_translation_step_, max_rotation_step_,
+        motion_limited_max_translation_velocity_, motion_limited_max_rotation_velocity_,
+        motion_limited_max_translation_acceleration_, motion_limited_max_rotation_acceleration_);
+    reference.reset(poseFromArray(initial_state.O_T_EE));
+    CartesianImpedanceTracker tracker(stiffness_, damping_, nullspace_config_);
+    TorqueRateLimiter safety(max_torque_rate_);
     double elapsed = 0.0;
     double next_policy_time = 0.0;
-    const std::shared_ptr<const ReferenceGenerator> reference = reference_generator_;
-    const bool motion_limited = std::string(reference->name()) == "motion_limited";
-    segment_start_time_ = 0.0;
 
-    uint64_t step_count = 0;
     robot_.control([&](const franka::RobotState& state, franka::Duration step) -> franka::Torques {
       TimingFrame timing{};
       const auto loop_start = Clock::now();
       const double dt = std::max(step.toSec(), 0.001);
       elapsed += dt;
-      ++step_count;
       timing.elapsed = elapsed;
       timing.robot_dt = dt;
       updateLatestRobotState(state);
 
       auto start = Clock::now();
       while (elapsed + 1e-12 >= next_policy_time) {
-        startNewSegment(elapsed, command_pose, poseFromArray(state.O_T_EE), &segment_start_pose, &segment_target_pose,
-                        &segment_delta_translation, &segment_delta_rotvec, &last_segment_rotvec, &timing);
+        reference.acceptAction(popAction(&timing), elapsed);
         next_policy_time += kPolicyPeriod;
       }
       timing.fields[kPolicyTotal] += secondsSince(start);
 
       start = Clock::now();
-      Vector6d desired_velocity = Vector6d::Zero();
-      if (motion_limited) {
-        updateMotionLimitedReference(dt, segment_target_pose, &command_pose, &desired_velocity, &v_ref, &a_ref,
-                                     &omega_ref, &alpha_ref, &last_ref_rotation_error);
-      } else {
-        const auto weights = reference->weights((elapsed - segment_start_time_) / kPolicyPeriod);
-        command_pose = segment_start_pose;
-        command_pose.block<3, 1>(0, 3) += weights.position * segment_delta_translation;
-        command_pose.block<3, 3>(0, 0) =
-            rotvecToMatrix(weights.position * segment_delta_rotvec) * segment_start_pose.block<3, 3>(0, 0);
-
-        desired_velocity.head<3>() = weights.velocity * segment_delta_translation;
-        desired_velocity.tail<3>() = weights.velocity * segment_delta_rotvec;
-      }
+      const CartesianReferenceSample reference_sample = reference.sample(elapsed, dt);
       timing.fields[kControllerReference] += secondsSince(start);
 
       start = Clock::now();
@@ -681,23 +520,18 @@ class RealtimeFrankaBackend {
       start = Clock::now();
       const Vector7d q = vector7FromArray(state.q);
       const Vector7d dq = vector7FromArray(state.dq);
+      const Pose actual_pose = poseFromArray(state.O_T_EE);
       timing.fields[kControllerVelocityMath] += secondsSince(start);
 
-      start = Clock::now();
-      const Vector6d error = poseError(state.O_T_EE, command_pose, last_error_rotvec);
-      last_error_rotvec = error.tail<3>();
-      timing.fields[kControllerPoseError] += secondsSince(start);
+      CartesianTrackerTiming tracker_timing{};
+      const CartesianTrackingOutput tracking =
+          tracker.compute(actual_pose, q, dq, coriolis, jacobian, mass_ptr, reference_sample, &tracker_timing);
+      timing.fields[kControllerPoseError] += tracker_timing.pose_error;
+      timing.fields[kControllerWrenchTorque] +=
+          tracker_timing.wrench_torque + tracker_timing.nullspace_torque;
 
       start = Clock::now();
-      const Vector6d task_wrench =
-          maskTaskVector(-stiffness_ * error + damping_ * (desired_velocity - jacobian * dq), nullspace_config_);
-      const Vector7d tau_task = jacobian.transpose() * task_wrench;
-      timing.fields[kControllerWrenchTorque] += secondsSince(start);
-
-      start = Clock::now();
-      const Vector7d tau_null = computeNullspaceTorque(jacobian, mass_ptr, q, dq, nullspace_config_);
-      const Vector7d tau_desired = tau_task + tau_null + coriolis;
-      const Vector7d tau_limited = limitTorqueRate(tau_desired, state.tau_J_d, dt, max_torque_rate_);
+      const Vector7d tau_limited = safety.apply(tracking.desired_torque, state.tau_J_d, dt);
       timing.fields[kControllerTorqueLimit] += secondsSince(start);
 
       start = Clock::now();
@@ -719,15 +553,14 @@ class RealtimeFrankaBackend {
           prev = rv;
         };
 
-        Pose actual = poseFromArray(state.O_T_EE);
         TraceFrame frame{};
         frame.time = elapsed;
-        fill_xyz_rotvec(frame.goal_xyz, frame.goal_rotvec, segment_target_pose, prev_goal_rotvec_);
-        fill_xyz_rotvec(frame.ref_xyz, frame.ref_rotvec, command_pose, prev_ref_rotvec_);
-        fill_xyz_rotvec(frame.actual_xyz, frame.actual_rotvec, actual, prev_actual_rotvec_);
+        fill_xyz_rotvec(frame.goal_xyz, frame.goal_rotvec, reference_sample.target_pose, prev_goal_rotvec_);
+        fill_xyz_rotvec(frame.ref_xyz, frame.ref_rotvec, reference_sample.pose, prev_ref_rotvec_);
+        fill_xyz_rotvec(frame.actual_xyz, frame.actual_rotvec, actual_pose, prev_actual_rotvec_);
         for (Eigen::Index i = 0; i < 7; ++i) {
           frame.tau_cmd[i] = tau_limited[i];
-          frame.tau_desired[i] = tau_desired[i];
+          frame.tau_desired[i] = tracking.desired_torque[i];
           frame.tau_j_d[i] = state.tau_J_d[static_cast<size_t>(i)];
           frame.tau_j[i] = state.tau_J[static_cast<size_t>(i)];
         }
@@ -766,7 +599,6 @@ class RealtimeFrankaBackend {
   Matrix6d stiffness_;
   Matrix6d damping_;
   NullspaceConfig nullspace_config_;
-  double segment_start_time_{0.0};
   mutable std::mutex action_mutex_;
   std::deque<std::array<double, 8>> action_queue_;
   std::thread control_thread_;

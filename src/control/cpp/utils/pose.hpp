@@ -68,15 +68,20 @@ inline Eigen::Vector3d matrixToRotvecContinuous(const Eigen::Matrix3d& rotation,
   return best;
 }
 
-inline Vector6d poseError(const std::array<double, 16>& current_pose,
-                          const Pose& desired_pose,
-                          const Eigen::Vector3d& previous_rotvec) {
+inline Vector6d poseError(const Pose& current,
+                         const Pose& desired_pose,
+                         const Eigen::Vector3d& previous_rotvec) {
   (void)previous_rotvec;
-  const Pose current = poseFromArray(current_pose);
   Vector6d error = Vector6d::Zero();
   error.head<3>() = current.block<3, 1>(0, 3) - desired_pose.block<3, 1>(0, 3);
   error.tail<3>() = matrixToRotvec(current.block<3, 3>(0, 0) * desired_pose.block<3, 3>(0, 0).transpose());
   return error;
+}
+
+inline Vector6d poseError(const std::array<double, 16>& current_pose,
+                          const Pose& desired_pose,
+                          const Eigen::Vector3d& previous_rotvec) {
+  return poseError(poseFromArray(current_pose), desired_pose, previous_rotvec);
 }
 
 }  // namespace franka_control::cpp
