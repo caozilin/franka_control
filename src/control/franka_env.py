@@ -9,6 +9,7 @@ import time
 import numpy as np
 
 from client import image_tools
+from devices import AsyncGripperDriver
 from utils.control import ActionConfig, GRIPPER_WIDTH_MAX, POLICY_HZ, transform_action
 from utils.pose import matrix_to_rotvec, matrix_to_rotvec_continuous, rotvec_to_matrix
 
@@ -212,64 +213,6 @@ def _validate_task_constraint_mask(mask: np.ndarray | None) -> np.ndarray:
     if not np.any(validated):
         raise ValueError("task_constraint_mask must keep at least one constrained task dimension")
     return validated
-
-
-def _gripper_worker(robot_ip: str, command_queue, status_queue, speed: float, force: float) -> None:
-    gripper = None
-
-    def report_state() -> None:
-        if gripper is None:
-            return
-        try:
-            state = gripper.read_once()
-            status_queue.put_nowait(("state", float(state.get("width", GRIPPER_WIDTH_MAX))))
-        except queue.Full:
-            pass
-        except Exception:
-            pass
-
-    def drain_latest(first_target):
-        target = first_target
-        while True:
-            try:
-                latest = command_queue.get_nowait()
-            except queue.Empty:
-                return target
-            if latest is None:
-                return None
-            target = latest
-
-    try:
-        from control._franka_backend import RealtimeGripperBackend
-
-        gripper = RealtimeGripperBackend(robot_ip)
-        initial_state = gripper.read_once()
-        status_queue.put((True, "", float(initial_state.get("width", GRIPPER_WIDTH_MAX))))
-        while True:
-            try:
-                item = command_queue.get(timeout=GRIPPER_STATE_POLL_PERIOD)
-            except queue.Empty:
-                report_state()
-                continue
-            target = drain_latest(item)
-            if target is None:
-                break
-            target = float(np.clip(float(target), 0.0, GRIPPER_WIDTH_MAX))
-            try:
-                ok = gripper.command(target, float(speed), float(force))
-                report_state()
-                if ok is False:
-                    print(f"  [夹爪] command({target:.3f}) 返回失败", flush=True)
-            except Exception as exc:
-                print(f"  [夹爪] command({target:.3f}) 异常: {exc}", flush=True)
-    except Exception as exc:
-        status_queue.put((False, str(exc)))
-    finally:
-        if gripper is not None:
-            try:
-                gripper.stop()
-            except Exception:
-                pass
 
 
 class _NoRobotBackend:
@@ -548,9 +491,7 @@ class FrankaEnv:
         self._last_gripper_target: float = GRIPPER_WIDTH_MAX
         self._last_gripper_width: float = GRIPPER_WIDTH_MAX
         self._gripper_enabled = False
-        self._gripper_command_queue = None
-        self._gripper_status_queue = None
-        self._gripper_thread = None
+        self._gripper_driver: AsyncGripperDriver | None = None
         self._gripper_speed = float(gripper_speed)
         self._gripper_force = float(gripper_force)
         self.commanded_pose_array = np.zeros(6, dtype=np.float64)
@@ -610,69 +551,44 @@ class FrankaEnv:
                 self.task_constraint_mask,
             )
             if use_gripper:
-                self._start_gripper_worker(float(gripper_speed), float(gripper_force))
+                self._start_gripper_driver(float(gripper_speed), float(gripper_force))
         self._refresh_status_from_state()
 
-    def _start_gripper_worker(self, speed: float, force: float) -> None:
-        self._gripper_command_queue = queue.Queue(maxsize=1)
-        self._gripper_status_queue = queue.Queue(maxsize=1)
-        self._gripper_thread = threading.Thread(
-            target=_gripper_worker,
-            args=(self.robot_ip, self._gripper_command_queue, self._gripper_status_queue, speed, force),
-            daemon=True,
+    def _start_gripper_driver(self, speed: float, force: float) -> None:
+        driver = AsyncGripperDriver(
+            self.robot_ip,
+            speed=speed,
+            force=force,
+            width_max=GRIPPER_WIDTH_MAX,
+            poll_period=GRIPPER_STATE_POLL_PERIOD,
+            connect_timeout=GRIPPER_CONNECT_TIMEOUT,
         )
-        self._gripper_thread.start()
+        self._gripper_driver = driver
         try:
-            startup = self._gripper_status_queue.get(timeout=GRIPPER_CONNECT_TIMEOUT)
-            if len(startup) >= 3:
-                ok, message, width = startup[0], startup[1], startup[2]
-            else:
-                ok, message = startup
-                width = GRIPPER_WIDTH_MAX
-        except queue.Empty:
-            worker = self._gripper_thread
-            alive = bool(worker is not None and worker.is_alive())
-            ok, message, width = False, f"startup timeout (thread_alive={alive})", GRIPPER_WIDTH_MAX
-        self._last_gripper_width = float(np.clip(width, 0.0, GRIPPER_WIDTH_MAX))
-        self._gripper_enabled = bool(ok)
-        if self._gripper_enabled:
+            driver.start()
+            self._last_gripper_width = driver.width
+            self._gripper_enabled = driver.enabled
             print("  [夹爪] worker 已启动")
-        else:
-            print(f"  [夹爪] worker 启动失败: {message}")
-            self._stop_gripper_worker()
+        except Exception as exc:
+            print(f"  [夹爪] worker 启动失败: {exc}")
+            self._stop_gripper_driver()
 
-    def _stop_gripper_worker(self) -> None:
-        thread = self._gripper_thread
-        command_queue = self._gripper_command_queue
-        self._gripper_thread = None
-        self._gripper_command_queue = None
-        self._gripper_status_queue = None
+    def _stop_gripper_driver(self) -> None:
+        driver = self._gripper_driver
+        self._gripper_driver = None
         self._gripper_enabled = False
-        if command_queue is not None:
-            try:
-                command_queue.put_nowait(None)
-            except Exception:
-                pass
-        if thread is not None:
-            thread.join(timeout=2.0)
-            if thread.is_alive():
+        if driver is not None:
+            if not driver.stop(timeout=2.0):
                 print("  [夹爪] worker 线程未在 2s 内退出", flush=True)
 
     def _set_gripper_target(self, target: float) -> None:
         target = float(np.clip(target, 0.0, GRIPPER_WIDTH_MAX))
-        self._drain_gripper_status_queue()
+        self._refresh_gripper_state()
         self._last_gripper_target = target
-        if not self._gripper_enabled or self._gripper_command_queue is None:
+        driver = self._gripper_driver
+        if not self._gripper_enabled or driver is None:
             return
-        try:
-            while True:
-                self._gripper_command_queue.get_nowait()
-        except queue.Empty:
-            pass
-        try:
-            self._gripper_command_queue.put_nowait(target)
-        except queue.Full:
-            pass
+        driver.set_target(target)
 
     def _format_torque_window(self) -> str:
         try:
@@ -720,16 +636,11 @@ class FrankaEnv:
             flush=True,
         )
 
-    def _drain_gripper_status_queue(self) -> None:
-        if self._gripper_status_queue is None:
-            return
-        while True:
-            try:
-                item = self._gripper_status_queue.get_nowait()
-            except queue.Empty:
-                return
-            if isinstance(item, tuple) and len(item) >= 2 and item[0] == "state":
-                self._last_gripper_width = float(np.clip(item[1], 0.0, GRIPPER_WIDTH_MAX))
+    def _refresh_gripper_state(self) -> None:
+        driver = self._gripper_driver
+        if driver is not None:
+            self._last_gripper_width = driver.width
+            self._gripper_enabled = driver.enabled
 
     def _refresh_status_from_state(self) -> np.ndarray:
         state = self.get_robot_state_vector()
@@ -887,7 +798,7 @@ class FrankaEnv:
         self.stop_control()
         if self._cameras is not None:
             self._cameras.stop()
-        self._stop_gripper_worker()
+        self._stop_gripper_driver()
 
     def read_trace_head(self) -> int:
         return int(self._backend.get_trace_head())
@@ -1057,7 +968,7 @@ class FrankaEnv:
         self._refresh_status_from_state()
 
     def get_robot_state_vector(self) -> np.ndarray:
-        self._drain_gripper_status_queue()
+        self._refresh_gripper_state()
         state = np.asarray(self._backend.get_robot_state_vector(), dtype=np.float64).copy()
         if state.shape[0] >= 8:
             half_width = float(np.clip(self._last_gripper_width, 0.0, GRIPPER_WIDTH_MAX)) / 2.0

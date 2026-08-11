@@ -639,7 +639,10 @@ class RealtimeGripperBackend {
   explicit RealtimeGripperBackend(std::string robot_ip) : gripper_(std::move(robot_ip)) {}
 
   py::dict read_once() const {
-    const franka::GripperState state = gripper_.readOnce();
+    const franka::GripperState state = [this]() {
+      py::gil_scoped_release release;
+      return gripper_.readOnce();
+    }();
     py::dict out;
     out["width"] = state.width;
     out["max_width"] = state.max_width;

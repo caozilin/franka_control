@@ -182,8 +182,8 @@ cmake --build build -j2
   - 不需要双 gripper 连接
   - 能拿到夹爪运动过程中的连续位置
 
-  下一步
-  我可以直接把你现在的夹爪 worker 改成这套结构：
+  当前实现
+  夹爪 worker 已经按这套结构重构，具体线程与命令合并契约见 `docs/gripper_driver.md`：
 
   - 单 backend
   - 后台 10Hz 持续 read_once()
