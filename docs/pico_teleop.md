@@ -10,7 +10,7 @@ PICO 端只负责发送左右手柄的 tracking pose 和按键状态。本项目
 - 右手柄姿态控制末端旋转，右手柄位置被忽略。
 - 左 Grip 是平移离合，右 Grip 是旋转离合；两个通道分别重锚，可以单独或同时操作。
 - 每个通道首次按下只重设自己的锚点，不产生跳变。
-- 右 Trigger 控制夹爪：超过阈值闭合，否则张开。
+- 右 Trigger 使用上升沿切换夹爪：每按下一次，在张开和闭合之间切换一次；持续按住不会重复切换。
 - Primary、Secondary 和摇杆随协议接收并保留，当前不绑定机器人行为。
 - 超过 `pico_stale_timeout_s` 没有新包，或任一手柄丢失 tracking 时，不再生成动作。
 
@@ -27,6 +27,25 @@ PICO 端只负责发送左右手柄的 tracking pose 和按键状态。本项目
 ```
 
 PICO/Unity 通常以 60Hz 或 90Hz 发包。接收线程只保存最新包，coordinator 固定以 `control_hz=10` 消费，因此不会堆积旧位姿。
+
+## XRoboToolkit 真机入口
+
+PICO、键盘和 PS4 现已统一使用笛卡尔遥操作/数采入口。已安装 XRoboToolkit PC Service 和 `xrobotoolkit_sdk` 时：
+
+```bash
+.venv/bin/python scripts/teleop.py --input-device pico
+```
+
+该入口会管理 SDK bridge，先自动错误恢复并回零，再进入控制；不需要浏览器。相机默认关闭，传 `--with-cameras` 后启用数采：A 开始、再次按 A 保存，B 作废。旧命令 `scripts/run_xrobotoolkit_teleop.py` 仍兼容，但只作为该统一入口的转发器。
+
+在当前电脑上，Franka 网口 `enp3s0` 的中断固定在 CPU 6，因此入口默认将控制进程固定到独立的 CPU 2，避免 1 kHz 实时控制线程与网卡中断争用同一 CPU。需要修改时可传 `--control-cpu N`。
+
+默认按操作者站在机械臂正前方标定：手柄向前/后控制机器人 `-X/+X`，向左/右控制机器人 `-Y/+Y`，向上/下控制机器人 `+Z/-Z`。平移和旋转比例默认都是 `1.0`。旋转增量在末端执行器局部坐标系中解释，每一拍再使用当前末端姿态转换成 Base 系增量动作。
+
+- 左 Grip：按下锚定零姿态，左手倾斜控制 Base 系平移速度。
+- 左手 Roll/Pitch/Yaw 分别控制 Base X/Y/Z；右 Grip 按下锚定零姿态，右手倾斜控制末端系旋转速度，右手 X/Y 互换、Z 不变。
+- 默认 `10°` 死区、`25°` 满量程；保持倾斜持续运动，姿态回零或松开 Grip 停止。
+- 右 Trigger：每按一下切换一次夹爪张开/闭合状态。
 
 ## UDP 数据
 

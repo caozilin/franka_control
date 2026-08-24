@@ -20,10 +20,10 @@ import threading
 import time
 
 import numpy as np
-from pynput import keyboard
 
 os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 pygame = None
+keyboard = None
 
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -37,9 +37,25 @@ from control.franka_env import (
     DEFAULT_MAX_TORQUE_RATE,
     FrankaEnv,
 )  # noqa: E402
+from devices.pico import (  # noqa: E402
+    DEFAULT_ROTATION_BASE_FROM_PICO,
+    PicoMapperConfig,
+    PicoPoseMapper,
+    PicoSnapshot,
+    PicoUdpReceiver,
+)
+from planning import (  # noqa: E402
+    PANDA_TOLERANCE_PROFILES,
+    CartesianActionPlanner,
+    GripperPhaseClassifier,
+    ManipulationPhase,
+    PlannerConfig,
+    box_tolerance_frame,
+)
+from planning.bottle_upright import BottleUprightPlanner
 from utils import POLICY_HZ  # noqa: E402
 from utils.control import transform_action  # noqa: E402
-from utils.pose import matrix_to_rotvec, rotvec_to_matrix  # noqa: E402
+from utils.pose import end_effector_rotation_to_backend_rotation, rotvec_to_matrix  # noqa: E402
 
 
 INPUT_DT = 0.1
@@ -64,18 +80,9 @@ PS4_BUTTON_SQUARE = 3
 PS4_BUTTON_L1 = 4
 PS4_BUTTON_R1 = 5
 PS4_BUTTON_OPTIONS = 9
+PS4_BUTTON_PS = 10
 PS4_BUTTON_L3 = 11
 PS4_BUTTON_R3 = 12
-
-
-def end_effector_rotation_to_backend_rotation(current_rotation: np.ndarray, rotvec_ee: np.ndarray) -> np.ndarray:
-    current_rotation = np.asarray(current_rotation, dtype=np.float64).reshape(3, 3)
-    rotvec_ee = np.asarray(rotvec_ee, dtype=np.float64)
-    if float(np.linalg.norm(rotvec_ee)) < 1e-12:
-        return np.zeros(3, dtype=np.float64)
-    delta_rotation_ee = rotvec_to_matrix(rotvec_ee)
-    delta_rotation_base = current_rotation @ delta_rotation_ee @ current_rotation.T
-    return matrix_to_rotvec(delta_rotation_base)
 
 
 class KeyboardController:
@@ -85,16 +92,45 @@ class KeyboardController:
         robot_ip: str = "172.16.0.2",
         input_device: str = "keyboard",
         joystick_index: int = 0,
+        rotation_frame: str = "ee",
+        tolerance_id: str | None = None,
+        pico_bind_host: str = "127.0.0.1",
+        pico_port: int = 9010,
+        pico_mapping_mode: str = "split",
+        pico_translation_scale: float = 1.0,
+        pico_rotation_scale: float = 1.0,
+        pico_grip_threshold: float = 0.5,
+        pico_trigger_threshold: float = 0.5,
+        pico_stale_timeout_s: float = 0.15,
+        pico_attitude_deadzone_deg: float = 10.0,
+        pico_attitude_full_scale_deg: float = 25.0,
+        pico_require_both_grips: bool = True,
+        pico_rotation_base_from_pico: np.ndarray | None = None,
         max_translation_velocity: float = DEFAULT_MAX_TRANSLATION_VELOCITY,
         max_rotation_velocity: float = DEFAULT_MAX_ROTATION_VELOCITY,
         max_translation_goal_error: float = DEFAULT_MAX_TRANSLATION_GOAL_ERROR,
         max_rotation_goal_error: float = DEFAULT_MAX_ROTATION_GOAL_ERROR,
+        max_torque_rate: float = DEFAULT_MAX_TORQUE_RATE,
         motion_limited_max_translation_velocity: float | None = None,
         motion_limited_max_rotation_velocity: float | None = None,
         motion_limited_max_translation_acceleration: float | None = None,
         motion_limited_max_rotation_acceleration: float | None = None,
         reset_duration: float = 5.0,
         reference_name: str = "linear",
+        planner_mode: str = "direct",
+        tracker_mode: str = "auto",
+        pid_proportional_gain: float = 0.18,
+        pid_integral_gain_s: float = 0.30,
+        pid_velocity_gain_s: float = 0.04,
+        pid_maximum_correction_rad: float = math.radians(3.0),
+        pid_integration_error_limit_rad: float = math.radians(4.0),
+        pid_integral_time_constant_s: float = 1.0,
+        pid_stationary_integral_time_constant_s: float = 0.25,
+        pid_stationary_velocity_threshold_rad_s: float = 0.02,
+        rotation_ranged_axes: tuple[bool, bool, bool] = (False, False, False),
+        rotation_limits_deg: tuple[float, float, float] = (30.0, 30.0, 45.0),
+        tolerance_frame_rotvec: tuple[float, float, float] = (0.0, 0.0, 0.0),
+        shadow_stage: str = "teleop",
         save_recording: bool = False,
         nullspace_enabled: bool = False,
         nullspace_q_target: np.ndarray | None = None,
@@ -108,12 +144,32 @@ class KeyboardController:
         no_cameras: bool = True,
         debug_ee_axes: bool = False,
     ):
-        if input_device not in ("keyboard", "ps4"):
+        if input_device not in ("keyboard", "ps4", "pico"):
             raise ValueError(f"不支持的输入设备: {input_device}")
+        if rotation_frame not in ("ee", "base"):
+            raise ValueError(f"不支持的旋转坐标系: {rotation_frame}")
+        normalized_tolerance_id = None if tolerance_id is None else str(tolerance_id).upper()
+        if normalized_tolerance_id is not None and normalized_tolerance_id not in PANDA_TOLERANCE_PROFILES:
+            raise ValueError(f"未知 Franka 容差 ID: {tolerance_id}")
+        if normalized_tolerance_id is not None and input_device != "ps4":
+            raise ValueError("阶段容差 ID 目前只支持 PS4 手柄")
+        if normalized_tolerance_id is not None and planner_mode == "direct":
+            raise ValueError("阶段容差 ID 需要 --planner-mode baseline_sqp 或 shadow_sqp")
 
         self.input_device = input_device
         self.joystick_index = int(joystick_index)
+        self.rotation_frame = rotation_frame
+        self.tolerance_id = normalized_tolerance_id
         self.robot_ip = robot_ip
+        action_planner = CartesianActionPlanner(
+            PlannerConfig(
+                mode=planner_mode,
+                rotation_ranged_axes=rotation_ranged_axes,
+                rotation_limits_deg=rotation_limits_deg,
+                tolerance_frame_rotvec=tolerance_frame_rotvec,
+                shadow_stage=shadow_stage,
+            )
+        )
         self.env = FrankaEnv(
             robot_ip=robot_ip,
             reset_duration=reset_duration,
@@ -121,11 +177,22 @@ class KeyboardController:
             max_rotation_velocity=max_rotation_velocity,
             max_translation_goal_error=max_translation_goal_error,
             max_rotation_goal_error=max_rotation_goal_error,
+            max_torque_rate=max_torque_rate,
             motion_limited_max_translation_velocity=motion_limited_max_translation_velocity,
             motion_limited_max_rotation_velocity=motion_limited_max_rotation_velocity,
             motion_limited_max_translation_acceleration=motion_limited_max_translation_acceleration,
             motion_limited_max_rotation_acceleration=motion_limited_max_rotation_acceleration,
             reference_name=reference_name,
+            action_planner=action_planner,
+            tracker_mode=tracker_mode,
+            pid_proportional_gain=pid_proportional_gain,
+            pid_integral_gain_s=pid_integral_gain_s,
+            pid_velocity_gain_s=pid_velocity_gain_s,
+            pid_maximum_correction_rad=pid_maximum_correction_rad,
+            pid_integration_error_limit_rad=pid_integration_error_limit_rad,
+            pid_integral_time_constant_s=pid_integral_time_constant_s,
+            pid_stationary_integral_time_constant_s=pid_stationary_integral_time_constant_s,
+            pid_stationary_velocity_threshold_rad_s=pid_stationary_velocity_threshold_rad_s,
             save_recording=save_recording,
             log_subdir="teleop",
             nullspace_enabled=nullspace_enabled,
@@ -144,7 +211,23 @@ class KeyboardController:
         self.max_translation_step = self.max_translation_velocity / POLICY_HZ
         self.max_rotation_step = self.max_rotation_velocity / POLICY_HZ
         self.reference_name = str(reference_name)
+        self.planner_mode = action_planner.mode
+        self.tracker_mode = self.env.tracker_mode
         self.debug_ee_axes = bool(debug_ee_axes)
+        self.action_planner = action_planner
+        self._tolerance_profile = (
+            None if self.tolerance_id is None else PANDA_TOLERANCE_PROFILES[self.tolerance_id]
+        )
+        self._phase_classifier = GripperPhaseClassifier()
+        self._stage_target_poses: dict[ManipulationPhase, np.ndarray] = {}
+        self._next_stage_capture = ManipulationPhase.PREGRASP
+        self._active_manipulation_phase: ManipulationPhase | None = None
+        self._tolerance_config_dirty = False
+        self._bottle_planner = BottleUprightPlanner()
+        self._bottle_actions: deque[np.ndarray] = deque()
+        self._bottle_plan_lock = threading.Lock()
+        self._bottle_planning = False
+        self._bottle_plan_id = 0
 
         self.gripper_target = 0.08
         self.step_size = 1.0
@@ -185,19 +268,56 @@ class KeyboardController:
         self._prev_buttons: dict[int, bool] = {}
         self._prev_hat = (0, 0)
         self._rumble_token = 0
+        self.recording_active = False
+        self._pico_receiver: PicoUdpReceiver | None = None
+        self._pico_mapper: PicoPoseMapper | None = None
+        self._pico_primary_pressed = False
+        self._pico_secondary_pressed = False
         if self.input_device == "ps4":
             self._init_ps4()
+        elif self.input_device == "pico":
+            rotation_base_from_pico = np.asarray(
+                DEFAULT_ROTATION_BASE_FROM_PICO
+                if pico_rotation_base_from_pico is None
+                else pico_rotation_base_from_pico,
+                dtype=np.float64,
+            )
+            self._pico_receiver = PicoUdpReceiver(pico_bind_host, pico_port)
+            self._pico_mapper = PicoPoseMapper(
+                PicoMapperConfig(
+                    mapping_mode=pico_mapping_mode,
+                    translation_scale=pico_translation_scale,
+                    rotation_scale=pico_rotation_scale,
+                    max_translation_step_m=self.env.max_translation_step,
+                    max_rotation_step_rad=self.env.max_rotation_step,
+                    grip_threshold=pico_grip_threshold,
+                    trigger_threshold=pico_trigger_threshold,
+                    stale_timeout_s=pico_stale_timeout_s,
+                    attitude_deadzone_rad=np.deg2rad(pico_attitude_deadzone_deg),
+                    attitude_full_scale_rad=np.deg2rad(pico_attitude_full_scale_deg),
+                    require_both_grips=pico_require_both_grips,
+                    rotation_base_from_pico=rotation_base_from_pico,
+                )
+            )
 
     def start(self, *, home_first: bool = True):
         self._print_controls()
+        if self._pico_receiver is not None:
+            self._pico_receiver.start()
+            print(f"  [PICO] UDP 接收: {self._pico_receiver.host}:{self._pico_receiver.port}")
         if home_first:
             self._reset_env()
         self._stop_rumble()
         self._sync_ps4_state()
+        self._sync_pico_state()
         self.rumble(0.18, 0.7, 120)
 
     def _reset_env(self):
         print("  [复位] 回到初始位姿...")
+        with self._bottle_plan_lock:
+            self._bottle_plan_id += 1
+            self._bottle_planning = False
+            self._bottle_actions.clear()
         self.gripper_target = 0.08
         self._stop_rumble()
         try:
@@ -206,6 +326,12 @@ class KeyboardController:
             print("  [复位] 失败")
             raise
         self._sync_ps4_state()
+        if self._pico_mapper is not None:
+            self._pico_mapper.reset()
+        self._sync_pico_state()
+        self._phase_classifier.reset()
+        self._active_manipulation_phase = None
+        self._tolerance_config_dirty = bool(self._stage_target_poses)
         print("  [复位] 完成")
 
     def stop(self):
@@ -215,6 +341,8 @@ class KeyboardController:
         if self._input_thread is not None:
             self._input_thread.join(timeout=1.0)
         self._shutdown_ps4()
+        if self._pico_receiver is not None:
+            self._pico_receiver.stop()
 
     def bind_event(self, event_name: str, callback):
         """绑定离散事件回调，例如 record_start / record_stop。"""
@@ -225,30 +353,58 @@ class KeyboardController:
         if callback is not None:
             callback()
 
+    def set_recording_active(self, active: bool) -> None:
+        self.recording_active = bool(active)
+
     def _print_controls(self):
+        print(
+            f"  [规划] planner={self.planner_mode} reference={self.reference_name} tracker={self.tracker_mode}"
+        )
+        if self.input_device != "pico":
+            print(f"  [旋转] input_frame={self.rotation_frame} backend_frame=base")
         if self.input_device == "keyboard":
             print("  [控制] 键盘模式")
             print("  [控制] W/S:X  A/D:Y  I/K:Z  Q/E:Roll  U/O:Pitch  J/L:Yaw")
-            print("  [控制] G/H:夹爪  +/-:速度档位  R:复位  1/2/3:开始/结束并恢复控制/作废录制  ESC:退出")
+            print("  [控制] G/H:夹爪  N:相机/瓶口同边扶瓶  M:相机/瓶口异边扶瓶  +/-:速度档位  R:复位  1/2/3:开始/结束并恢复控制/作废录制  ESC:退出")
+            return
+
+        if self.input_device == "pico":
+            print("  [控制] PICO 双手柄模式")
+            print("  [控制] 左 Grip+姿态:平移速度  右 Grip+姿态:末端系旋转速度")
+            print("  [控制] 姿态回零停止，保持倾斜持续运动；右 Trigger:切换夹爪")
+            print("  [控制] A:开始录制/再次按下保存  B:作废当前录制  Ctrl+C:退出")
             return
 
         print("  [控制] PS4 手柄模式")
         print("  [控制] 左摇杆:X/Y平移  右摇杆:Z平移/Yaw  L1/R1:Roll  L2/R2:Pitch")
         print("  [控制] 三角/圆圈:打开/关闭夹爪  叉:作废并复位  方块:复位  十字键左右:速度档位")
         print("  [控制] L3/R3:开始/结束录制并恢复控制  OPTIONS:退出")
+        print("  [控制] 键盘 N:腕部相机/瓶口同边  M:异边（最终末端相差 180deg）")
+        if self._tolerance_profile is not None:
+            print(f"  [容差] id={self.tolerance_id}；PS键依次采集/覆盖 Pre、Post 目标姿态")
+            print(
+                f"  [容差] Pre={self._tolerance_profile.pre_deg} deg  "
+                f"Post={self._tolerance_profile.post_deg} deg"
+            )
 
     def _on_key_press(self, key):
-        if self.input_device != "keyboard":
-            return
         try:
             char = key.char.lower()
         except AttributeError:
             char = key.name.lower()
 
+        if char in ("n", "m"):
+            self._start_bottle_plan(camera_mouth_same_side=(char == "n"), key_name=char.upper())
+            return
+        if self.input_device != "keyboard":
+            return
+
+        if char == "escape":
+            self.running = False
+            self.env.request_stop()
+            return False
+
         with self._keys_lock:
-            if char == "escape":
-                self.stop()
-                return False
             if char == "r":
                 self._request_reset()
                 return
@@ -279,6 +435,81 @@ class KeyboardController:
                 self._open_gripper()
                 return
             self.keys_pressed.add(char)
+
+    def _start_bottle_plan(
+        self,
+        *,
+        camera_mouth_same_side: bool,
+        key_name: str,
+    ) -> None:
+        with self._bottle_plan_lock:
+            if self._bottle_planning or self._bottle_actions:
+                print("  [扶瓶] 已在规划或执行中", flush=True)
+                return
+            if self.gripper_target > 0.0:
+                print("  [扶瓶] 拒绝启动：请先抓紧瓶子", flush=True)
+                return
+            self._bottle_planning = True
+            self._bottle_plan_id += 1
+            plan_id = self._bottle_plan_id
+        print(
+            f"  [扶瓶] 开始生成 {key_name} 序列："
+            f"腕部相机/瓶口={'同边' if camera_mouth_same_side else '异边'}",
+            flush=True,
+        )
+
+        def worker() -> None:
+            try:
+                state = self.env.get_robot_state_vector()
+                joint = self.env.get_joint_positions()
+                plan = self._bottle_planner.plan(
+                    joint,
+                    state[:3],
+                    rotvec_to_matrix(state[3:6]),
+                    camera_mouth_same_side=camera_mouth_same_side,
+                )
+                candidate = plan.candidate
+                with self._bottle_plan_lock:
+                    if plan_id != self._bottle_plan_id:
+                        return
+                    self._bottle_actions.extend(action.copy() for action in plan.actions)
+                print(
+                    f"  [扶瓶] key={key_name} "
+                    f"腕部相机/瓶口={'同边' if camera_mouth_same_side else '异边'} "
+                    f"候选={plan.candidate_count} 选择={candidate.label} "
+                    f"目标=({candidate.final_position[0]:.6f},"
+                    f"{candidate.final_position[1]:.6f},"
+                    f"{candidate.final_position[2]:.6f}) "
+                    f"joint_margin={math.degrees(candidate.minimum_joint_margin_rad):.1f}deg "
+                    f"frames={len(plan.actions)}",
+                    flush=True,
+                )
+            except Exception as exc:
+                print(f"  [扶瓶] {exc}", flush=True)
+            finally:
+                with self._bottle_plan_lock:
+                    if plan_id == self._bottle_plan_id:
+                        self._bottle_planning = False
+
+        threading.Thread(target=worker, name="bottle_planner", daemon=True).start()
+
+    def _next_bottle_action(self) -> np.ndarray | None:
+        with self._bottle_plan_lock:
+            if not self._bottle_actions:
+                if not self._bottle_planning:
+                    return None
+                # Planning uses a snapshot of the current pose.  Freeze the
+                # Cartesian command until the worker publishes the trajectory
+                # so manual input cannot invalidate that snapshot.
+                action = np.zeros(7, dtype=np.float64)
+                action[6] = 1.0
+                return action
+            action = self._bottle_actions.popleft()
+            remaining = len(self._bottle_actions)
+        self._set_gripper_target(0.0 if action[6] > 0.0 else 0.08)
+        if remaining == 0:
+            print("  [扶瓶] 自动轨迹执行完成", flush=True)
+        return action
 
     def _on_key_release(self, key):
         if self.input_device != "keyboard":
@@ -355,6 +586,84 @@ class KeyboardController:
             }
         except pygame.error:
             pass
+
+    def _sync_pico_state(self) -> None:
+        if self._pico_receiver is None:
+            return
+        snapshot = self._pico_receiver.latest()
+        if snapshot is None:
+            self._pico_primary_pressed = False
+            self._pico_secondary_pressed = False
+            return
+        self._pico_primary_pressed = bool(snapshot.packet.right.primary)
+        self._pico_secondary_pressed = bool(snapshot.packet.right.secondary)
+
+    def _capture_stage_target(self) -> None:
+        if self._tolerance_profile is None:
+            return
+        state = self.env.get_robot_state_vector()
+        pose = np.eye(4, dtype=np.float64)
+        pose[:3, 3] = state[:3]
+        pose[:3, :3] = rotvec_to_matrix(state[3:6])
+        stage = self._next_stage_capture
+        self._stage_target_poses[stage] = pose
+        self._next_stage_capture = (
+            ManipulationPhase.POSTGRASP
+            if stage is ManipulationPhase.PREGRASP
+            else ManipulationPhase.PREGRASP
+        )
+        self._tolerance_config_dirty = True
+        label = "Pre" if stage is ManipulationPhase.PREGRASP else "Post"
+        p = pose[:3, 3]
+        print(
+            f"  [容差目标] 已记录 {label}: "
+            f"position=({p[0]:+.4f},{p[1]:+.4f},{p[2]:+.4f}) "
+            f"rotvec=({state[3]:+.4f},{state[4]:+.4f},{state[5]:+.4f})",
+            flush=True,
+        )
+        if len(self._stage_target_poses) < 2:
+            print("  [容差目标] 请移动到 Post 目标姿态，再按一次 PS 键", flush=True)
+        else:
+            next_label = "Pre" if self._next_stage_capture is ManipulationPhase.PREGRASP else "Post"
+            print(f"  [容差目标] Pre/Post 已就绪；下一次 PS 键将覆盖 {next_label}", flush=True)
+
+    def _update_stage_tolerance(self, state: np.ndarray) -> None:
+        if self._tolerance_profile is None or len(self._stage_target_poses) < 2:
+            return
+        aperture = float(abs(state[6]) + abs(state[7])) if state.shape[0] >= 8 else self.gripper_target
+        observation = self._phase_classifier.update(
+            aperture,
+            commanded_closed=self.gripper_target <= 0.0,
+        )
+        phase = observation.phase
+        if phase is self._active_manipulation_phase and not self._tolerance_config_dirty:
+            return
+        stable_phase = (
+            ManipulationPhase.PREGRASP
+            if phase in (ManipulationPhase.PREGRASP, ManipulationPhase.GRASP)
+            else ManipulationPhase.POSTGRASP
+        )
+        pose = self._stage_target_poses[stable_phase]
+        if phase in (ManipulationPhase.GRASP, ManipulationPhase.RELEASE):
+            negative = np.zeros(3, dtype=np.float64)
+            positive = np.zeros(3, dtype=np.float64)
+        else:
+            negative, positive = self._tolerance_profile.bounds_rad(phase)
+        self.action_planner.configure_rotation_tolerance(
+            pose[:3, :3],
+            box_tolerance_frame(pose[:3, :3]),
+            negative,
+            positive,
+            phase=phase,
+        )
+        self._active_manipulation_phase = phase
+        self._tolerance_config_dirty = False
+        print(
+            f"  [容差阶段] {phase.key.upper()} aperture={observation.aperture_m:.4f}m "
+            f"bounds_deg=(-{np.degrees(negative).round(1).tolist()},"
+            f"+{np.degrees(positive).round(1).tolist()})",
+            flush=True,
+        )
 
     def rumble(self, low: float = 0.0, high: float = 0.0, duration_ms: int = 150):
         if self.input_device != "ps4" or not self._pygame_ready or self._joystick is None:
@@ -473,6 +782,9 @@ class KeyboardController:
                     self.running = False
                     self.env.request_stop()
                     return False
+                if button_idx == PS4_BUTTON_PS:
+                    self._capture_stage_target()
+                    continue
                 if button_idx == PS4_BUTTON_CROSS:
                     self._emit_event("record_discard")
                     self.reset_to_home(open_gripper=True)
@@ -551,6 +863,22 @@ class KeyboardController:
             return self._get_ps4_delta()
         return self._get_keyboard_delta()
 
+    def _handle_pico_recording_buttons(self, snapshot: PicoSnapshot) -> None:
+        primary = bool(snapshot.packet.right.primary)
+        secondary = bool(snapshot.packet.right.secondary)
+        primary_rising = primary and not self._pico_primary_pressed
+        secondary_rising = secondary and not self._pico_secondary_pressed
+        self._pico_primary_pressed = primary
+        self._pico_secondary_pressed = secondary
+
+        # B wins if both buttons arrive pressed in the same packet: discard must
+        # never immediately start a fresh episode by accident.
+        if secondary_rising:
+            self._emit_event("record_discard")
+            return
+        if primary_rising:
+            self._emit_event("record_stop" if self.recording_active else "record_start")
+
     def _current_rotation_matrix(self, commanded_pose: np.ndarray | None = None) -> np.ndarray:
         try:
             if commanded_pose is not None and np.asarray(commanded_pose).shape[0] >= 6:
@@ -576,10 +904,13 @@ class KeyboardController:
         input_delta: tuple[float, float, float, float, float, float] | None = None,
     ) -> np.ndarray:
         dx, dy, dz, droll, dpitch, dyaw = input_delta if input_delta is not None else self._get_input_delta()
-        drx, dry, drz = self._end_effector_rotation_to_backend_rotation(
-            np.array([droll, dpitch, dyaw], dtype=np.float64),
-            commanded_pose,
-        )
+        rotation_delta = np.array([droll, dpitch, dyaw], dtype=np.float64)
+        if self.rotation_frame == "ee":
+            rotation_delta = self._end_effector_rotation_to_backend_rotation(
+                rotation_delta,
+                commanded_pose,
+            )
+        drx, dry, drz = rotation_delta
         return np.array(
             [
                 dx,
@@ -593,6 +924,34 @@ class KeyboardController:
             dtype=np.float64,
         )
 
+    def _build_pico_action(self, commanded_pose: np.ndarray) -> tuple[np.ndarray, tuple[float, ...]]:
+        assert self._pico_receiver is not None and self._pico_mapper is not None
+        snapshot = self._pico_receiver.latest()
+        command = self._pico_mapper.step(snapshot)
+        if snapshot is not None and snapshot.age_s() <= self._pico_mapper.config.stale_timeout_s:
+            self._handle_pico_recording_buttons(snapshot)
+        if command is None:
+            action = np.zeros(7, dtype=np.float64)
+            action[6] = 1.0 if self.gripper_target <= 0.0 else -1.0
+            return action, tuple(action[:6])
+
+        action = command.action.copy()
+        action[3:6] = self._end_effector_rotation_to_backend_rotation(
+            action[3:6],
+            commanded_pose,
+        )
+        self._set_gripper_target(0.0 if action[6] > 0.0 else 0.08)
+        return action, tuple(command.action[:6])
+
+    def _build_current_input_action(
+        self,
+        commanded_pose: np.ndarray,
+    ) -> tuple[np.ndarray, tuple[float, ...]]:
+        if self.input_device == "pico":
+            return self._build_pico_action(commanded_pose)
+        input_delta = self._get_input_delta()
+        return self._build_action(commanded_pose, input_delta), input_delta
+
     def _print_ee_debug(
         self,
         *,
@@ -605,8 +964,9 @@ class KeyboardController:
             return
         rotation = self._current_rotation_matrix(commanded_pose)
         pos_ee = np.asarray(input_delta[:3], dtype=np.float64)
-        rot_ee = np.asarray(input_delta[3:6], dtype=np.float64)
+        rot_input = np.asarray(input_delta[3:6], dtype=np.float64)
         rot_base = np.asarray(action[3:6], dtype=np.float64)
+        rotation_input_frame = "ee" if self.input_device == "pico" else self.rotation_frame
         x_axis = rotation[:, 0]
         y_axis = rotation[:, 1]
         z_axis = rotation[:, 2]
@@ -617,7 +977,7 @@ class KeyboardController:
             f"ee_y=({y_axis[0]:+.3f},{y_axis[1]:+.3f},{y_axis[2]:+.3f}) "
             f"ee_z=({z_axis[0]:+.3f},{z_axis[1]:+.3f},{z_axis[2]:+.3f}) "
             f"dpos_ee=({pos_ee[0]:+.4f},{pos_ee[1]:+.4f},{pos_ee[2]:+.4f}) "
-            f"drot_ee=({rot_ee[0]:+.4f},{rot_ee[1]:+.4f},{rot_ee[2]:+.4f}) "
+            f"drot_{rotation_input_frame}=({rot_input[0]:+.4f},{rot_input[1]:+.4f},{rot_input[2]:+.4f}) "
             f"drot_base=({rot_base[0]:+.4f},{rot_base[1]:+.4f},{rot_base[2]:+.4f}) "
             f"action=({action[0]:+.4f},{action[1]:+.4f},{action[2]:+.4f},"
             f"{action[3]:+.4f},{action[4]:+.4f},{action[5]:+.4f},{action[6]:+.1f})",
@@ -638,8 +998,16 @@ class KeyboardController:
                 state = self.env.get_robot_state_vector()
                 joint_state = self.env.get_joint_positions()
                 commanded_pose = state[:6].copy()
-                input_delta = self._get_input_delta()
-                action = self._build_action(commanded_pose, input_delta)
+                # Poll the active device even during autonomous execution so
+                # reset/abort/exit buttons remain responsive.
+                manual_action, input_delta = self._build_current_input_action(commanded_pose)
+                bottle_action = self._next_bottle_action()
+                if bottle_action is None:
+                    action = manual_action
+                else:
+                    action = bottle_action
+                    input_delta = tuple(float(value) for value in action[:6])
+                self._update_stage_tolerance(state)
                 self._print_ee_debug(
                     state=state,
                     commanded_pose=commanded_pose,
@@ -657,7 +1025,17 @@ class KeyboardController:
                     self._latest_state = state.copy()
                     self._latest_joint_state = joint_state.copy()
                     self._latest_commanded_pose = commanded_pose.copy()
-                self.env.enqueue_action_block(action)
+                self.env.enqueue_cartesian_action(
+                    action,
+                    semantic_key=(
+                        "teleop",
+                        self.input_device,
+                        self.planner_mode,
+                        None
+                        if self._active_manipulation_phase is None
+                        else self._active_manipulation_phase.key,
+                    ),
+                )
                 self._append_recording_snapshot(
                     state=state,
                     joint_state=joint_state,
@@ -696,7 +1074,12 @@ class KeyboardController:
             self._latest_recording_action = np.zeros(7, dtype=np.float64)
             self._latest_recording_action[6] = self._latest_action[6]
         self._input_last_tick = time.monotonic()
-        self._input_thread = threading.Thread(target=self._input_loop, args=(generation,), daemon=True)
+        self._input_thread = threading.Thread(
+            target=self._input_loop,
+            args=(generation,),
+            name="franka_policy",
+            daemon=True,
+        )
         self._input_thread.start()
 
     def _ensure_input_thread(self, *, reason: str) -> None:
@@ -786,15 +1169,19 @@ class KeyboardController:
             ]
 
     def run(self, *, home_first: bool = True):
+        global keyboard
         self.start(home_first=home_first)
         listener = None
         try:
-            if self.input_device == "keyboard":
-                listener = keyboard.Listener(
-                    on_press=self._on_key_press,
-                    on_release=self._on_key_release,
-                )
-                listener.start()
+            if keyboard is None:
+                from pynput import keyboard as pynput_keyboard
+
+                keyboard = pynput_keyboard
+            listener = keyboard.Listener(
+                on_press=self._on_key_press,
+                on_release=self._on_key_release,
+            )
+            listener.start()
             self._start_input_thread()
             while self.running:
                 self.env.start_control_loop(

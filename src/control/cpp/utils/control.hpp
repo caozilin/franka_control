@@ -4,9 +4,13 @@
 #include <array>
 #include <cmath>
 
+#include <franka/rate_limiting.h>
+
 #include "utils/types.hpp"
 
 namespace franka_control::cpp {
+
+constexpr double kTorqueControlPeriodS = 1e-3;
 
 inline Eigen::Vector3d transformTranslation(const std::array<double, 7>& action, double max_translation_step) {
   return Eigen::Vector3d{
@@ -34,12 +38,15 @@ inline std::array<double, 7> arrayFromVector7(const Vector7d& input) {
   return out;
 }
 
-inline Vector7d limitTorqueRate(const Vector7d& tau_d, const std::array<double, 7>& tau_j_d, double dt,
-                                 double max_torque_rate) {
-  const double max_delta = max_torque_rate * dt;
+inline Vector7d limitTorqueRate(const Vector7d& tau_d,
+                                const std::array<double, 7>& tau_j_d,
+                                double max_torque_rate) {
   const Vector7d previous = vector7FromArray(tau_j_d);
   Vector7d out = previous;
   for (int i = 0; i < 7; ++i) {
+    const double max_delta =
+        std::min(max_torque_rate, franka::kMaxTorqueRate[static_cast<size_t>(i)]) *
+        kTorqueControlPeriodS;
     out(i) += std::clamp(tau_d(i) - previous(i), -max_delta, max_delta);
   }
   return out;

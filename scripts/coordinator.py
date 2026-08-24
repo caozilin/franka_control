@@ -17,7 +17,7 @@ import pathlib
 import sys
 import threading
 import time
-from typing import Any
+from typing import Any, Literal
 
 import imageio
 import numpy as np
@@ -37,12 +37,10 @@ from recording import RealtimeTimingProfiler
 from control.contracts import ControlRates, PolicyActionSpec
 from control.franka_env import DEFAULT_CAM1_SERIAL, DEFAULT_CAM2_SERIAL, FrankaEnv, ROBOT_IP
 from planning import (
-    AxisTask,
-    BaselineSQPPlanner,
+    CartesianActionPlanner,
+    PlannerConfig,
     SQPObjectiveSettings,
     SQPSettings,
-    ShadowSQPPlanner,
-    TaskKind,
 )
 from client.realtime_utils import (
     coerce_rgb_frame,
@@ -52,10 +50,27 @@ from client.realtime_utils import (
     shape_list,
 )
 from utils.control import transform_action
-from utils.pose import rotvec_to_matrix
+from utils.pose import end_effector_rotation_to_backend_rotation, rotvec_to_matrix
 
 LOGS_BASE_DIR = pathlib.Path(__file__).resolve().parents[1] / "logs"
 STATIC_DIR_BASE = ROOT / "src" / "static"
+
+
+def _rotation_action_ee_to_base(action: np.ndarray, robot_state: np.ndarray) -> np.ndarray:
+    """Convert a body-fixed EE rotation increment into the Base frame."""
+    result = np.asarray(action, dtype=np.float64).copy()
+    state = np.asarray(robot_state, dtype=np.float64)
+    if result.shape != (7,):
+        raise ValueError(f"Pico action must have shape (7,); got {result.shape}")
+    if state.shape[0] < 6:
+        raise ValueError(f"robot state must contain an XYZ + rotvec pose; got shape {state.shape}")
+    result[3:6] = end_effector_rotation_to_backend_rotation(
+        rotvec_to_matrix(state[3:6]),
+        result[3:6],
+    )
+    return result
+
+
 STREAM_DT = 0.05
 
 logger = logging.getLogger(__name__)
@@ -69,13 +84,13 @@ class State(enum.Enum):
 
 @dataclasses.dataclass
 class Args:
-    action_source: str = "policy"
+    action_source: Literal["policy", "pico"] = "policy"
     host: str = "100.96.2.67"
     port: int = 8000
     web_port: int = 8080
     prompt: str = "put the yellow cube on the red plate"
     log_subdir: str = ""
-    policy_type: str = "cosmos"
+    policy_type: Literal["openpi", "cosmos"] = "cosmos"
     replan_steps: int | None = None
     api_key: str | None = None
     robot_ip: str = ROBOT_IP
@@ -86,27 +101,36 @@ class Args:
     use_gripper: bool = True
     save_recording: bool = False
     startup_home: bool = True
+    auto_start: bool = False
     control_hz: float = 10.0
     pico_bind_host: str = "0.0.0.0"
     pico_port: int = 9010
-    pico_mapping_mode: str = "split"
-    pico_translation_scale: float = 0.5
+    pico_mapping_mode: Literal["single_6dof", "split"] = "split"
+    pico_translation_scale: float = 1.0
     pico_rotation_scale: float = 1.0
     pico_grip_threshold: float = 0.5
     pico_trigger_threshold: float = 0.5
     pico_stale_timeout_s: float = 0.15
     pico_require_both_grips: bool = True
     pico_rotation_base_from_pico: tuple[float, float, float, float, float, float, float, float, float] = (
+        0.0, 0.0, 1.0,
         1.0, 0.0, 0.0,
         0.0, 1.0, 0.0,
-        0.0, 0.0, 1.0,
     )
-    planner_mode: str = "direct"
+    planner_mode: Literal["direct", "baseline_sqp", "shadow_sqp"] = "direct"
+    tracker_mode: Literal["auto", "pid"] = "auto"
     policy_translation_scale_m: float = 0.01
     policy_rotation_scale_rad: float = 0.01
-    joint_reference_duration_s: float = 0.25
     joint_stiffness: tuple[float, float, float, float, float, float, float] = (80.0, 80.0, 80.0, 60.0, 25.0, 15.0, 10.0)
     joint_damping: tuple[float, float, float, float, float, float, float] = (17.8885, 17.8885, 17.8885, 15.4919, 10.0, 7.7460, 6.3246)
+    pid_proportional_gain: float = 0.18
+    pid_integral_gain_s: float = 0.30
+    pid_velocity_gain_s: float = 0.04
+    pid_maximum_correction_rad: float = 0.05235987755982989
+    pid_integration_error_limit_rad: float = 0.06981317007977318
+    pid_integral_time_constant_s: float = 1.0
+    pid_stationary_integral_time_constant_s: float = 0.25
+    pid_stationary_velocity_threshold_rad_s: float = 0.02
     max_torque_rate: float = 1000.0
     sqp_max_iterations: int = 20
     sqp_max_time_s: float = 0.095
@@ -130,14 +154,13 @@ class Args:
     rotation_limits_deg: tuple[float, float, float] = (30.0, 30.0, 45.0)
     tolerance_frame_rotvec: tuple[float, float, float] = (0.0, 0.0, 0.0)
     shadow_stage: str = "default"
-    reference: str | None = None
-    reference_name: str = "min_jerk"
+    reference: Literal["min_jerk", "linear", "cubic", "motion_limited"] = "min_jerk"
     nullspace_enabled: bool = False
     nullspace_q_target: tuple[float, float, float, float, float, float, float] | None = None
     nullspace_stiffness: float = 10.0
     nullspace_damping: float = 2.0
-    nullspace_pinv: str = "plain"
-    nullspace_projector: str = "kinematic"
+    nullspace_pinv: Literal["plain", "damped"] = "plain"
+    nullspace_projector: Literal["kinematic", "dynamic"] = "kinematic"
     nullspace_lambda: float = 0.05
     step_warn_ms: float = 20.0
     rtc_enabled: bool = False
@@ -145,31 +168,8 @@ class Args:
     rtc_inference_delay: int = 3
 
     def __post_init__(self) -> None:
-        self.action_source = self.action_source.lower().strip()
-        if self.action_source not in {"policy", "pico"}:
-            raise ValueError("action_source must be 'policy' or 'pico'")
-        self.pico_mapping_mode = self.pico_mapping_mode.lower().strip()
-        if self.pico_mapping_mode not in {"single_6dof", "split"}:
-            raise ValueError("pico_mapping_mode must be 'single_6dof' or 'split'")
-        self.policy_type = self.policy_type.lower().strip()
-        if self.policy_type not in {"openpi", "cosmos"}:
-            raise ValueError("policy_type must be 'openpi' or 'cosmos'")
-        self.planner_mode = self.planner_mode.lower().strip()
-        if self.planner_mode not in {"direct", "baseline_sqp", "shadow_sqp"}:
-            raise ValueError("planner_mode must be 'direct', 'baseline_sqp', or 'shadow_sqp'")
         if not str(self.log_subdir or "").strip():
             self.log_subdir = self.policy_type if self.action_source == "policy" else "pico"
-        if self.reference is not None:
-            self.reference_name = str(self.reference)
-        self.reference_name = self.reference_name.lower().strip()
-        if self.reference_name not in {"min_jerk", "linear", "cubic", "motion_limited"}:
-            raise ValueError("reference must be one of 'min_jerk', 'linear', 'cubic', or 'motion_limited'")
-        self.nullspace_pinv = self.nullspace_pinv.lower().strip()
-        if self.nullspace_pinv not in {"plain", "damped"}:
-            raise ValueError("nullspace_pinv must be 'plain' or 'damped'")
-        self.nullspace_projector = self.nullspace_projector.lower().strip()
-        if self.nullspace_projector not in {"kinematic", "dynamic"}:
-            raise ValueError("nullspace_projector must be 'kinematic' or 'dynamic'")
         if self.replan_steps is None:
             self.replan_steps = 16 if self.policy_type == "cosmos" else 5
         self.rtc_execution_horizon = max(1, int(self.rtc_execution_horizon))
@@ -243,36 +243,9 @@ class Coordinator:
         self._ws_clients: set[WebSocket] = set()
         self._ws_lock = asyncio.Lock()
 
-        self._env = FrankaEnv(
-            robot_ip=args.robot_ip,
-            cam1_serial=args.cam1_serial,
-            cam2_serial=args.cam2_serial,
-            no_robot=args.no_robot,
-            no_cameras=args.no_cameras,
-            use_gripper=args.use_gripper,
-            control_hz=args.control_hz,
-            control_mode="joint" if args.planner_mode != "direct" else "cartesian",
-            joint_min_jerk_duration=args.joint_reference_duration_s,
-            joint_stiffness=np.asarray(args.joint_stiffness, dtype=np.float64),
-            joint_damping=np.asarray(args.joint_damping, dtype=np.float64),
-            max_torque_rate=args.max_torque_rate,
-            save_recording=args.save_recording,
-            reference_name=args.reference_name,
-            nullspace_enabled=args.nullspace_enabled,
-            nullspace_q_target=None if args.nullspace_q_target is None else np.asarray(args.nullspace_q_target, dtype=np.float64),
-            nullspace_stiffness=args.nullspace_stiffness,
-            nullspace_damping=args.nullspace_damping,
-            nullspace_pinv=args.nullspace_pinv,
-            nullspace_projector=args.nullspace_projector,
-            nullspace_lambda=args.nullspace_lambda,
-        )
-        self._sqp_planner: BaselineSQPPlanner | ShadowSQPPlanner | None = None
-        self._sqp_axis_tasks: tuple[AxisTask, ...] | None = None
-        self._tolerance_frame = rotvec_to_matrix(np.asarray(args.tolerance_frame_rotvec, dtype=np.float64))
-        self._ranged_axes = np.asarray(args.rotation_ranged_axes, dtype=bool)
-        self._rotation_limits = np.radians(np.asarray(args.rotation_limits_deg, dtype=np.float64))
-        if args.planner_mode != "direct":
-            baseline = BaselineSQPPlanner(
+        action_planner = CartesianActionPlanner(
+            PlannerConfig(
+                mode=args.planner_mode,
                 solver_settings=SQPSettings(
                     max_iterations=args.sqp_max_iterations,
                     max_time_s=args.sqp_max_time_s,
@@ -295,18 +268,43 @@ class Coordinator:
                     self_collision_weight=args.sqp_self_collision_weight,
                     tolerance_weight=args.sqp_tolerance_weight,
                 ),
+                rotation_ranged_axes=args.rotation_ranged_axes,
+                rotation_limits_deg=args.rotation_limits_deg,
+                tolerance_frame_rotvec=args.tolerance_frame_rotvec,
+                shadow_stage=args.shadow_stage,
             )
-            self._sqp_planner = ShadowSQPPlanner(baseline) if args.planner_mode == "shadow_sqp" else baseline
-            tasks = [AxisTask(TaskKind.SPECIFIC) for _ in range(6)]
-            for axis, ranged in enumerate(self._ranged_axes):
-                if ranged:
-                    tasks[axis + 3] = AxisTask(
-                        TaskKind.FLAT_RANGE,
-                        lower=-self._rotation_limits[axis],
-                        upper=self._rotation_limits[axis],
-                    )
-            self._sqp_axis_tasks = tuple(tasks)
-
+        )
+        self._env = FrankaEnv(
+            robot_ip=args.robot_ip,
+            cam1_serial=args.cam1_serial,
+            cam2_serial=args.cam2_serial,
+            no_robot=args.no_robot,
+            no_cameras=args.no_cameras,
+            use_gripper=args.use_gripper,
+            control_hz=args.control_hz,
+            action_planner=action_planner,
+            tracker_mode=args.tracker_mode,
+            joint_stiffness=np.asarray(args.joint_stiffness, dtype=np.float64),
+            joint_damping=np.asarray(args.joint_damping, dtype=np.float64),
+            pid_proportional_gain=args.pid_proportional_gain,
+            pid_integral_gain_s=args.pid_integral_gain_s,
+            pid_velocity_gain_s=args.pid_velocity_gain_s,
+            pid_maximum_correction_rad=args.pid_maximum_correction_rad,
+            pid_integration_error_limit_rad=args.pid_integration_error_limit_rad,
+            pid_integral_time_constant_s=args.pid_integral_time_constant_s,
+            pid_stationary_integral_time_constant_s=args.pid_stationary_integral_time_constant_s,
+            pid_stationary_velocity_threshold_rad_s=args.pid_stationary_velocity_threshold_rad_s,
+            max_torque_rate=args.max_torque_rate,
+            save_recording=args.save_recording,
+            reference_name=args.reference,
+            nullspace_enabled=args.nullspace_enabled,
+            nullspace_q_target=None if args.nullspace_q_target is None else np.asarray(args.nullspace_q_target, dtype=np.float64),
+            nullspace_stiffness=args.nullspace_stiffness,
+            nullspace_damping=args.nullspace_damping,
+            nullspace_pinv=args.nullspace_pinv,
+            nullspace_projector=args.nullspace_projector,
+            nullspace_lambda=args.nullspace_lambda,
+        )
         self._pico_receiver: PicoUdpReceiver | None = None
         self._pico_mapper: PicoPoseMapper | None = None
         if args.action_source == "pico":
@@ -375,8 +373,7 @@ class Coordinator:
                 self._action_scheduler.clear()
                 if self._pico_mapper is not None:
                     self._pico_mapper.reset()
-                if self._sqp_planner is not None:
-                    self._sqp_planner.reset(self._env.get_joint_positions())
+                self._env.reset_action_planner()
                 self._bump_infer_generation()
                 self._state = State.RUNNING
                 logger.info("State -> RUNNING")
@@ -533,7 +530,7 @@ class Coordinator:
             "log_subdir": self.log_subdir,
             "control_hz": self._args.control_hz,
             "planner_mode": self._args.planner_mode,
-            "reference_name": self._args.reference_name,
+            "reference": self._args.reference,
             "args": {
                 key: value
                 for key, value in dataclasses.asdict(self._args).items()
@@ -684,13 +681,13 @@ class Coordinator:
             self._control_timing_profiler = RealtimeTimingProfiler(capacity=12000)
             self._env.start_control(
                 home_first=False,
-                reference_name=self._args.reference_name,
+                reference_name=self._args.reference,
                 timing_profiler=self._control_timing_profiler,
             )
             return
 
         if self._args.action_source == "pico":
-            pico_action = self._next_pico_action()
+            pico_action = self._next_pico_action(obs)
             if pico_action is None:
                 return
             raw_action, exec_action = pico_action
@@ -703,48 +700,10 @@ class Coordinator:
             raw_action = action.copy()
             exec_action = self._policy_action_spec.decode_cartesian(action).as_vector()
         transformed = transform_action(exec_action, self._env.action_config)
-        sqp_telemetry = None
-        if self._sqp_planner is None:
-            self._env.enqueue_action(exec_action)
-        else:
-            measured_q = self._env.get_joint_positions()
-            if isinstance(self._sqp_planner, ShadowSQPPlanner):
-                with self._prompt_lock:
-                    semantic_key = (self._prompt, self._args.shadow_stage)
-                shadow_plan = self._sqp_planner.step(
-                    measured_q,
-                    transformed[:6],
-                    tolerance_frame=self._tolerance_frame,
-                    ranged_axes=self._ranged_axes,
-                    rotation_limits=self._rotation_limits,
-                    semantic_key=semantic_key,
-                    axis_tasks=self._sqp_axis_tasks,
-                )
-                plan = shadow_plan.baseline
-                sqp_telemetry = {
-                    "shadow_anchor_reset": shadow_plan.shadow.anchor_reset,
-                    "shadow_strict_residual_rad": shadow_plan.shadow.non_tolerance_residual_rad,
-                }
-            else:
-                plan = self._sqp_planner.step(
-                    measured_q,
-                    transformed[:6],
-                    axis_tasks=self._sqp_axis_tasks,
-                    tolerance_rotation=self._tolerance_frame,
-                )
-            self._env.enqueue_joint_target(plan.q, gripper_target=float(transformed[6]))
-            sqp_telemetry = {
-                **(sqp_telemetry or {}),
-                "status": plan.solver.status,
-                "feasible": plan.solver.feasible,
-                "converged": plan.solver.converged,
-                "iterations": plan.solver.iterations,
-                "qp_iterations": plan.solver.qp_iterations,
-                "elapsed_ms": plan.solver.elapsed_ms,
-                "position_residual": plan.solver.constraints.position_residual,
-                "rotation_residual": plan.solver.constraints.rotation_residual,
-                "tolerance_violation": plan.solver.constraints.inequality_violation,
-            }
+        with self._prompt_lock:
+            semantic_key = (self._prompt, self._args.shadow_stage)
+        planned = self._env.enqueue_cartesian_action(exec_action, semantic_key=semantic_key)
+        sqp_telemetry = planned.telemetry
         if self._args.action_source == "policy":
             self._action_scheduler.consume_executed_step()
         with self._telemetry_lock:
@@ -753,7 +712,7 @@ class Coordinator:
             self._latest_sqp = sqp_telemetry
         self._record_action_telemetry()
 
-    def _next_pico_action(self) -> tuple[np.ndarray, np.ndarray] | None:
+    def _next_pico_action(self, obs: dict) -> tuple[np.ndarray, np.ndarray] | None:
         assert self._pico_receiver is not None and self._pico_mapper is not None
         snapshot = self._pico_receiver.latest()
         command = self._pico_mapper.step(snapshot)
@@ -785,7 +744,16 @@ class Coordinator:
             self._latest_pico = pico
         if command is None:
             return None
-        return command.action.copy(), command.action.copy()
+        raw_action = command.action.copy()
+        state_value = obs.get("observation/state")
+        if state_value is None:
+            state_value = self._env.get_robot_state_vector()
+        state = np.asarray(state_value, dtype=np.float64)
+        # Mapper rotation is body-fixed (end-effector frame).  Cartesian actions
+        # consumed by FrankaEnv are spatial increments in Base, so reuse the
+        # keyboard teleop's shared EE-to-Base conjugation here.
+        exec_action = _rotation_action_ee_to_base(raw_action, state)
+        return raw_action, exec_action
 
     def _copy_obs_for_inference(self, obs: dict) -> dict:
         copied = {}
@@ -1201,6 +1169,8 @@ def main(args: Args) -> None:
     coordinator = Coordinator(args)
     ctrl_thread = threading.Thread(target=coordinator.run_control_loop, daemon=True)
     ctrl_thread.start()
+    if args.auto_start:
+        coordinator.cmd_start()
     app = build_app(coordinator)
     uvicorn.run(app, host="0.0.0.0", port=args.web_port)
 

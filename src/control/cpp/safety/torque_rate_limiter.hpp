@@ -11,9 +11,8 @@ class TorqueRateLimiter {
   explicit TorqueRateLimiter(double max_torque_rate) : max_torque_rate_(max_torque_rate) {}
 
   Vector7d apply(const Vector7d& desired,
-                 const std::array<double, 7>& previous_desired,
-                 double dt) const {
-    return limitTorqueRate(desired, previous_desired, dt, max_torque_rate_);
+                 const std::array<double, 7>& previous_desired) const {
+    return limitTorqueRate(desired, previous_desired, max_torque_rate_);
   }
 
  private:

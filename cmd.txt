@@ -1,31 +1,375 @@
-cd /home/k324/franka_my_code/franka_control
-source .venv/bin/activate
+## 1. 统一笛卡尔遥操作（键盘 / PS4 / PICO，默认：Direct + Linear，相机关闭）
+/home/franka/franka_my_code/franka_control/.venv/bin/python /home/franka/franka_my_code/franka_control/scripts/teleop.py \
+  --input-device keyboard \
+  --planner-mode shadow_sqp \
+  --reference linear \
+  --tracker-mode pid \
+  --tolerance-id T03
 
-cmake --build build -j2
+--input-device {keyboard,ps4,pico} ； --rotation-frame {ee,base} ； --planner-mode {direct,baseline_sqp,shadow_sqp} ； --reference {min_jerk,linear,cubic,motion_limited} ;  --tracker-mode {auto,pid}
 
-python examples/real_robot_env_smoke_test.py --ip 172.16.0.2
-python examples/move_forward_30cm.py --ip 172.16.0.2
-python scripts/example_trajectory_record_and_analyze.py --ip 172.16.0.2 --reference linear --scale 1.0 --nullspace-enabled
-python scripts/example_trajectory_record_and_analyze.py --ip 172.16.0.2 --reference motion_limited --scale 1.0
-python scripts/joint_keyboard_control.py
+# 扶瓶：手动抓紧后，腕部相机与瓶口同边按 N，异边按 M；两个最终末端姿态相差 180deg。
+# 固定末端目标 xyz=(0.429286, 0, 0.315028)m（标定时真机 x/z + 固定 y=0），左/右姿态按 MuJoCo 筛选。
 
-python scripts/key_control.py --reference motion_limited
-python scripts/key_control.py --reference motion_limited --save-recording
-python scripts/key_control.py --save-recording --nullspace-enabled \
---nullspace-pinv plain \
---nullspace-projector kinematic \
---nullspace-stiffness 20.0 \
---nullspace-damping 5.0 \
---nullspace-q-target "nan,-0.3,nan,nan,nan,nan,nan" \
---release-task-dims ry
+## 2. 关节键盘控制（默认：从当前关节位置开始）
 
-python src/data_collection/data_recorder.py --reference linear \
---collection_dir default
+/home/franka/franka_my_code/franka_control/.venv/bin/python /home/franka/franka_my_code/franka_control/scripts/joint_keyboard_control.py \
+  --ip 172.16.0.2 \
+  --reference min_jerk \
+  --tracker-mode auto
 
-# franka_control 连接 openpi 推理服务
-cd /home/k324/franka_my_code/franka_control
-source .venv/bin/activate
-python scripts/coordinator.py --policy_type openpi \
---prompt "put the yellow cube on the red plate" \
---reference motion_limited \
---rtc-enabled
+
+## 3. 固定轨迹复现与分析（默认：Direct + Min-Jerk + scale 1.0）
+
+/home/franka/franka_my_code/franka_control/.venv/bin/python /home/franka/franka_my_code/franka_control/scripts/example_trajectory_record_and_analyze.py \
+  --ip 172.16.0.2 \
+  --planner-mode direct \
+  --reference min_jerk \
+  --tracker-mode auto \
+  --scale 1.0 \
+  --yes
+
+
+## 4. 人工数据采集（统一入口；必须显式打开相机）
+
+/home/franka/franka_my_code/franka_control/.venv/bin/python /home/franka/franka_my_code/franka_control/scripts/teleop.py \
+  --collection-dir default \
+  --task-name default \
+  --ip 172.16.0.2 \
+  --input-device ps4 \
+  --with-cameras \
+  --joystick-index 0 \
+  --planner-mode direct \
+  --reference linear \
+  --tracker-mode auto
+
+
+## 5. 策略推理服务 + Web 控制面板（默认：Cosmos + Direct + Min-Jerk）
+
+/home/franka/franka_my_code/franka_control/.venv/bin/python /home/franka/franka_my_code/franka_control/scripts/coordinator.py \
+  --action-source policy \
+  --policy-type cosmos \
+  --robot-ip 172.16.0.2 \
+  --planner-mode direct \
+  --reference min_jerk \
+  --tracker-mode auto \
+  --prompt "put the yellow cube on the red plate"
+
+
+## 6. PICO 双姿态速度控制（默认：Direct + Linear，相机关闭）
+
+/home/franka/franka_my_code/franka_control/.venv/bin/python /home/franka/franka_my_code/franka_control/scripts/teleop.py \
+  --input-device pico \
+  --ip 172.16.0.2 \
+  --pico-mapping-mode split \
+  --pico-attitude-deadzone-deg 10 \
+  --pico-attitude-full-scale-deg 25 \
+  --pico-translation-scale 1 \
+  --pico-rotation-scale 1 \
+  --planner-mode direct \
+  --reference linear \
+  --tracker-mode auto
+
+# PICO 数采：在上面命令末尾增加 --with-cameras --task-name default
+# A：开始/再次按下保存；B：作废；右 Trigger：切换夹爪。
+# 左手：Roll/Pitch/Yaw -> Base X/Y/Z 平移速度。
+# 右手：X/Y 互换后 -> 末端系旋转速度，随后转换为 Base 系增量。
+# =============================================================================
+# 控制参数总览
+# =============================================================================
+
+# 一、机器人、输入与启动
+#
+# --ip IP
+#   遥操、数据采集和测试脚本的机器人 IP；默认 172.16.0.2。
+#
+# --robot-ip IP
+#   Coordinator 使用的机器人 IP；默认 172.16.0.2。
+#
+# --input-device {keyboard,ps4,pico}
+#   统一笛卡尔遥操作输入设备；teleop 默认 keyboard。
+#
+# --joystick-index INT
+#   手柄索引；默认 0。
+#
+# --rotation-frame {ee,base}
+#   键盘/PS4 旋转增量的输入坐标系；默认 ee。base 表示绕 Base 固定 XYZ 轴旋转。
+#   PICO 保持现有末端系旋转映射，不受该参数影响。
+#
+# --tolerance-id {T01,...,T13}
+#   PS4 SQP 的 Pre/Post 旋转容差组合；对应任务见 docs/franka_tolerance_ids.md。
+#   启用后按 PS 键依次采集 Pre、Post 当前姿态，Grasp/Release 阶段自动使用零容差。
+#
+# --no-home-first
+#   从当前位置开始，跳过启动时 Home 复位。
+#
+# --with-cameras
+#   启用双相机和片段录制；teleop 默认关闭相机。
+#
+# --control-cpu INT
+#   统一遥操作控制进程使用的 CPU；当前电脑默认 2。
+#
+# --startup-home / --no-startup-home
+#   Coordinator 启动时是否执行 Home 复位；默认执行。
+#
+# --home-first
+#   joint_keyboard_control 启动时先执行 Home 复位；默认不执行。
+#
+# --dry-run
+#   joint_keyboard_control 仅打印关节目标，不连接或控制机器人。
+#
+# --reset-duration SEC
+#   Home 复位时长；默认 5.0 s。
+#
+# --control-hz HZ
+#   Coordinator 的策略与规划频率；默认 10 Hz。
+#
+# --use-gripper / --no-use-gripper
+#   Coordinator 是否连接夹爪；默认启用。
+#
+# --no-cameras
+#   不启动 RealSense 相机。
+#
+# --cam1-serial SERIAL / --cam2-serial SERIAL
+#   Coordinator 的两台 RealSense 序列号；默认 346222072769 / 938422075745。
+#
+# --no-robot
+#   不连接真机，仅运行 Python 逻辑。
+
+
+# 二、运动规划与参考轨迹
+#
+# --planner-mode {direct,baseline_sqp,shadow_sqp}
+#   默认 direct。
+#   direct       ：7D 笛卡尔动作直接进入笛卡尔参考轨迹和阻抗控制。
+#   baseline_sqp ：7D 笛卡尔动作先经 SQP 求解为绝对关节目标。
+#   shadow_sqp   ：Shadow 目标姿态 + Baseline SQP，再生成绝对关节目标。
+#
+# --tracker-mode {auto,pid}
+#   默认 auto：笛卡尔 Reference 选择内部 cartesian_impedance，关节 Reference 选择内部 joint_pid。
+#   pid：同样按 Reference 空间选择实现；不会把笛卡尔 Reference 转成关节 Reference。
+#   joint_pid 先做有界泄漏 PID 关节参考修正，再由关节阻抗转换为扭矩。
+#
+# --reference {min_jerk,linear,cubic,motion_limited}
+#   Reference profile 与 Planner 独立选择，再由 Router 检查空间兼容性。
+#   所有启动命令统一使用 --reference。
+#   key_control/data_recorder 默认 linear；coordinator 默认 min_jerk。
+#   笛卡尔空间可选 min_jerk/linear/cubic/motion_limited。
+#   关节空间可选 min_jerk/linear/cubic；joint motion_limited 尚未实现。
+#   min_jerk      ：五次最小加加速度插值，段首尾速度和加速度为零。
+#   linear        ：线性插值，响应直接。
+#   cubic         ：三次平滑插值，段首尾速度为零。
+#   motion_limited：按速度和加速度上限在线跟踪，适合连续遥操。
+#
+# 关节 linear/cubic/min_jerk 固定在一个低频控制周期（1 / control_hz）内走完。
+#
+# 路由关系：Planner 决定输出空间；Reference 决定目标随时间的变化；Tracker 决定误差到扭矩的映射。
+#           三者分别选择，但必须属于同一空间；Router 只负责校验和连接。
+
+
+# 三、笛卡尔动作限制
+#
+# --max-translation-velocity M_S
+#   末端平移速度上限；默认 0.2 m/s。
+#
+# --max-rotation-velocity RAD_S
+#   末端旋转速度上限；默认 pi/4 rad/s。
+#
+# --max-translation-goal-error M
+#   命令位置与实测位置的最大允许距离；默认 0.3 m。
+#
+# --max-rotation-goal-error RAD
+#   命令姿态与实测姿态的最大允许误差；默认 pi/6 rad。
+#
+# --motion-limited-max-translation-velocity M_S
+# --motion-limited-max-rotation-velocity RAD_S
+#   motion_limited 参考的速度上限；默认是对应基础速度的 1.2 倍。
+#
+# --motion-limited-max-translation-acceleration M_S2
+# --motion-limited-max-rotation-acceleration RAD_S2
+#   motion_limited 参考的加速度上限；默认是对应 motion_limited 速度的 5 倍。
+#
+# --policy-translation-scale-m M
+# --policy-rotation-scale-rad RAD
+#   Coordinator 将 Policy 原始动作换算为物理增量的缩放系数；均默认 0.01。
+#
+# --max-translation-step M / --max-rotation-step RAD
+#   固定轨迹脚本每个 10Hz 动作的平移/旋转尺度；默认 0.1 m / pi/4 rad。
+#
+# --scale FLOAT
+#   固定轨迹的整体动作缩放；默认 1.0。
+#
+# --settle SEC
+#   最后一个动作后的稳定等待时间；固定轨迹默认 4.0 s。
+
+
+# 四、Shadow SQP 目标姿态与容差
+#
+# --rotation-ranged-axes RX RY RZ
+#   哪些 tolerance-frame 旋转轴允许在范围内优化；默认 false false false。
+#   key_control/data_recorder 使用小写 false/true；Coordinator 使用 False/True。
+#
+# --rotation-limits-deg RX RY RZ
+#   各旋转轴容差半宽，实际范围为 +/-该值；默认 30 30 45 deg。
+#   只有 rotation-ranged-axes 为 true 的轴使用对应容差。
+#
+# --tolerance-frame-rotvec RX RY RZ
+#   容差坐标系相对基坐标系的旋转向量，单位 rad；默认 0 0 0。
+#
+# --shadow-stage NAME
+#   Shadow 语义阶段键；阶段或 prompt 改变时重置 Shadow anchor。
+#   key_control/data_recorder 默认 teleop；Coordinator 默认 default。
+
+
+# 五、SQP 求解器（Coordinator 可配置，Baseline/Shadow 共用）
+#
+# --sqp-max-iterations INT                 最大 SQP 迭代数；默认 20。
+# --sqp-max-time-s SEC                     单拍求解时间上限；默认 0.095 s。
+# --sqp-derivative-epsilon FLOAT           数值导数步长；默认 1e-7。
+# --sqp-step-tolerance FLOAT               步长收敛阈值；默认 1e-7。
+# --sqp-position-tolerance M               位置约束容差；默认 1e-5。
+# --sqp-rotation-tolerance RAD             姿态约束容差；默认 1e-4。
+# --sqp-inequality-tolerance FLOAT         不等式可行容差；默认 1e-7。
+# --sqp-trust-region RAD                   关节搜索信赖域；默认 0.35。
+# --sqp-merit-penalty FLOAT                约束违反惩罚；默认 1000。
+# --sqp-line-search-iterations INT         最大线搜索次数；默认 12。
+# --sqp-qp-iterations INT                  每次 SQP 的最大 QP 迭代数；默认 32。
+#
+# --sqp-velocity-weight FLOAT              关节速度目标权重；默认 0.7。
+# --sqp-acceleration-weight FLOAT          关节加速度目标权重；默认 0.5。
+# --sqp-jerk-weight FLOAT                  关节加加速度目标权重；默认 0.3。
+# --sqp-joint-limit-weight FLOAT           关节限位避让权重；默认 0.1。
+# --sqp-manipulability-weight FLOAT        可操作度权重；默认 1.0。
+# --sqp-self-collision-weight FLOAT        自碰撞避让权重；默认 0.01。
+# --sqp-tolerance-weight FLOAT             容差区内偏好权重；默认 1.0。
+
+
+# 六、关节跟踪与扭矩（Coordinator 的 SQP 模式）
+#
+# --joint-stiffness J1 J2 J3 J4 J5 J6 J7
+#   关节阻抗刚度；默认 80 80 80 60 25 15 10。
+#
+# --joint-damping J1 J2 J3 J4 J5 J6 J7
+#   关节阻抗阻尼；默认 17.8885 17.8885 17.8885 15.4919 10 7.746 6.3246。
+#
+# --pid-proportional-gain FLOAT                    默认 0.18。
+# --pid-integral-gain-s FLOAT                      默认 0.30。
+# --pid-velocity-gain-s FLOAT                      默认 0.04。
+# --pid-maximum-correction-rad RAD                 单关节修正上限；默认 0.05236 rad（3 deg）。
+# --pid-integration-error-limit-rad RAD            进入积分的误差上限；默认 0.06981 rad（4 deg）。
+# --pid-integral-time-constant-s SEC               运动时积分泄漏时间常数；默认 1.0 s。
+# --pid-stationary-integral-time-constant-s SEC    静止时积分泄漏时间常数；默认 0.25 s。
+# --pid-stationary-velocity-threshold-rad-s RAD_S  静止判断阈值；默认 0.02 rad/s。
+#   以上参数只在 tracker-mode=pid 且 Reference 为 joint 时使用，数值来自 franka_mujoco JointReferenceTracker。
+#
+# --max-torque-rate NM_S
+#   扭矩变化率上限；默认 1000，按固定 1 ms 限幅并封顶到 libfranka 上限。
+
+
+# 七、Direct 笛卡尔控制的 Nullspace
+#
+# --nullspace-enabled
+#   启用 Nullspace 姿态控制；默认关闭。SQP 关节阻抗路径不使用该组参数。
+#
+# --nullspace-pinv {plain,damped}
+#   Jacobian 伪逆；默认 plain。
+#
+# --nullspace-projector {kinematic,dynamic}
+#   Nullspace 投影器；默认 kinematic。
+#
+# --nullspace-lambda FLOAT
+#   damped 伪逆的阻尼系数；默认 0.05。
+#
+# --nullspace-stiffness FLOAT
+# --nullspace-damping FLOAT
+#   Nullspace 刚度/阻尼；默认 10.0 / 2.0。
+#
+# --nullspace-q-target "Q1,Q2,Q3,Q4,Q5,Q6,Q7"
+#   Nullspace 关节目标，nan 表示该关节不设目标。
+#
+# --release-task-dims x,y,z,rx,ry,rz
+#   key_control 可释放的笛卡尔任务维度，多个维度用逗号分隔。
+
+
+# 八、Policy / RTC / Pico 动作源（Coordinator）
+#
+# --action-source {policy,pico}
+#   动作源；默认 policy。
+#
+# --policy-type {cosmos,openpi}
+#   Policy 类型；默认 cosmos。
+#
+# --host HOST / --port PORT
+#   Policy WebSocket 服务地址；默认 100.96.2.67:8000。
+#
+# --web-port PORT
+#   本地 Web 控制面板端口；默认 8080。
+#
+# --api-key KEY
+#   推理服务 API key；默认不设置。
+#
+# --prompt TEXT
+#   任务语言指令；默认 "put the yellow cube on the red plate"。
+#
+# --replan-steps INT
+#   每次推理使用的动作数；Cosmos 默认 16，OpenPI 默认 5。
+#
+# --rtc-enabled
+#   启用 OpenPI RTC；仅 action-source=policy 且 policy-type=openpi 时生效。
+#
+# --rtc-execution-horizon INT
+#   RTC 执行 horizon；默认 5。
+#
+# --rtc-inference-delay INT
+#   RTC 推理延迟拍数；默认 3。
+#
+# --pico-bind-host HOST / --pico-port PORT
+#   Pico UDP 监听地址；默认 0.0.0.0:9010。
+#
+# --pico-mapping-mode {split,single_6dof}
+#   Pico 映射模式；默认 split。
+#
+# --pico-translation-scale FLOAT / --pico-rotation-scale FLOAT
+#   PICO 平移/旋转速度缩放；统一入口默认 1.0 / 1.0。
+#
+# --pico-grip-threshold FLOAT / --pico-trigger-threshold FLOAT
+#   Pico 抓握/扳机阈值；默认 0.5 / 0.5。
+#
+# --pico-stale-timeout-s SEC
+#   UDP 数据超时阈值；默认 0.15 s。
+#
+# --pico-attitude-deadzone-deg DEG
+#   左右手姿态速度死区；默认 10 deg。
+#
+# --pico-attitude-full-scale-deg DEG
+#   姿态达到每帧动作上限的倾角；默认 25 deg。
+#
+# --pico-require-both-grips / --no-pico-require-both-grips
+#   split 模式是否要求双手同时抓握才允许运动；默认要求。
+#
+# --pico-rotation-base-from-pico R00 R01 R02 R10 R11 R12 R20 R21 R22
+#   PICO Tracking 坐标系到机器人 Base 系的 3x3 旋转矩阵。
+
+
+# 九、录制与数据采集
+#
+# --save-recording
+#   退出控制后保存轨迹、时序和分析结果。
+#
+# --collection-dir DIR
+#   数据集目录或配置名；示例使用 default。
+#
+# --task-name NAME / --prompt TEXT
+#   数据采集的任务名和语言指令。
+#
+# --collect-hz HZ
+#   数据采集频率；未指定时使用采集器默认配置。
+#
+# --max-frames INT
+#   单条轨迹最大帧数；未指定时使用采集器默认配置。
+#
+# --action-scale FLOAT
+#   录制动作缩放；未指定时使用采集器默认配置。
+#
+# --debug-ee-axes
+#   打印末端坐标系输入和基坐标系动作转换。

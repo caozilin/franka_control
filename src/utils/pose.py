@@ -92,6 +92,22 @@ def matrix_to_rotvec_continuous(matrix: np.ndarray, previous: np.ndarray | None 
     return min(candidates, key=lambda candidate: float(np.linalg.norm(candidate - previous))).copy()
 
 
+def end_effector_rotation_to_backend_rotation(
+    current_rotation: np.ndarray,
+    rotvec_ee: np.ndarray,
+) -> np.ndarray:
+    """Convert an end-effector-frame rotation increment to a Base-frame increment."""
+    current_rotation = np.asarray(current_rotation, dtype=np.float64).reshape(3, 3)
+    rotvec_ee = np.asarray(rotvec_ee, dtype=np.float64)
+    if rotvec_ee.shape != (3,):
+        raise ValueError(f"rotvec_ee must have shape (3,); got {rotvec_ee.shape}")
+    if float(np.linalg.norm(rotvec_ee)) < 1e-12:
+        return np.zeros(3, dtype=np.float64)
+    delta_rotation_ee = rotvec_to_matrix(rotvec_ee)
+    delta_rotation_base = current_rotation @ delta_rotation_ee @ current_rotation.T
+    return matrix_to_rotvec(delta_rotation_base)
+
+
 def pose_array_to_matrix(pose: np.ndarray) -> np.ndarray:
     return np.asarray(pose, dtype=np.float64).reshape(4, 4, order="F")
 

@@ -15,13 +15,21 @@ dependencies = [
     "msgpack-numpy>=0.4",
     "opencv-python>=4.0",
     "pyrealsense2>=2.0",
+    "cmeel-tinyxml2==10.0.0",
+    "cmeel-urdfdom==4.0.1",
+    "pin==3.4.0",
 ]
 
 [project.optional-dependencies]
+build = [
+    "cmake>=3.18,<4",
+    "cmeel-urdfdom[build]==4.0.1",
+    "pin[build]==3.4.0",
+    "pybind11>=2.11,<4",
+]
 dev = [
     "pytest>=7.0",
 ]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-

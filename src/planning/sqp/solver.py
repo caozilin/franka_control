@@ -226,6 +226,32 @@ class FullSpaceSQPSolver:
                 )
             )
             qp_iterations += qp_result.iterations
+            if (
+                not qp_result.success
+                and qp_result.status == "dependent violated constraint"
+                and not phase_one
+            ):
+                # The MuJoCo formulation starts with an identity BFGS model.
+                # A first full-speed rotational command can then pin more
+                # trust-region faces than the 3-D translation manifold has
+                # free dimensions, although the nonlinear problem is feasible.
+                # Retry the identical linearized constraints with conservative
+                # isotropic curvature; subsequent accepted steps restore the
+                # ordinary damped-BFGS update.
+                cold_start_curvature = max(
+                    1.0,
+                    float(np.linalg.norm(qp_gradient, ord=np.inf)),
+                )
+                qp_result = self.qp.solve(
+                    qp_hessian + cold_start_curvature * identity,
+                    qp_gradient,
+                    qp_equality_jacobian,
+                    qp_equality_rhs,
+                    inequality_matrix,
+                    inequality_rhs,
+                    tolerance=self.settings.inequality_tolerance,
+                )
+                qp_iterations += qp_result.iterations
             if box_only and not qp_result.success:
                 hessian = np.eye(q.size)
                 qp_result = self.qp.solve_box(

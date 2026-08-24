@@ -15,6 +15,8 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from control.franka_env import FrankaEnv  # noqa: E402
+from control.pid_config import add_joint_pid_arguments, joint_pid_kwargs  # noqa: E402
+from planning import JOINT_REFERENCE_CHOICES, TRACKER_MODE_CHOICES  # noqa: E402
 
 INPUT_DT = 0.1
 STEP_DEG = 3.0
@@ -40,11 +42,22 @@ def format_degrees(q: np.ndarray) -> str:
 
 
 class JointKeyboardController:
-    def __init__(self, *, robot_ip: str, home_first: bool, dry_run: bool, segment_duration: float):
+    def __init__(
+        self,
+        *,
+        robot_ip: str,
+        home_first: bool,
+        dry_run: bool,
+        reference_name: str,
+        tracker_mode: str,
+        pid_kwargs: dict[str, float],
+    ):
         self.env = FrankaEnv(
             robot_ip=robot_ip,
             control_mode="joint",
-            joint_min_jerk_duration=segment_duration,
+            reference_name=reference_name,
+            tracker_mode=tracker_mode,
+            **pid_kwargs,
             print_events=False,
             use_gripper=False,
             auto_record=False,
@@ -157,14 +170,18 @@ def main() -> int:
     parser.add_argument("--ip", default="172.16.0.2")
     parser.add_argument("--home-first", action="store_true", help="Move to DEFAULT_HOME_Q before accepting keyboard input")
     parser.add_argument("--dry-run", action="store_true", help="Only print q_target; do not command the robot")
-    parser.add_argument("--segment-duration", type=float, default=0.25, help="C++ min-jerk segment duration in seconds")
+    parser.add_argument("--reference", choices=JOINT_REFERENCE_CHOICES, default="min_jerk")
+    parser.add_argument("--tracker-mode", choices=TRACKER_MODE_CHOICES, default="auto")
+    add_joint_pid_arguments(parser)
     args = parser.parse_args()
 
     controller = JointKeyboardController(
         robot_ip=args.ip,
         home_first=args.home_first,
         dry_run=args.dry_run,
-        segment_duration=args.segment_duration,
+        reference_name=args.reference,
+        tracker_mode=args.tracker_mode,
+        pid_kwargs=joint_pid_kwargs(args),
     )
     controller.run()
     return 0

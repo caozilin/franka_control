@@ -4,20 +4,11 @@ import argparse
 import pathlib
 import sys
 
-import numpy as np
-
-
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from control.cli_args import parse_joint_vector  # noqa: E402
 from control.franka_env import FrankaEnv, ROBOT_IP  # noqa: E402
-
-
-def parse_joint_vector(value: str) -> np.ndarray:
-    parts = [float(part.strip()) for part in value.split(",") if part.strip()]
-    if len(parts) != 7:
-        raise argparse.ArgumentTypeError("--nullspace-q-target must contain 7 comma-separated joint values")
-    return np.asarray(parts, dtype=np.float64)
 
 
 def main() -> int:

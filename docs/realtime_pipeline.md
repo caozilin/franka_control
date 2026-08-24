@@ -5,13 +5,13 @@ one libfranka 1 kHz callback.  They are separate code components, not separate
 threads:
 
 ```text
-10 Hz action or planner waypoint
+10 Hz action -> Planner -> typed ControlRoute
           |
           v
-CartesianReferenceGenerator / JointMinJerkReferenceGenerator
+CartesianReferenceGenerator / JointReferenceGenerator
           |  CartesianReferenceSample / JointReferenceSample
           v
-CartesianImpedanceTracker / JointImpedanceTracker
+CartesianImpedanceTracker / JointImpedanceTracker / JointPidTracker
           |  desired joint torque
           v
 TorqueRateLimiter
@@ -31,9 +31,24 @@ libfranka robot.control() at 1 kHz
 - All three components execute sequentially against the same robot state and
   `franka::Duration`; no queue or scheduler is inserted between them.
 
+The shared 10 Hz event reports `actual_plan_dxyz_m` / `actual_plan_drot_rad`
+for every planner. SQP nominal-target residuals are not printed because the
+nominal Cartesian target is enforced as a hard constraint.
+
+Every realtime route publishes the same 1 kHz trace and timing records. For
+joint-output planners, goal and reference poses are obtained from their joint
+vectors with the libfranka model before recording.
+
 Joint and Cartesian reference samples are intentionally different types.  A
 joint reference can only be paired with a joint tracker, and a Cartesian
 reference can only be paired with a Cartesian tracker.
+
+Planner, reference profile, and tracker are selected independently. The Python
+`ControlRoute` does not implement planning, interpolation, or torque control;
+it only resolves `auto` and rejects cross-space combinations before hardware is
+opened. Cartesian references support `min_jerk`, `linear`, `cubic`, and
+`motion_limited`; joint references currently support `min_jerk`, `linear`, and
+`cubic`.
 
 ## Non-realtime boundary
 
@@ -49,7 +64,7 @@ The baseline SQP path is therefore:
 Python Cartesian action -> BaselineSQPPlanner at 10 Hz
                         -> absolute q target
                         -> FrankaEnv.enqueue_joint_target()
-                        -> 1 kHz JointMinJerkReferenceGenerator + tracker
+                        -> 1 kHz JointReferenceGenerator + tracker
 ```
 
 Joint deltas and absolute SQP waypoints use distinct backend queues. This keeps
@@ -83,6 +98,6 @@ requires an available user stop.
 Experiment parameters are passed when constructing `FrankaEnv`; changing them
 does not require rebuilding the C++ extension. This includes `control_hz`,
 Cartesian and joint stiffness/damping, reference limits and convergence
-thresholds, torque-rate limits, collision thresholds, joint min-jerk duration,
+thresholds, torque-rate limits, collision thresholds,
 nullspace settings, and gripper command tolerances. C++ keeps only numerical
 constants and Franka hardware limits fixed.

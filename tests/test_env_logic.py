@@ -13,7 +13,11 @@ from analysis import analyze_trace_csv  # noqa: E402
 from recording import TraceRecorder, create_run_paths  # noqa: E402
 from utils.control import GRIPPER_WIDTH_MAX, transform_action  # noqa: E402
 from control.franka_env import FrankaEnv  # noqa: E402
-from utils.pose import matrix_to_pose_array, matrix_to_rotvec, rotvec_to_matrix  # noqa: E402
+from utils.pose import (  # noqa: E402
+    end_effector_rotation_to_backend_rotation,
+    matrix_to_pose_array,
+    rotvec_to_matrix,
+)
 
 
 def _pose_array(x: float, y: float, z: float, rx: float, ry: float, rz: float) -> np.ndarray:
@@ -37,7 +41,7 @@ def test_teleop_rotation_conversion_matches_backend_left_multiply() -> None:
     current_rotation = rotvec_to_matrix(np.array([0.2, -0.35, 0.8], dtype=np.float64))
     rotvec_ee = np.array([0.04, -0.02, 0.06], dtype=np.float64)
 
-    rotvec_base = matrix_to_rotvec(current_rotation @ rotvec_to_matrix(rotvec_ee) @ current_rotation.T)
+    rotvec_base = end_effector_rotation_to_backend_rotation(current_rotation, rotvec_ee)
 
     np.testing.assert_allclose(
         rotvec_to_matrix(rotvec_base) @ current_rotation,

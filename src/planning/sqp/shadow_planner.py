@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Hashable
+from typing import Callable, Hashable
 
 import numpy as np
 
@@ -52,6 +52,7 @@ class ShadowSQPPlanner:
         rotation_limits: np.ndarray = DEFAULT_ROTATION_LIMITS,
         active_dofs: np.ndarray | None = None,
         axis_tasks: tuple[AxisTask, ...] | None = None,
+        axis_task_factory: Callable[[np.ndarray], tuple[AxisTask, ...]] | None = None,
     ) -> ShadowSQPPlan:
         action = np.asarray(cartesian_action, dtype=np.float64)
         active = np.ones(6, dtype=bool) if active_dofs is None else np.asarray(active_dofs, dtype=bool)
@@ -60,16 +61,22 @@ class ShadowSQPPlanner:
         if self.baseline.target is None:
             self.baseline.reset(measured_q)
         assert self.baseline.target is not None
-        optimized_rotation = self.baseline.optimized_rotation
-        if optimized_rotation is None:
-            optimized_rotation = self.baseline.kinematics.evaluate(measured_q).rotation
+        if axis_tasks is not None and axis_task_factory is not None:
+            raise ValueError("axis_tasks and axis_task_factory are mutually exclusive")
+        # Match MuJoCo's sole-reference rule: shadow propagation starts from
+        # the previous cycle's already projected expectation, never raw FK.
+        previous_projected_rotation = self.baseline.target.rotation
         corrected_rotation, diagnostics = self.shadow.advance(
-            optimized_rotation,
+            previous_projected_rotation,
             action[3:6],
             tolerance_frame,
             ranged,
             semantic_key=semantic_key,
         )
+        # MuJoCo constructs live tolerance tasks only after shadow correction,
+        # so bounds, release goals and the SQP target share one exact pose.
+        if axis_task_factory is not None:
+            axis_tasks = axis_task_factory(corrected_rotation)
         if axis_tasks is None:
             generated = []
             for index in range(6):

@@ -9,11 +9,9 @@ Python 层以 10Hz 运行策略/输入更新，并通过 pybind11 扩展发送�
 必须使用 `uv` 为本项目创建专用虚拟环境。不要用系统 Python、系统 `pip`，也不要混用其他虚拟环境；编译和运行都应使用本项目的 `.venv`。
 
 ```bash
-cd /home/k324/franka_my_code/franka_control
-$HOME/.local/bin/uv venv --python 3.12
-source .venv/bin/activate
-$HOME/.local/bin/uv pip install -U pip setuptools wheel pybind11 cmake
-$HOME/.local/bin/uv pip install -e .
+cd franka_control
+uv venv --python 3.12
+uv sync --extra build --extra dev
 ```
 
 日常检查建议先确认解释器来源：
@@ -23,31 +21,45 @@ which python
 python --version
 ```
 
-期望 `python` 指向：
+期望项目解释器位于：
 
 ```bash
-/home/k324/franka_my_code/franka_control/.venv/bin/python
+.venv/bin/python
+```
+
+默认目录结构如下，`libfranka` 与本项目位于同一父目录：
+
+```text
+<workspace>/
+├── libfranka/
+└── franka_control/
 ```
 
 构建 libfranka 0.21.2 后构建 C++ 扩展：
 
 ```bash
-cd /home/k324/franka_my_code/franka_control
-source .venv/bin/activate
-cmake -S /home/k324/franka_my_code/libfranka-0.21.2 -B /home/k324/franka_my_code/libfranka-0.21.2/build-openrobots -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=OFF -DBUILD_EXAMPLES=OFF -DGENERATE_PYLIBFRANKA=OFF
-cmake --build /home/k324/franka_my_code/libfranka-0.21.2/build-openrobots -j2
-cmake -S . -B build -DPYTHON_EXECUTABLE="$PWD/.venv/bin/python"
-cmake --build build -j2
+CMEEL_PREFIX="$PWD/.venv/lib/python3.12/site-packages/cmeel.prefix"
+uv run --extra build cmake -S ../libfranka -B ../libfranka/build-openrobots \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DBUILD_TESTS=OFF \
+  -DBUILD_EXAMPLES=OFF \
+  -DGENERATE_PYLIBFRANKA=OFF \
+  -DCMAKE_PREFIX_PATH="$CMEEL_PREFIX" \
+  -Dfmt_DIR=/usr/lib/x86_64-linux-gnu/cmake/fmt \
+  -DPYTHON_EXECUTABLE="$PWD/.venv/bin/python" \
+  -DPython_EXECUTABLE="$PWD/.venv/bin/python" \
+  -DPython3_EXECUTABLE="$PWD/.venv/bin/python"
+uv run --extra build cmake --build ../libfranka/build-openrobots -j2
+uv run --extra build cmake -S . -B build -DPYTHON_EXECUTABLE="$PWD/.venv/bin/python"
+uv run --extra build cmake --build build -j2
 ```
 
 如果只想重编译当前 pybind11 扩展，也应继续使用同一个 `uv` 环境：
 
 ```bash
-cd /home/k324/franka_my_code/franka_control
-source .venv/bin/activate
-cmake -S . -B build -DPYTHON_EXECUTABLE="$PWD/.venv/bin/python"
-cmake --build build -j2
-.venv/bin/python -c "import sys; sys.path.insert(0, 'src'); from control._franka_backend import RealtimeFrankaBackend; print('import-ok')"
+uv run --extra build cmake -S . -B build -DPYTHON_EXECUTABLE="$PWD/.venv/bin/python"
+uv run --extra build cmake --build build -j2
+uv run python -c "import sys; sys.path.insert(0, 'src'); from control._franka_backend import RealtimeFrankaBackend; print('import-ok')"
 ```
 
 ## 最小机器人验证
@@ -55,29 +67,55 @@ cmake --build build -j2
 最简单的机器人验证是将末端执行器沿基坐标系 +X 方向移动 30cm。它使用 `FrankaEnv`；Python 每 0.1s 发送一个动作，C++ 以 1kHz 的频率输出笛卡尔阻抗力矩指令流。支持 C++ 参考轨迹类型包括 `min_jerk`、`linear`、`cubic` 和 `motion_limited`。
 
 ```bash
-.venv/bin/python examples/move_forward_30cm.py --ip 172.16.0.2
+uv run python examples/move_forward_30cm.py --ip 172.16.0.2
 ```
 
 使用仅连接模式验证 C++ 扩展可以连接但不启动运动：
 
 ```bash
-.venv/bin/python examples/move_forward_30cm.py --ip 172.16.0.2 --yes --connect-only
+uv run python examples/move_forward_30cm.py --ip 172.16.0.2 --yes --connect-only
 ```
 
 在运行主动运动前，请确保用户急停按钮可用。
+
+## 统一运动规划接口
+
+所有笛卡尔动作源都通过同一个 `CartesianActionPlanner` 接口，可在启动时选择
+`direct`、`baseline_sqp` 或 `shadow_sqp`。键盘、PS4 和 PICO 遥操作及数据采集统一
+使用 `scripts/teleop.py`；Policy 和固定轨迹也使用相同规划边界。
+
+```bash
+.venv/bin/python scripts/teleop.py --input-device keyboard
+.venv/bin/python scripts/teleop.py --input-device ps4 --planner-mode baseline_sqp
+.venv/bin/python scripts/teleop.py --input-device pico --with-cameras
+.venv/bin/python scripts/teleop.py --input-device ps4 --planner-mode shadow_sqp \
+  --rotation-ranged-axes false false true --rotation-limits-deg 30 30 45
+```
+
+统一入口默认 `direct + linear` 且关闭相机；只有显式传入 `--with-cameras` 才启用双相机和片段录制。详细按键见 [统一笛卡尔遥操作文档](docs/cartesian_teleop.md)。
+
+Planner、Reference 和 Torque Tracker 分别选择，再由类型化 Router 按输出空间检查兼容性。
+`direct` 输出笛卡尔目标，可配 `min_jerk`、`linear`、`cubic` 或 `motion_limited`
+笛卡尔 Reference，并使用内部的 `cartesian_impedance`。两种 SQP 输出绝对关节目标，可配
+`min_jerk`、`linear` 或 `cubic` 关节 Reference，并使用内部的 `joint_pid`。
+`joint_pid` 移植自 `franka_mujoco` 的有界泄漏 PID 关节参考外环，
+修正后的关节参考仍由关节阻抗安全转换为扭矩。关节 Reference 固定在一个 10 Hz
+控制周期内走完。CLI 只提供 `--tracker-mode {auto,pid}`；两者都按 Reference 空间
+选择内部实现：笛卡尔 Reference 保持笛卡尔并使用 `cartesian_impedance`，关节
+Reference 使用 `joint_pid`，不会把笛卡尔 Reference 转成关节 Reference。
 
 ## 6秒轨迹复现
 
 通过相同的 `FrankaEnv` 和 C++ 后端路径复现 60 拍、10Hz 的轨迹。`--scale` 用于缩放笛卡尔平移和旋转增量，然后再转换为归一化动作。
 
 ```bash
-.venv/bin/python scripts/example_trajectory_record_and_analyze.py --ip 172.16.0.2 --reference linear --scale 1.0
+uv run python scripts/example_trajectory_record_and_analyze.py --ip 172.16.0.2 --reference linear --scale 1.0
 ```
 
 不连接机器人地试运行 Python/日志路径：
 
 ```bash
-.venv/bin/python scripts/example_trajectory_record_and_analyze.py --no-robot --yes --scale 1.0 --settle 0.2
+uv run python scripts/example_trajectory_record_and_analyze.py --no-robot --yes --scale 1.0 --settle 0.2
 ```
 
 使用 `--reference min_jerk`、`--reference linear`、`--reference cubic` 或 `--reference motion_limited` 来选择 C++ 实时参考轨迹。要使 nullspace 中仅 J2 趋近于 0，请使用 `--nullspace-enabled --nullspace-q-target "nan,0,nan,nan,nan,nan,nan"`；`nan` 表示该关节没有姿态参考。
@@ -130,8 +168,8 @@ cmake --build build -j2
   - 单个 FrankaGripper
   - 100Hz 后台线程轮询 getGripperState()
   - 位置在：
-      - /home/k324/franka_my_code/franka-interface/franka-interface/include/franka-interface/run_loop.h:63
-      - /home/k324/franka_my_code/franka-interface/franka-interface/src/run_loop.cpp:333
+      - ../franka-interface/franka-interface/include/franka-interface/run_loop.h:63
+      - ../franka-interface/franka-interface/src/run_loop.cpp:333
 
   2. franka_ros2 的 franka_gripper
 
@@ -139,9 +177,9 @@ cmake --build build -j2
   - move/grasp 用 std::async(...)
   - 定时器继续 publishGripperState() 调 readOnce()
   - 位置在：
-      - /home/k324/franka_my_code/franka-interface/ros2_ws/src/franka_ros2/franka_gripper/src/gripper_action_server.cpp:141
-      - /home/k324/franka_my_code/franka-interface/ros2_ws/src/franka_ros2/franka_gripper/src/gripper_action_server.cpp:253
-      - /home/k324/franka_my_code/franka-interface/ros2_ws/src/franka_ros2/franka_gripper/include/franka_gripper/gripper_action_server.hpp:84
+      - ../franka-interface/ros2_ws/src/franka_ros2/franka_gripper/src/gripper_action_server.cpp:141
+      - ../franka-interface/ros2_ws/src/franka_ros2/franka_gripper/src/gripper_action_server.cpp:253
+      - ../franka-interface/ros2_ws/src/franka_ros2/franka_gripper/include/franka_gripper/gripper_action_server.hpp:84
 
   迁移到本项目的具体方案
   你这个项目里应该改成：

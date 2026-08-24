@@ -13,22 +13,22 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from analysis import analyze_trace_csv, write_plot_svg, write_summary_json  # noqa: E402
+from control.cli_args import parse_bool, parse_joint_vector  # noqa: E402
 from control.franka_env import FrankaEnv  # noqa: E402
+from control.pid_config import add_joint_pid_arguments, joint_pid_kwargs  # noqa: E402
+from planning import (  # noqa: E402
+    CartesianActionPlanner,
+    PLANNER_MODE_CHOICES,
+    TRACKER_MODE_CHOICES,
+    PlannerConfig,
+)
 from recording import TraceRecorder, create_run_paths  # noqa: E402
 from utils import POLICY_HZ  # noqa: E402
 
 
 
 ACTION_DIM = 7
-BLOCK_SIZE = 60
 REFERENCE_CHOICES = ("min_jerk", "linear", "cubic", "motion_limited")
-
-
-def parse_joint_vector(value: str) -> np.ndarray:
-    parts = [float(part.strip()) for part in value.split(",") if part.strip()]
-    if len(parts) != 7:
-        raise argparse.ArgumentTypeError("--nullspace-q-target must contain 7 comma-separated joint values")
-    return np.asarray(parts, dtype=np.float64)
 
 
 def timed_step(label, func):
@@ -129,21 +129,24 @@ class TimedActionBlockSource:
     def duration(self) -> float:
         return len(self._actions) / POLICY_HZ
 
-    def next_block(self) -> np.ndarray:
+    def next_action(self) -> np.ndarray:
         if self.done:
-            return np.zeros((BLOCK_SIZE, ACTION_DIM), dtype=np.float64)
-        remaining = self._actions[self._cursor : self._cursor + BLOCK_SIZE]
+            raise StopIteration
+        action = self._actions[self._cursor]
         self._cursor += 1
-        if len(remaining) < BLOCK_SIZE:
-            padding = [np.zeros(ACTION_DIM, dtype=np.float64) for _ in range(BLOCK_SIZE - len(remaining))]
-            remaining = remaining + padding
-        return np.vstack(remaining)
+        return action.copy()
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--ip", default="172.16.0.2", help="Robot IP address")
     parser.add_argument("--reference", choices=REFERENCE_CHOICES, default="min_jerk")
+    parser.add_argument("--planner-mode", choices=PLANNER_MODE_CHOICES, default="direct")
+    parser.add_argument("--tracker-mode", choices=TRACKER_MODE_CHOICES, default="auto")
+    add_joint_pid_arguments(parser)
+    parser.add_argument("--rotation-ranged-axes", type=parse_bool, nargs=3, default=(False, False, False))
+    parser.add_argument("--rotation-limits-deg", type=float, nargs=3, default=(30.0, 30.0, 45.0))
+    parser.add_argument("--tolerance-frame-rotvec", type=float, nargs=3, default=(0.0, 0.0, 0.0))
     parser.add_argument("--log-dir", type=pathlib.Path, default=ROOT / "logs" / "runs")
     parser.add_argument("--max-translation-step", type=float, default=0.1)
     parser.add_argument("--max-rotation-step", type=float, default=math.pi / 4.0)
@@ -164,7 +167,7 @@ def main() -> int:
 
     print("WARNING: This script will run a scaled 10Hz action sequence on the robot.")
     print("First 5s: mixed motion. Last 1s: zero motion. C++ may continue settling after the last action.")
-    print(f"Reference: {args.reference}, scale: {args.scale}")
+    print(f"Planner: {args.planner_mode}, reference: {args.reference}, scale: {args.scale}")
     if not args.yes:
         input("Press Enter to continue...")
 
@@ -175,12 +178,24 @@ def main() -> int:
         max_rotation_step=args.max_rotation_step,
         scale=args.scale,
     )
+    action_planner = CartesianActionPlanner(
+        PlannerConfig(
+            mode=args.planner_mode,
+            rotation_ranged_axes=tuple(args.rotation_ranged_axes),
+            rotation_limits_deg=tuple(args.rotation_limits_deg),
+            tolerance_frame_rotvec=tuple(args.tolerance_frame_rotvec),
+            shadow_stage="trajectory_replay",
+        )
+    )
     env = FrankaEnv(
         robot_ip=args.ip,
         reset_duration=args.reset_duration,
         max_translation_velocity=args.max_translation_step * POLICY_HZ,
         max_rotation_velocity=args.max_rotation_step * POLICY_HZ,
         reference_name=args.reference,
+        action_planner=action_planner,
+        tracker_mode=args.tracker_mode,
+        **joint_pid_kwargs(args),
         no_robot=args.no_robot,
         auto_record=False,
         nullspace_enabled=args.nullspace_enabled,
@@ -200,26 +215,20 @@ def main() -> int:
             if not args.yes:
                 input("Reset complete. Press Enter to start torque control...")
 
-        tick = 0
-        first_block = source.next_block()
-        env.enqueue_action_block(first_block)
-        tick += 1
-        print(f"10Hz tick {tick:03d}  (first block enqueued)")
-
         env.start_control_loop(max_duration=source.duration + float(args.settle))
         next_time = time.monotonic()
+        tick = 0
         while not source.done:
+            action = source.next_action()
+            env.enqueue_cartesian_action(action, semantic_key="trajectory_replay")
+            tick += 1
+            action_mm = action[:3] * float(args.max_translation_step) * 1000.0
+            print(f"10Hz tick {tick:03d}  dxyz_mm=[{action_mm[0]:+.1f},{action_mm[1]:+.1f},{action_mm[2]:+.1f}]  "
+                  f"drot=[{action[3]:+.3f},{action[4]:+.3f},{action[5]:+.3f}]")
             next_time += 1.0 / POLICY_HZ
             sleep_time = next_time - time.monotonic()
             if sleep_time > 0.0:
                 time.sleep(sleep_time)
-            block = source.next_block()
-            env.enqueue_action_block(block)
-            tick += 1
-            first_action = block[0]
-            action_mm = first_action[:3] * float(args.max_translation_step) * 1000.0
-            print(f"10Hz tick {tick:03d}  dxyz_mm=[{action_mm[0]:+.1f},{action_mm[1]:+.1f},{action_mm[2]:+.1f}]  "
-                  f"drot=[{first_action[3]:+.3f},{first_action[4]:+.3f},{first_action[5]:+.3f}]")
 
         print("Waiting for C++ backend to finish settling...")
         env.wait_control_loop()

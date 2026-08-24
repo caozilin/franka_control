@@ -12,14 +12,15 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from control.franka_env import FrankaEnv  # noqa: E402
+from control.cli_args import parse_bool, parse_joint_vector  # noqa: E402
+from control.pid_config import add_joint_pid_arguments, joint_pid_kwargs  # noqa: E402
+from planning import (  # noqa: E402
+    CartesianActionPlanner,
+    PLANNER_MODE_CHOICES,
+    TRACKER_MODE_CHOICES,
+    PlannerConfig,
+)
 from utils import POLICY_HZ  # noqa: E402
-
-
-def parse_joint_vector(value: str) -> np.ndarray:
-    parts = [float(part.strip()) for part in value.split(",") if part.strip()]
-    if len(parts) != 7:
-        raise argparse.ArgumentTypeError("--nullspace-q-target must contain 7 comma-separated joint values")
-    return np.asarray(parts, dtype=np.float64)
 
 
 def main() -> int:
@@ -30,6 +31,13 @@ def main() -> int:
     parser.add_argument("--settle", type=float, default=3.0)
     parser.add_argument("--yes", action="store_true")
     parser.add_argument("--connect-only", action="store_true", help="Construct FrankaEnv and exit without starting control.")
+    parser.add_argument("--planner-mode", choices=PLANNER_MODE_CHOICES, default="direct")
+    parser.add_argument("--tracker-mode", choices=TRACKER_MODE_CHOICES, default="auto")
+    parser.add_argument("--reference", choices=("min_jerk", "linear", "cubic", "motion_limited"), default="min_jerk")
+    add_joint_pid_arguments(parser)
+    parser.add_argument("--rotation-ranged-axes", type=parse_bool, nargs=3, default=(False, False, False))
+    parser.add_argument("--rotation-limits-deg", type=float, nargs=3, default=(30.0, 30.0, 45.0))
+    parser.add_argument("--tolerance-frame-rotvec", type=float, nargs=3, default=(0.0, 0.0, 0.0))
     parser.add_argument("--nullspace-enabled", action="store_true")
     parser.add_argument("--nullspace-pinv", choices=("plain", "damped"), default="plain")
     parser.add_argument("--nullspace-projector", choices=("kinematic", "dynamic"), default="kinematic")
@@ -47,9 +55,22 @@ def main() -> int:
         input("Press Enter to start...")
 
     print("[stage] constructing FrankaEnv", flush=True)
+    action_planner = CartesianActionPlanner(
+        PlannerConfig(
+            mode=args.planner_mode,
+            rotation_ranged_axes=tuple(args.rotation_ranged_axes),
+            rotation_limits_deg=tuple(args.rotation_limits_deg),
+            tolerance_frame_rotvec=tuple(args.tolerance_frame_rotvec),
+            shadow_stage="move_forward_30cm",
+        )
+    )
     env = FrankaEnv(
         robot_ip=args.ip,
         max_translation_velocity=args.step * POLICY_HZ,
+        reference_name=args.reference,
+        action_planner=action_planner,
+        tracker_mode=args.tracker_mode,
+        **joint_pid_kwargs(args),
         no_robot=False,
         nullspace_enabled=args.nullspace_enabled,
         nullspace_q_target=args.nullspace_q_target,
@@ -72,7 +93,10 @@ def main() -> int:
         print("[stage] C++ realtime control thread started", flush=True)
         next_time = time.monotonic()
         for _ in range(ticks):
-            env.enqueue_action_block(np.array([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0], dtype=np.float64))
+            env.enqueue_cartesian_action(
+                np.array([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0], dtype=np.float64),
+                semantic_key="move_forward_30cm",
+            )
             next_time += 0.1
             time.sleep(max(0.0, next_time - time.monotonic()))
         print("[stage] waiting for C++ control thread", flush=True)

@@ -3,6 +3,7 @@
 #include <pybind11/stl.h>
 
 #include <franka/control_types.h>
+#include <franka/control_tools.h>
 #include <franka/duration.h>
 #include <franka/gripper.h>
 #include <franka/gripper_state.h>
@@ -13,6 +14,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <exception>
 #include <cstring>
 #include <memory>
@@ -22,6 +24,9 @@
 #include <string>
 #include <thread>
 
+#include <pthread.h>
+#include <sched.h>
+
 #include "nullspace/nullspace_torque.hpp"
 #include "reference/cartesian_reference.hpp"
 #include "reference/joint_reference.hpp"
@@ -29,6 +34,7 @@
 #include "safety/torque_rate_limiter.hpp"
 #include "tracker/cartesian_impedance_tracker.hpp"
 #include "tracker/joint_impedance_tracker.hpp"
+#include "tracker/joint_pid_tracker.hpp"
 #include "utils/control.hpp"
 #include "utils/atomic_robot_state.hpp"
 #include "utils/joint_motion_generator.hpp"
@@ -46,10 +52,39 @@ namespace {
 static constexpr int kTraceDim = 47;
 static constexpr std::size_t kActionQueueCapacity = 4096;
 static constexpr int kDefaultTraceSeconds = 180;  // 1kHz × 180s
+static constexpr uint64_t kJointPoseTraceDecimation = 10;  // Pose diagnostics at 100 Hz; torque remains 1 kHz.
 static constexpr std::array<double, 7> kJointLowerLimits{
     {-2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973}};
 static constexpr std::array<double, 7> kJointUpperLimits{
     {2.8973, 1.7628, 2.8973, -0.0698, 2.8973, 3.7525, 2.8973}};
+
+void setCurrentThreadToNormalPriority() {
+  sched_param parameters{};
+  const int result = pthread_setschedparam(pthread_self(), SCHED_OTHER, &parameters);
+  if (result != 0) {
+    throw std::runtime_error(
+        std::string("failed to restore caller thread to SCHED_OTHER: ") + std::strerror(result));
+  }
+}
+
+void setCurrentThreadToRealtimePriority() {
+  std::string error;
+  if (!franka::setCurrentThreadToHighestSchedulerPriority(&error)) {
+    throw std::runtime_error(error);
+  }
+}
+
+class ScopedRealtimePriority {
+ public:
+  ScopedRealtimePriority() { setCurrentThreadToRealtimePriority(); }
+  ~ScopedRealtimePriority() {
+    sched_param parameters{};
+    pthread_setschedparam(pthread_self(), SCHED_OTHER, &parameters);
+  }
+
+  ScopedRealtimePriority(const ScopedRealtimePriority&) = delete;
+  ScopedRealtimePriority& operator=(const ScopedRealtimePriority&) = delete;
+};
 
 struct alignas(64) TraceFrame {
   double time;
@@ -159,10 +194,11 @@ std::array<double, N> fixedArrayFromHandle(py::handle value, const char* name) {
 }
 
 struct BackendConfig {
+  std::string tracker_mode;
   double policy_period_s;
-  double joint_min_jerk_duration_s;
   std::array<double, 7> joint_stiffness;
   std::array<double, 7> joint_damping;
+  JointPidSettings joint_pid;
   double reference_position_epsilon;
   double reference_linear_velocity_epsilon;
   double reference_rotation_epsilon;
@@ -176,10 +212,20 @@ struct BackendConfig {
 
 BackendConfig backendConfigFromDict(const py::dict& config) {
   return {
+      config["tracker_mode"].cast<std::string>(),
       config["policy_period_s"].cast<double>(),
-      config["joint_min_jerk_duration_s"].cast<double>(),
       fixedArrayFromHandle<7>(config["joint_stiffness"], "joint_stiffness"),
       fixedArrayFromHandle<7>(config["joint_damping"], "joint_damping"),
+      JointPidSettings{
+          config["pid_proportional_gain"].cast<double>(),
+          config["pid_integral_gain_s"].cast<double>(),
+          config["pid_velocity_gain_s"].cast<double>(),
+          config["pid_maximum_correction_rad"].cast<double>(),
+          config["pid_integration_error_limit_rad"].cast<double>(),
+          config["pid_integral_time_constant_s"].cast<double>(),
+          config["pid_stationary_integral_time_constant_s"].cast<double>(),
+          config["pid_stationary_velocity_threshold_rad_s"].cast<double>(),
+      },
       config["reference_position_epsilon"].cast<double>(),
       config["reference_linear_velocity_epsilon"].cast<double>(),
       config["reference_rotation_epsilon"].cast<double>(),
@@ -244,6 +290,19 @@ class RealtimeFrankaBackend {
         config_(backendConfigFromDict(backend_config)),
         trace_ring_(static_cast<size_t>(trace_capacity_sec > 0.0 ? trace_capacity_sec * 1000.0 : 1000)),
         timing_ring_(static_cast<size_t>(trace_capacity_sec > 0.0 ? trace_capacity_sec * 1000.0 : 1000)) {
+    // libfranka raises the thread constructing Robot to the highest SCHED_FIFO
+    // priority. This constructor runs on Python's caller thread, so restore it
+    // before Python creates input, planner, camera, and logging threads. Only
+    // the dedicated 1 kHz thread below is allowed to run at realtime priority.
+    setCurrentThreadToNormalPriority();
+    const bool valid_cartesian_tracker =
+        control_mode_ == "cartesian" && config_.tracker_mode == "cartesian_impedance";
+    const bool valid_joint_tracker =
+        control_mode_ == "joint" &&
+        (config_.tracker_mode == "joint_impedance" || config_.tracker_mode == "joint_pid");
+    if (!valid_cartesian_tracker && !valid_joint_tracker) {
+      throw std::invalid_argument("tracker_mode is incompatible with the selected control mode");
+    }
     robot_.setCollisionBehavior(config_.collision_lower_torque,
                                 config_.collision_upper_torque,
                                 config_.collision_lower_force,
@@ -295,6 +354,8 @@ class RealtimeFrankaBackend {
     running_.store(true);
     control_thread_ = std::thread([this, max_duration]() {
       try {
+        pthread_setname_np(pthread_self(), "franka_ctrl_rt");
+        setCurrentThreadToRealtimePriority();
         runControlLoop(max_duration);
       } catch (const std::exception& exc) {
         std::lock_guard<std::mutex> lock(error_mutex_);
@@ -307,13 +368,18 @@ class RealtimeFrankaBackend {
     });
   }
 
-  void joinControlThread(bool may_release_gil) {
+  void joinControlThreadWithoutGil() {
+    std::lock_guard<std::mutex> lock(control_thread_join_mutex_);
     if (!control_thread_.joinable()) return;
+    control_thread_.join();
+  }
+
+  void joinControlThread(bool may_release_gil) {
     if (may_release_gil && PyGILState_Check()) {
       py::gil_scoped_release release;
-      control_thread_.join();
+      joinControlThreadWithoutGil();
     } else {
-      control_thread_.join();
+      joinControlThreadWithoutGil();
     }
   }
 
@@ -322,8 +388,10 @@ class RealtimeFrankaBackend {
     throwIfError();
   }
 
+  void request_stop() noexcept { stop_requested_.store(true); }
+
   void stop() {
-    stop_requested_.store(true);
+    request_stop();
     joinControlThread(true);
     try {
       robot_.stop();
@@ -422,6 +490,12 @@ class RealtimeFrankaBackend {
 
   void reset(double speed_factor, double reset_duration) {
     if (running_.load()) throw std::runtime_error("cannot reset while control thread is running");
+    // A previous control exception leaves the robot in reflex/idle state.  Clear
+    // that state before asking libfranka to start the homing motion.  Calling
+    // automaticErrorRecovery when no recoverable error is active is a no-op on
+    // the robot controller.
+    robot_.automaticErrorRecovery();
+    ScopedRealtimePriority realtime_scope;
     if (reset_duration > 0.0) {
       DurationJointMotionGenerator motion_generator(reset_duration, home_q_);
       robot_.control(motion_generator);
@@ -485,23 +559,42 @@ class RealtimeFrankaBackend {
     return found;
   }
 
-  void runJointMinJerkImpedanceLoop(double max_duration, double segment_duration) {
+  void runJointTrackerLoop(double max_duration) {
     auto model = robot_.loadModel();
     const franka::RobotState initial_state = robot_.readOnce();
-    JointMinJerkReferenceGenerator reference(
-        segment_duration, vector7FromArray(kJointLowerLimits), vector7FromArray(kJointUpperLimits));
+    JointReferenceGenerator reference(
+        reference_generator_, config_.policy_period_s,
+        vector7FromArray(kJointLowerLimits), vector7FromArray(kJointUpperLimits));
     reference.reset(vector7FromArray(initial_state.q));
     JointImpedanceTracker tracker(
         vector7FromArray(config_.joint_stiffness), vector7FromArray(config_.joint_damping));
+    JointPidTracker pid_tracker(
+        vector7FromArray(kJointLowerLimits), vector7FromArray(kJointUpperLimits),
+        vector7FromArray(config_.joint_stiffness), vector7FromArray(config_.joint_damping),
+        config_.joint_pid);
+    const bool use_pid = config_.tracker_mode == "joint_pid";
     TorqueRateLimiter safety(max_torque_rate_);
     double elapsed = 0.0;
     double next_policy_time = 0.0;
+    Clock::time_point previous_callback_start{};
+    TraceFrame cached_pose_frame{};
+    uint64_t trace_frame_index = 0;
 
     robot_.control([&](const franka::RobotState& state, franka::Duration step) -> franka::Torques {
+      TimingFrame timing{};
+      const auto loop_start = Clock::now();
+      if (previous_callback_start.time_since_epoch().count() != 0) {
+        timing.fields[kCallbackPeriod] =
+            std::chrono::duration<double>(loop_start - previous_callback_start).count();
+      }
+      previous_callback_start = loop_start;
       const double dt = std::max(step.toSec(), 0.001);
       elapsed += dt;
+      timing.elapsed = elapsed;
+      timing.robot_dt = dt;
       updateLatestRobotState(state);
 
+      auto start = Clock::now();
       while (elapsed + 1e-12 >= next_policy_time) {
         std::array<double, 7> target{};
         if (popLatestJointTarget(target)) {
@@ -511,14 +604,86 @@ class RealtimeFrankaBackend {
         }
         next_policy_time += config_.policy_period_s;
       }
+      timing.fields[kPolicyTotal] += secondsSince(start);
 
+      start = Clock::now();
       const JointReferenceSample reference_sample = reference.sample(elapsed);
+      timing.fields[kControllerReference] += secondsSince(start);
+
+      start = Clock::now();
       const Vector7d q = vector7FromArray(state.q);
       const Vector7d dq = vector7FromArray(state.dq);
+      const Pose actual_pose = poseFromArray(state.O_T_EE);
+      timing.fields[kControllerVelocityMath] += secondsSince(start);
+
+      start = Clock::now();
       const Vector7d coriolis = vector7FromArray(model.coriolis(state));
-      const Vector7d tau_desired = tracker.compute(q, dq, coriolis, reference_sample);
-      const Vector7d tau_limited = safety.apply(tau_desired, state.tau_J_d, dt);
+      timing.fields[kControllerModelCoriolis] += secondsSince(start);
+
+      start = Clock::now();
+      const Vector7d tau_desired = use_pid
+                                       ? pid_tracker.compute(q, dq, coriolis, reference_sample, dt)
+                                       : tracker.compute(q, dq, coriolis, reference_sample);
+      timing.fields[kControllerWrenchTorque] += secondsSince(start);
+
+      start = Clock::now();
+      const Vector7d tau_limited = safety.apply(tau_desired, state.tau_J_d);
+      timing.fields[kControllerTorqueLimit] += secondsSince(start);
+
+      start = Clock::now();
       franka::Torques command(arrayFromVector7(tau_limited));
+      timing.fields[kTorquesBuild] += secondsSince(start);
+
+      // Joint FK and rotation diagnostics are not part of control. Refresh
+      // them at 100 Hz while retaining exact 1 kHz torque samples.
+      {
+        start = Clock::now();
+        TraceFrame frame = cached_pose_frame;
+        if (trace_frame_index % kJointPoseTraceDecimation == 0) {
+          auto pose_for_q = [&](const Vector7d& joint_positions) {
+            return poseFromArray(model.pose(
+                franka::Frame::kEndEffector, arrayFromVector7(joint_positions),
+                state.F_T_EE, state.EE_T_K));
+          };
+          auto fill_xyz_rotvec = [](double* dst_xyz, double* dst_rotvec,
+                                     const Pose& pose, Eigen::Vector3d& prev) {
+            dst_xyz[0] = pose(0, 3);
+            dst_xyz[1] = pose(1, 3);
+            dst_xyz[2] = pose(2, 3);
+            const Eigen::Vector3d rv =
+                matrixToRotvecContinuous(pose.block<3, 3>(0, 0), prev);
+            dst_rotvec[0] = rv.x();
+            dst_rotvec[1] = rv.y();
+            dst_rotvec[2] = rv.z();
+            prev = rv;
+          };
+
+          const Pose goal_pose = pose_for_q(reference.target());
+          const Pose reference_pose = pose_for_q(reference_sample.q);
+          fill_xyz_rotvec(frame.goal_xyz, frame.goal_rotvec, goal_pose, prev_goal_rotvec_);
+          fill_xyz_rotvec(frame.ref_xyz, frame.ref_rotvec, reference_pose, prev_ref_rotvec_);
+          fill_xyz_rotvec(frame.actual_xyz, frame.actual_rotvec, actual_pose, prev_actual_rotvec_);
+          cached_pose_frame = frame;
+        }
+        frame.time = elapsed;
+        for (Eigen::Index i = 0; i < 7; ++i) {
+          frame.tau_cmd[i] = tau_limited[i];
+          frame.tau_desired[i] = tau_desired[i];
+          frame.tau_j_d[i] = state.tau_J_d[static_cast<size_t>(i)];
+          frame.tau_j[i] = state.tau_J[static_cast<size_t>(i)];
+        }
+        trace_ring_.write(frame);
+        ++trace_frame_index;
+        timing.fields[kTraceBuildWrite] += secondsSince(start);
+      }
+
+      timing.fields[kControllerStep] =
+          timing.fields[kControllerReference] + timing.fields[kControllerModelCoriolis] +
+          timing.fields[kControllerVelocityMath] + timing.fields[kControllerWrenchTorque] +
+          timing.fields[kControllerTorqueLimit] + timing.fields[kTorquesBuild];
+      timing.fields[kLoopTotal] = secondsSince(loop_start);
+      timing_ring_.write(timing);
+
       if (stop_requested_.load() || (max_duration > 0.0 && elapsed >= max_duration)) {
         return franka::MotionFinished(command);
       }
@@ -528,7 +693,7 @@ class RealtimeFrankaBackend {
 
   void runControlLoop(double max_duration) {
     if (control_mode_ == "joint") {
-      runJointMinJerkImpedanceLoop(max_duration, config_.joint_min_jerk_duration_s);
+      runJointTrackerLoop(max_duration);
       return;
     }
 
@@ -546,10 +711,16 @@ class RealtimeFrankaBackend {
     TorqueRateLimiter safety(max_torque_rate_);
     double elapsed = 0.0;
     double next_policy_time = 0.0;
+    Clock::time_point previous_callback_start{};
 
     robot_.control([&](const franka::RobotState& state, franka::Duration step) -> franka::Torques {
       TimingFrame timing{};
       const auto loop_start = Clock::now();
+      if (previous_callback_start.time_since_epoch().count() != 0) {
+        timing.fields[kCallbackPeriod] =
+            std::chrono::duration<double>(loop_start - previous_callback_start).count();
+      }
+      previous_callback_start = loop_start;
       const double dt = std::max(step.toSec(), 0.001);
       elapsed += dt;
       timing.elapsed = elapsed;
@@ -602,7 +773,7 @@ class RealtimeFrankaBackend {
           tracker_timing.wrench_torque + tracker_timing.nullspace_torque;
 
       start = Clock::now();
-      const Vector7d tau_limited = safety.apply(tracking.desired_torque, state.tau_J_d, dt);
+      const Vector7d tau_limited = safety.apply(tracking.desired_torque, state.tau_J_d);
       timing.fields[kControllerTorqueLimit] += secondsSince(start);
 
       start = Clock::now();
@@ -636,7 +807,7 @@ class RealtimeFrankaBackend {
           frame.tau_j[i] = state.tau_J[static_cast<size_t>(i)];
         }
         trace_ring_.write(frame);
-        timing.fields[kRawTraceWrite] += secondsSince(start);
+        timing.fields[kTraceBuildWrite] += secondsSince(start);
       }
 
       timing.fields[kControllerStep] =
@@ -673,6 +844,7 @@ class RealtimeFrankaBackend {
   SpscActionQueue<8, kActionQueueCapacity> action_queue_;
   SpscActionQueue<7, kActionQueueCapacity> joint_target_queue_;
   std::thread control_thread_;
+  std::mutex control_thread_join_mutex_;
   std::atomic<bool> running_{false};
   std::atomic<bool> stop_requested_{false};
   mutable std::mutex error_mutex_;
@@ -803,6 +975,7 @@ PYBIND11_MODULE(_franka_backend, m) {
       .def("get_joint_positions", &RealtimeFrankaBackend::get_joint_positions)
       .def("start_control_loop", &RealtimeFrankaBackend::start_control_loop, py::arg("max_duration") = -1.0)
       .def("wait", &RealtimeFrankaBackend::wait)
+      .def("request_stop", &RealtimeFrankaBackend::request_stop)
       .def("stop", &RealtimeFrankaBackend::stop)
       .def("is_running", &RealtimeFrankaBackend::is_running)
       .def("set_reference", &RealtimeFrankaBackend::set_reference)

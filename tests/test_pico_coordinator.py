@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pathlib
+import math
 import socket
 import sys
 import time
@@ -12,13 +13,21 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "src"))
 
 from devices.pico import PicoControllerState, PicoPacket  # noqa: E402
-from scripts.coordinator import Args, Coordinator  # noqa: E402
+from scripts.coordinator import Args, Coordinator, _rotation_action_ee_to_base  # noqa: E402
 
 
-def _controller(position: tuple[float, float, float], grip: float = 1.0) -> PicoControllerState:
+def _controller(
+    position: tuple[float, float, float],
+    grip: float = 1.0,
+    orientation_xyzw: np.ndarray | None = None,
+) -> PicoControllerState:
     return PicoControllerState(
         position=np.asarray(position, dtype=np.float64),
-        orientation_xyzw=np.array([0.0, 0.0, 0.0, 1.0]),
+        orientation_xyzw=(
+            np.array([0.0, 0.0, 0.0, 1.0])
+            if orientation_xyzw is None
+            else np.asarray(orientation_xyzw, dtype=np.float64)
+        ),
         grip=grip,
         trigger=0.0,
         thumbstick=np.zeros(2),
@@ -28,11 +37,14 @@ def _controller(position: tuple[float, float, float], grip: float = 1.0) -> Pico
     )
 
 
-def _send(sender: socket.socket, port: int, sequence: int, left_x: float) -> None:
+def _send(sender: socket.socket, port: int, sequence: int, left_tilt: float) -> None:
+    left_orientation = np.array(
+        [0.0, math.sin(-left_tilt / 2.0), 0.0, math.cos(-left_tilt / 2.0)]
+    )
     packet = PicoPacket(
         sequence,
         time.time(),
-        _controller((left_x, 0.0, 0.0)),
+        _controller((0.0, 0.0, 0.0), orientation_xyzw=left_orientation),
         _controller((0.0, 0.0, 0.0)),
         session_id="coordinator-test",
     )
@@ -75,14 +87,32 @@ def test_pico_source_runs_without_policy_server_or_robot() -> None:
         assert coordinator._latest_pico is not None
         assert coordinator._latest_pico["reanchored"] is True
 
-        _send(sender, coordinator._pico_receiver.port, 2, 0.04)
+        _send(sender, coordinator._pico_receiver.port, 2, 0.2)
         _wait_for_sequence(coordinator, 2)
         coordinator._run_action_step({})
 
         assert coordinator._latest_pico is not None
         assert coordinator._latest_pico["motion_enabled"] is True
-        expected_x = min(0.02, coordinator._env.max_translation_step)
-        np.testing.assert_allclose(coordinator._latest_action_transformed[:3], [expected_x, 0.0, 0.0])
+        deadzone = math.radians(10.0)
+        full_scale = math.radians(25.0)
+        expected_step = coordinator._env.max_translation_step * (
+            (0.2 - deadzone) / (full_scale - deadzone)
+        )
+        np.testing.assert_allclose(
+            coordinator._latest_action_transformed[:3],
+            [0.0, expected_step, 0.0],
+        )
     finally:
         sender.close()
         coordinator.close()
+
+
+def test_end_effector_rotation_increment_is_converted_to_base() -> None:
+    action = np.array([0.0, 0.0, 0.0, 0.1, 0.0, 0.0, -1.0])
+    robot_state = np.array([0.0, 0.0, 0.0, 0.0, 0.0, math.pi / 2.0])
+
+    converted = _rotation_action_ee_to_base(action, robot_state)
+
+    np.testing.assert_allclose(converted[:3], 0.0)
+    np.testing.assert_allclose(converted[3:6], [0.0, 0.1, 0.0], atol=1e-12)
+    assert converted[6] == -1.0

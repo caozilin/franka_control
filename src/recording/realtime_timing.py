@@ -7,10 +7,17 @@ from pathlib import Path
 import numpy as np
 
 
-PARENT_TIMING_FIELDS = {"loop_total", "policy_total", "controller_step", "controller_reference"}
+PARENT_TIMING_FIELDS = {
+    "loop_total",
+    "callback_period",
+    "policy_total",
+    "controller_step",
+    "controller_reference",
+}
 
 TIMING_FIELDS = (
     "loop_total",
+    "callback_period",
     "read_once",
     "policy_total",
     "action_get",
@@ -29,7 +36,7 @@ TIMING_FIELDS = (
     "controller_pose_error",
     "controller_wrench_torque",
     "controller_torque_limit",
-    "raw_trace_write",
+    "trace_build_write",
     "trace_callback",
     "torques_build",
     "write_once",

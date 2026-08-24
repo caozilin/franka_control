@@ -8,8 +8,9 @@
 
 namespace franka_control::cpp {
 
-inline constexpr std::array<const char*, 23> kTimingFieldNames{
+inline constexpr std::array<const char*, 24> kTimingFieldNames{
     "loop_total",
+    "callback_period",
     "read_once",
     "policy_total",
     "action_get",
@@ -28,7 +29,7 @@ inline constexpr std::array<const char*, 23> kTimingFieldNames{
     "controller_pose_error",
     "controller_wrench_torque",
     "controller_torque_limit",
-    "raw_trace_write",
+    "trace_build_write",
     "trace_callback",
     "torques_build",
     "write_once",
@@ -36,6 +37,7 @@ inline constexpr std::array<const char*, 23> kTimingFieldNames{
 
 enum TimingField : int {
   kLoopTotal = 0,
+  kCallbackPeriod,
   kReadOnce,
   kPolicyTotal,
   kActionGet,
@@ -54,7 +56,7 @@ enum TimingField : int {
   kControllerPoseError,
   kControllerWrenchTorque,
   kControllerTorqueLimit,
-  kRawTraceWrite,
+  kTraceBuildWrite,
   kTraceCallback,
   kTorquesBuild,
   kWriteOnce,

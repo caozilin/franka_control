@@ -5,12 +5,16 @@ import pathlib
 import sys
 
 import numpy as np
+import pytest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from planning import (  # noqa: E402
     BaselineSQPPlanner,
+    AxisTask,
+    TaskKind,
+    TargetPose,
     ShadowOrientationReference,
     ShadowSQPPlanner,
     SQPSettings,
@@ -18,6 +22,8 @@ from planning import (  # noqa: E402
 )
 from control.franka_env import DEFAULT_HOME_Q  # noqa: E402
 from utils.pose import matrix_to_rotvec, rotvec_to_matrix  # noqa: E402
+from planning.sqp import SQPPlan  # noqa: E402
+from planning.sqp.solver import ConstraintValues, SQPSolverResult  # noqa: E402
 
 
 def _bias_coordinates(rotation: np.ndarray, shadow: np.ndarray, frame: np.ndarray) -> np.ndarray:
@@ -108,3 +114,66 @@ def test_shadow_planner_uses_the_same_baseline_sqp() -> None:
     assert planner.baseline is baseline
     assert plan.baseline.solver.feasible, plan.baseline.solver.status
     assert plan.shadow.anchor_reset
+
+
+def test_shadow_uses_projected_reference_then_builds_tasks_from_corrected_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline = BaselineSQPPlanner()
+    baseline.reset(DEFAULT_HOME_Q)
+    assert baseline.target is not None
+    projected = rotvec_to_matrix(np.array([0.22, -0.08, 0.13]))
+    corrected = rotvec_to_matrix(np.array([-0.11, 0.19, 0.07]))
+    baseline._target = TargetPose(baseline.target.position.copy(), projected)
+    planner = ShadowSQPPlanner(baseline)
+    seen: dict[str, np.ndarray | tuple[AxisTask, ...]] = {}
+
+    def fake_advance(
+        previous: np.ndarray,
+        action: np.ndarray,
+        frame: np.ndarray,
+        mask: np.ndarray,
+        *,
+        semantic_key: object,
+    ):
+        del action, frame, mask, semantic_key
+        seen["previous"] = previous.copy()
+        from planning import ShadowOrientationDiagnostics
+
+        zeros = np.zeros(3)
+        return corrected.copy(), ShadowOrientationDiagnostics(
+            zeros, zeros, zeros, 0.0, False,
+        )
+
+    def task_factory(rotation: np.ndarray) -> tuple[AxisTask, ...]:
+        seen["task_rotation"] = rotation.copy()
+        return tuple(AxisTask(TaskKind.SPECIFIC) for _ in range(6))
+
+    def fake_solve_target(
+        measured_q: np.ndarray,
+        target: TargetPose,
+        **kwargs: object,
+    ) -> SQPPlan:
+        seen["solve_rotation"] = target.rotation.copy()
+        seen["tasks"] = kwargs["axis_tasks"]  # type: ignore[assignment]
+        constraints = ConstraintValues(np.zeros(6), np.empty(0), 0.0, 0.0, 0.0)
+        result = SQPSolverResult(
+            measured_q.copy(), 0.0, 0, 0, 0.0, 0.0, True, True,
+            "converged", constraints, {},
+        )
+        return SQPPlan(measured_q.copy(), target, target, result)
+
+    monkeypatch.setattr(planner.shadow, "advance", fake_advance)
+    monkeypatch.setattr(baseline, "solve_target", fake_solve_target)
+    planner.step(
+        DEFAULT_HOME_Q,
+        np.zeros(6),
+        tolerance_frame=np.eye(3),
+        ranged_axes=np.array([True, False, False]),
+        semantic_key=("task", "pregrasp"),
+        axis_task_factory=task_factory,
+    )
+
+    np.testing.assert_allclose(seen["previous"], projected)
+    np.testing.assert_allclose(seen["task_rotation"], corrected)
+    np.testing.assert_allclose(seen["solve_rotation"], corrected)

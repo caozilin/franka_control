@@ -28,6 +28,39 @@ def test_panda_analytic_jacobian_matches_finite_difference() -> None:
     np.testing.assert_allclose(state.jacobian, numeric, atol=5e-7)
 
 
+def test_accelerated_panda_kinematics_matches_python_fallback() -> None:
+    accelerated = PandaKinematics()
+    fallback = PandaKinematics(use_accelerated=False)
+    assert accelerated.backend_name == "pinocchio"
+    rng = np.random.default_rng(7)
+    for _ in range(20):
+        q = np.clip(
+            DEFAULT_HOME_Q + rng.normal(0.0, 0.12, size=7),
+            accelerated.joint_lower + 0.05,
+            accelerated.joint_upper - 0.05,
+        )
+        expected = fallback.evaluate(q)
+        actual = accelerated.evaluate(q)
+        np.testing.assert_allclose(actual.position, expected.position, atol=1e-12)
+        np.testing.assert_allclose(actual.rotation, expected.rotation, atol=1e-12)
+        np.testing.assert_allclose(actual.jacobian, expected.jacobian, atol=1e-12)
+        np.testing.assert_allclose(actual.manipulability, expected.manipulability, atol=1e-12)
+        np.testing.assert_allclose(actual.link_points, expected.link_points, atol=1e-12)
+
+
+def test_panda_kinematics_can_skip_expensive_optional_fields() -> None:
+    state = PandaKinematics().evaluate(
+        DEFAULT_HOME_Q,
+        include_manipulability=False,
+        include_link_points=False,
+    )
+    assert state.manipulability is None
+    assert state.link_points is None
+    assert state.position.shape == (3,)
+    assert state.rotation.shape == (3, 3)
+    assert state.jacobian.shape == (6, 7)
+
+
 def test_baseline_sqp_reaches_small_hard_pose_target() -> None:
     planner = BaselineSQPPlanner(
         solver_settings=SQPSettings(max_iterations=30, max_time_s=2.0),

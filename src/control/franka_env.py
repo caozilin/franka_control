@@ -10,6 +10,13 @@ import numpy as np
 
 from client import image_tools
 from devices import AsyncGripperDriver
+from planning.action_planner import CartesianActionPlanner, PlannedRobotCommand
+from planning.control_route import (
+    JOINT_REFERENCE_CHOICES,
+    ROUTE_TRACKER_MODE_CHOICES,
+    TRACKER_MODE_CHOICES,
+    ControlRoute,
+)
 from utils.control import ActionConfig, GRIPPER_WIDTH_MAX, POLICY_HZ, transform_action
 from utils.pose import matrix_to_rotvec, matrix_to_rotvec_continuous, rotvec_to_matrix
 
@@ -37,6 +44,14 @@ DEFAULT_MOTION_LIMITED_ACCELERATION_SCALE = 5.0
 DEFAULT_MAX_TORQUE_RATE = 1000.0
 DEFAULT_JOINT_STIFFNESS = np.array([80.0, 80.0, 80.0, 60.0, 25.0, 15.0, 10.0], dtype=np.float64)
 DEFAULT_JOINT_DAMPING = 2.0 * np.sqrt(DEFAULT_JOINT_STIFFNESS)
+DEFAULT_PID_PROPORTIONAL_GAIN = 0.18
+DEFAULT_PID_INTEGRAL_GAIN_S = 0.30
+DEFAULT_PID_VELOCITY_GAIN_S = 0.04
+DEFAULT_PID_MAXIMUM_CORRECTION_RAD = math.radians(3.0)
+DEFAULT_PID_INTEGRATION_ERROR_LIMIT_RAD = math.radians(4.0)
+DEFAULT_PID_INTEGRAL_TIME_CONSTANT_S = 1.0
+DEFAULT_PID_STATIONARY_INTEGRAL_TIME_CONSTANT_S = 0.25
+DEFAULT_PID_STATIONARY_VELOCITY_THRESHOLD_RAD_S = 0.02
 DEFAULT_REFERENCE_POSITION_EPSILON = 0.0005
 DEFAULT_REFERENCE_LINEAR_VELOCITY_EPSILON = 0.001
 DEFAULT_REFERENCE_ROTATION_EPSILON = 0.001
@@ -51,7 +66,7 @@ DEFAULT_HOME_Q = np.array(
 DEFAULT_STIFFNESS = np.diag([600.0, 600.0, 600.0, 25.0, 25.0, 25.0]).astype(np.float64)
 DEFAULT_DAMPING = np.diag([2.0 * math.sqrt(DEFAULT_STIFFNESS[i, i]) for i in range(6)]).astype(np.float64)
 GRIPPER_SPEED = 0.08
-GRIPPER_FORCE = 60.0
+GRIPPER_FORCE = 30.0
 GRIPPER_CONNECT_TIMEOUT = 8.0
 GRIPPER_STATE_POLL_PERIOD = 1.0 / POLICY_HZ
 GRIPPER_WIDTH_TOLERANCE = 0.003
@@ -432,9 +447,18 @@ class FrankaEnv:
         damping: np.ndarray | None = None,
         reference_name: str = "min_jerk",
         control_mode: str = "cartesian",
-        joint_min_jerk_duration: float = 0.25,
+        action_planner: CartesianActionPlanner | None = None,
+        tracker_mode: str = "auto",
         joint_stiffness: np.ndarray | None = None,
         joint_damping: np.ndarray | None = None,
+        pid_proportional_gain: float = DEFAULT_PID_PROPORTIONAL_GAIN,
+        pid_integral_gain_s: float = DEFAULT_PID_INTEGRAL_GAIN_S,
+        pid_velocity_gain_s: float = DEFAULT_PID_VELOCITY_GAIN_S,
+        pid_maximum_correction_rad: float = DEFAULT_PID_MAXIMUM_CORRECTION_RAD,
+        pid_integration_error_limit_rad: float = DEFAULT_PID_INTEGRATION_ERROR_LIMIT_RAD,
+        pid_integral_time_constant_s: float = DEFAULT_PID_INTEGRAL_TIME_CONSTANT_S,
+        pid_stationary_integral_time_constant_s: float = DEFAULT_PID_STATIONARY_INTEGRAL_TIME_CONSTANT_S,
+        pid_stationary_velocity_threshold_rad_s: float = DEFAULT_PID_STATIONARY_VELOCITY_THRESHOLD_RAD_S,
         reference_position_epsilon: float = DEFAULT_REFERENCE_POSITION_EPSILON,
         reference_linear_velocity_epsilon: float = DEFAULT_REFERENCE_LINEAR_VELOCITY_EPSILON,
         reference_rotation_epsilon: float = DEFAULT_REFERENCE_ROTATION_EPSILON,
@@ -504,17 +528,74 @@ class FrankaEnv:
         self.max_rotation_step = self.max_rotation_velocity / self.control_hz
         self.reset_duration = float(reset_duration)
         self.reset_speed_factor = float(reset_speed_factor)
-        self.reference_name = _validate_reference_name(reference_name)
+        reference_name = _validate_reference_name(reference_name)
+        self.action_planner = action_planner
+        if self.action_planner is not None:
+            self.control_route = ControlRoute(self.action_planner, reference_name, tracker_mode)
+            control_mode = self.control_route.control_mode
+        elif control_mode == "cartesian":
+            self.action_planner = CartesianActionPlanner()
+            self.control_route = ControlRoute(self.action_planner, reference_name, tracker_mode)
+            control_mode = self.control_route.control_mode
+        else:
+            tracker_mode = str(tracker_mode).lower().strip()
+            if tracker_mode not in ROUTE_TRACKER_MODE_CHOICES:
+                raise ValueError(
+                    f"tracker_mode must be one of {ROUTE_TRACKER_MODE_CHOICES}; got {tracker_mode!r}"
+                )
+            if tracker_mode not in {"auto", "pid", "joint_impedance", "joint_pid"}:
+                raise ValueError(
+                    "raw joint control requires tracker_mode='auto', 'pid', "
+                    "'joint_impedance', or 'joint_pid'"
+                )
+            if reference_name not in JOINT_REFERENCE_CHOICES:
+                raise ValueError(
+                    f"joint reference must be one of {JOINT_REFERENCE_CHOICES}; got {reference_name!r}"
+                )
+            self.control_route = None
         self.control_mode = _validate_control_mode(control_mode)
-        self.joint_min_jerk_duration = float(joint_min_jerk_duration)
-        if self.joint_min_jerk_duration <= 0.0:
-            raise ValueError("joint_min_jerk_duration must be positive")
+        self.tracker_mode = (
+            self.control_route.tracker_mode
+            if self.control_route is not None
+            else ("joint_pid" if tracker_mode in TRACKER_MODE_CHOICES else tracker_mode)
+        )
+        self.reference_name = reference_name
+        self.latest_planner_telemetry: dict[str, object] | None = None
         self.joint_stiffness = np.asarray(
             DEFAULT_JOINT_STIFFNESS if joint_stiffness is None else joint_stiffness, dtype=np.float64
         )
         self.joint_damping = np.asarray(
             DEFAULT_JOINT_DAMPING if joint_damping is None else joint_damping, dtype=np.float64
         )
+        self.pid_proportional_gain = float(pid_proportional_gain)
+        self.pid_integral_gain_s = float(pid_integral_gain_s)
+        self.pid_velocity_gain_s = float(pid_velocity_gain_s)
+        self.pid_maximum_correction_rad = float(pid_maximum_correction_rad)
+        self.pid_integration_error_limit_rad = float(pid_integration_error_limit_rad)
+        self.pid_integral_time_constant_s = float(pid_integral_time_constant_s)
+        self.pid_stationary_integral_time_constant_s = float(pid_stationary_integral_time_constant_s)
+        self.pid_stationary_velocity_threshold_rad_s = float(pid_stationary_velocity_threshold_rad_s)
+        pid_values = np.asarray(
+            [
+                self.pid_proportional_gain,
+                self.pid_integral_gain_s,
+                self.pid_velocity_gain_s,
+                self.pid_maximum_correction_rad,
+                self.pid_integration_error_limit_rad,
+                self.pid_integral_time_constant_s,
+                self.pid_stationary_integral_time_constant_s,
+                self.pid_stationary_velocity_threshold_rad_s,
+            ],
+            dtype=np.float64,
+        )
+        if not np.all(np.isfinite(pid_values)) or np.any(pid_values < 0.0):
+            raise ValueError("PID tracker settings must be finite and non-negative")
+        if (
+            self.pid_maximum_correction_rad <= 0.0
+            or self.pid_integral_time_constant_s <= 0.0
+            or self.pid_stationary_integral_time_constant_s <= 0.0
+        ):
+            raise ValueError("PID correction limit and integral time constants must be positive")
         self.reference_position_epsilon = float(reference_position_epsilon)
         self.reference_linear_velocity_epsilon = float(reference_linear_velocity_epsilon)
         self.reference_rotation_epsilon = float(reference_rotation_epsilon)
@@ -633,10 +714,18 @@ class FrankaEnv:
                 self.nullspace_lambda,
                 self.task_constraint_mask,
                 {
+                    "tracker_mode": self.tracker_mode,
                     "policy_period_s": 1.0 / self.control_hz,
-                    "joint_min_jerk_duration_s": self.joint_min_jerk_duration,
                     "joint_stiffness": self.joint_stiffness,
                     "joint_damping": self.joint_damping,
+                    "pid_proportional_gain": self.pid_proportional_gain,
+                    "pid_integral_gain_s": self.pid_integral_gain_s,
+                    "pid_velocity_gain_s": self.pid_velocity_gain_s,
+                    "pid_maximum_correction_rad": self.pid_maximum_correction_rad,
+                    "pid_integration_error_limit_rad": self.pid_integration_error_limit_rad,
+                    "pid_integral_time_constant_s": self.pid_integral_time_constant_s,
+                    "pid_stationary_integral_time_constant_s": self.pid_stationary_integral_time_constant_s,
+                    "pid_stationary_velocity_threshold_rad_s": self.pid_stationary_velocity_threshold_rad_s,
                     "reference_position_epsilon": self.reference_position_epsilon,
                     "reference_linear_velocity_epsilon": self.reference_linear_velocity_epsilon,
                     "reference_rotation_epsilon": self.reference_rotation_epsilon,
@@ -723,10 +812,15 @@ class FrankaEnv:
 
         return f" tau_abs_max=[{tau_text}] jd_rate={jd_rate:.3f}@J{jd_rate_joint}"
 
-    def _print_action_event(self, action: np.ndarray) -> None:
+    def _print_action_event(
+        self,
+        action: np.ndarray,
+        *,
+        planned_command: PlannedRobotCommand | None = None,
+    ) -> None:
         if not self.print_events:
             return
-        if self.control_mode == "joint":
+        if action.shape == (8,):
             dq_deg = np.degrees(action[:7])
             dq_text = ",".join(f"{value:+.1f}" for value in dq_deg)
             gripper = "close" if action[7] > 0.0 else "open"
@@ -735,11 +829,34 @@ class FrankaEnv:
         torque_window = self._format_torque_window()
         dx, dy, dz = action[0], action[1], action[2]
         drx, dry, drz = action[3], action[4], action[5]
+        sqp_text = ""
+        pose_error_text = ""
+        if planned_command is not None and self.action_planner is not None:
+            telemetry = planned_command.telemetry
+            if telemetry is not None:
+                sqp_text = (
+                    f" sqp_status={telemetry.get('status', 'unknown')}"
+                    f" feasible={telemetry.get('feasible', False)}"
+                    f" iter={telemetry.get('iterations', 0)}"
+                    f" solve_ms={float(telemetry.get('elapsed_ms', 0.0)):.2f}"
+                )
+            actual_pose = planned_command.actual_pose
+            planned_pose = planned_command.planned_pose
+            if planned_command.reference_space == "cartesian":
+                actual_pose = self._pose_array_to_transform(self.get_robot_state_vector()[:6])
+                planned_pose = self._pose_array_to_transform(self.commanded_pose_array)
+            if actual_pose is not None and planned_pose is not None:
+                actual_plan_position, actual_plan_rotation = self._pose_delta(actual_pose, planned_pose)
+                pose_error_text += self._format_pose_delta(
+                    "actual_plan", actual_plan_position, actual_plan_rotation
+                )
         print(
             f"10Hz tick {self._policy_tick + 1:04d} "
             f"dxyz=[{dx:+.3f},{dy:+.3f},{dz:+.3f}]  "
             f"drot=[{drx:+.3f},{dry:+.3f},{drz:+.3f}]"
-            f"{torque_window}",
+            f"{pose_error_text}"
+            f"{torque_window}"
+            f"{sqp_text}",
             flush=True,
         )
 
@@ -763,6 +880,31 @@ class FrankaEnv:
         if norm <= limit or norm < 1e-12:
             return vector.copy()
         return vector * (limit / norm)
+
+    @staticmethod
+    def _pose_array_to_transform(pose: np.ndarray) -> np.ndarray:
+        pose_array = np.asarray(pose, dtype=np.float64)
+        if pose_array.shape != (6,):
+            raise ValueError(f"pose must have shape (6,); got {pose_array.shape}")
+        transform = np.eye(4, dtype=np.float64)
+        transform[:3, :3] = rotvec_to_matrix(pose_array[3:6])
+        transform[:3, 3] = pose_array[:3]
+        return transform
+
+    @staticmethod
+    def _pose_delta(source: np.ndarray, target: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        source_pose = np.asarray(source, dtype=np.float64)
+        target_pose = np.asarray(target, dtype=np.float64)
+        position_delta = target_pose[:3, 3] - source_pose[:3, 3]
+        rotation_delta = matrix_to_rotvec(target_pose[:3, :3] @ source_pose[:3, :3].T)
+        return position_delta, rotation_delta
+
+    @staticmethod
+    def _format_pose_delta(name: str, position: np.ndarray, rotation: np.ndarray) -> str:
+        return (
+            f" {name}_dxyz_m=[{position[0]:+.4f},{position[1]:+.4f},{position[2]:+.4f}]"
+            f" {name}_drot_rad=[{rotation[0]:+.4f},{rotation[1]:+.4f},{rotation[2]:+.4f}]"
+        )
 
     def _prepare_cartesian_action(self, action: np.ndarray) -> np.ndarray:
         transformed = transform_action(action, self.action_config)
@@ -799,7 +941,13 @@ class FrankaEnv:
         self.commanded_pose_array = limited_goal
         return limited_action
 
-    def enqueue_action_block(self, action_block: np.ndarray) -> None:
+    def enqueue_action_block(
+        self,
+        action_block: np.ndarray,
+        *,
+        print_event: bool = True,
+        planned_command: PlannedRobotCommand | None = None,
+    ) -> None:
         block = np.asarray(action_block, dtype=np.float64)
         first = block[0] if block.ndim == 2 else block
         expected_dim = 8 if self.control_mode == "joint" else 7
@@ -807,7 +955,6 @@ class FrankaEnv:
             raise ValueError(
                 f"{self.control_mode} action must have shape ({expected_dim},) or (N, {expected_dim}); got {block.shape}"
             )
-        self._print_action_event(first)
         if self.control_mode == "cartesian":
             if block.ndim == 1:
                 transformed = self._prepare_cartesian_action(first)
@@ -819,11 +966,43 @@ class FrankaEnv:
                 block = transformed_rows
         else:
             self._set_gripper_target(GRIPPER_WIDTH_MAX if first[7] <= 0.0 else 0.0)
+        if print_event:
+            self._print_action_event(first, planned_command=planned_command)
         self._backend.enqueue_action(block)
         self._policy_tick += 1
 
     def enqueue_action(self, action: np.ndarray) -> None:
         self.enqueue_action_block(action)
+
+    def enqueue_cartesian_action(
+        self,
+        action: np.ndarray,
+        *,
+        semantic_key=None,
+    ) -> PlannedRobotCommand:
+        """Plan and enqueue one physical 7D Cartesian action through the configured planner."""
+        if self.action_planner is None:
+            raise RuntimeError("this FrankaEnv was created for raw joint control and has no Cartesian planner")
+        command = self.action_planner.plan(
+            self.get_joint_positions(),
+            np.asarray(action, dtype=np.float64),
+            self.action_config,
+            semantic_key=semantic_key,
+        )
+        if command.reference_space == "cartesian":
+            assert command.cartesian_action is not None
+            self.enqueue_action_block(command.cartesian_action, planned_command=command)
+        else:
+            assert command.joint_target is not None
+            self._print_action_event(np.asarray(action, dtype=np.float64), planned_command=command)
+            self.enqueue_joint_target(command.joint_target, gripper_target=command.gripper_target)
+        self.latest_planner_telemetry = command.telemetry
+        return command
+
+    def reset_action_planner(self) -> None:
+        if self.action_planner is not None:
+            self.action_planner.reset(self.get_joint_positions())
+        self.latest_planner_telemetry = None
 
     def enqueue_joint_target(self, target: np.ndarray, *, gripper_target: float | None = None) -> None:
         if self.control_mode != "joint":
@@ -853,12 +1032,22 @@ class FrankaEnv:
     def set_control_mode(self, control_mode: str) -> None:
         if self.is_control_running():
             raise RuntimeError("cannot change control_mode while control thread is running")
-        self.control_mode = _validate_control_mode(control_mode)
+        control_mode = _validate_control_mode(control_mode)
+        if self.action_planner is not None and control_mode != self.action_planner.control_mode:
+            raise ValueError(
+                f"planner {self.action_planner.mode!r} requires control_mode={self.action_planner.control_mode!r}"
+            )
+        self.control_mode = control_mode
         if hasattr(self._backend, "set_control_mode"):
             self._backend.set_control_mode(self.control_mode)
 
     def set_reference(self, reference_name: str) -> None:
-        self.reference_name = _validate_reference_name(reference_name)
+        reference_name = _validate_reference_name(reference_name)
+        if self.action_planner is not None:
+            self.control_route = ControlRoute(self.action_planner, reference_name, self.tracker_mode)
+        elif self.control_mode == "joint" and reference_name not in JOINT_REFERENCE_CHOICES:
+            raise ValueError(f"joint reference must be one of {JOINT_REFERENCE_CHOICES}; got {reference_name!r}")
+        self.reference_name = reference_name
         self._backend.set_reference(self.reference_name)
 
     def start_control_loop(
@@ -901,7 +1090,10 @@ class FrankaEnv:
         self.wait_control_loop()
 
     def request_stop(self) -> None:
-        self.stop_control()
+        if hasattr(self._backend, "request_stop"):
+            self._backend.request_stop()
+        else:
+            self.stop_control()
 
     def stop_control(self) -> None:
         try:
@@ -1045,6 +1237,15 @@ class FrankaEnv:
                 run_paths.metadata_json,
                 {
                     "reference": self.reference_name,
+                    "tracker_mode": self.tracker_mode,
+                    "pid_proportional_gain": self.pid_proportional_gain,
+                    "pid_integral_gain_s": self.pid_integral_gain_s,
+                    "pid_velocity_gain_s": self.pid_velocity_gain_s,
+                    "pid_maximum_correction_rad": self.pid_maximum_correction_rad,
+                    "pid_integration_error_limit_rad": self.pid_integration_error_limit_rad,
+                    "pid_integral_time_constant_s": self.pid_integral_time_constant_s,
+                    "pid_stationary_integral_time_constant_s": self.pid_stationary_integral_time_constant_s,
+                    "pid_stationary_velocity_threshold_rad_s": self.pid_stationary_velocity_threshold_rad_s,
                     "max_translation_velocity": self.max_translation_velocity,
                     "max_rotation_velocity": self.max_rotation_velocity,
                     "max_translation_step": self.max_translation_step,
@@ -1084,6 +1285,7 @@ class FrankaEnv:
             self._backend.reset(self.reset_speed_factor)
         self._set_gripper_target(GRIPPER_WIDTH_MAX)
         self._refresh_status_from_state()
+        self.reset_action_planner()
 
     def get_robot_state_vector(self) -> np.ndarray:
         self._refresh_gripper_state()
@@ -1098,6 +1300,8 @@ class FrankaEnv:
         return {
             "control_running": self.is_control_running(),
             "reference_name": self.reference_name,
+            "planner_mode": None if self.action_planner is None else self.action_planner.mode,
+            "tracker_mode": self.tracker_mode,
             "gripper_enabled": self._gripper_enabled,
             "gripper_target": self._last_gripper_target,
             "pending_action_count": self.get_pending_action_count(),

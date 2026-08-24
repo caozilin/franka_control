@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import logging
 import math
+import os
 import pathlib
 import sys
 import threading
@@ -42,6 +43,9 @@ from data_collection.key_control import (
     KeyboardController,
 )  # noqa: E402
 from data_collection.episode_io import Episode, EpisodeWriter  # noqa: E402
+from control.cli_args import parse_bool, parse_joint_vector  # noqa: E402
+from control.pid_config import add_joint_pid_arguments, joint_pid_kwargs  # noqa: E402
+from planning import PANDA_TOLERANCE_PROFILES, TRACKER_MODE_CHOICES  # noqa: E402
 
 
 class DataRecorder:
@@ -114,6 +118,9 @@ class DataRecorder:
         if self.is_recording:
             print("  [录制] 已在录制中")
             return
+        if self.kc.env.no_cameras:
+            print("  [录制] 相机未启用；请使用 --with-cameras 启动后再录制")
+            return
         with self.record_lock:
             self.is_recording = True
             self.recording_frames1.clear()
@@ -123,8 +130,9 @@ class DataRecorder:
             self._gripper_force_record_frames = 0
             latest_trace = self.kc.get_recording_snapshot()
             self._last_trace_seq = int(latest_trace["seq_id"])
+        self.kc.set_recording_active(True)
         self.kc.rumble(0.15, 0.85, 120)
-        print("  [录制] 开始 -> 按 2/R3 结束当前轨迹，停控并同步保存后立即恢复")
+        print("  [录制] 开始；再次触发保存键将结束并保存当前轨迹")
 
     def stop_recording(self) -> None:
         if not self.is_recording:
@@ -135,8 +143,9 @@ class DataRecorder:
             frames1 = list(self.recording_frames1)
             frames2 = list(self.recording_frames2)
             data = list(self.recording_data)
+        self.kc.set_recording_active(False)
         self.kc.rumble(0.55, 0.25, 180)
-        print("  [录制] R3/2 已触发，先停止机械臂，再同步保存当前轨迹")
+        print("  [录制] 保存已触发，先停止机械臂，再同步保存当前轨迹")
         save_done = threading.Event()
         if frames1 and data:
             self._pending_save = (frames1, frames2, data, save_done)
@@ -158,6 +167,7 @@ class DataRecorder:
             self._gripper_force_record_frames = 0
             latest_trace = self.kc.get_recording_snapshot()
             self._last_trace_seq = int(latest_trace["seq_id"])
+        self.kc.set_recording_active(False)
         print(f"  [录制] 当前轨迹已作废，不保存 ({discarded_frames} 帧)")
 
     def _save_trajectory(self, frames1: list[np.ndarray], frames2: list[np.ndarray], data: list[dict]) -> None:
@@ -224,15 +234,20 @@ class DataRecorder:
 
     def run(self) -> None:
         self.running = True
-        control_hint = (
-            "  1: 开始录制   2: 结束录制并保存后恢复控制   3: 作废并复位   ESC: 退出"
-            if self.kc.input_device == "keyboard"
-            else "  L3: 开始录制   R3: 结束录制并保存后恢复控制   Cross: 作废并复位   OPTIONS: 退出"
-        )
+        if self.kc.input_device == "keyboard":
+            control_hint = "  1: 开始录制   2: 结束并保存   3: 作废并复位   ESC: 退出"
+        elif self.kc.input_device == "pico":
+            control_hint = "  A: 开始录制/再次按下保存   B: 作废当前录制   Ctrl+C: 退出"
+        else:
+            control_hint = "  L3: 开始录制   R3: 结束并保存   Cross: 作废并复位   OPTIONS: 退出"
         print("\n" + "=" * 60)
-        print("  数据录制器已启动")
-        print(f"  保存路径: {self.collection_dir / self.task_name}")
-        print(f"  采集频率: {self.collect_hz}Hz  每段最大帧: {self.max_frames}")
+        print("  统一笛卡尔遥操作已启动")
+        if self.kc.env.no_cameras:
+            print("  相机: OFF（录制禁用；使用 --with-cameras 开启）")
+        else:
+            print("  相机: ON")
+            print(f"  保存路径: {self.collection_dir / self.task_name}")
+            print(f"  采集频率: {self.collect_hz}Hz  每段最大帧: {self.max_frames}")
         print("=" * 60)
         print(control_hint)
         print("=" * 60 + "\n")
@@ -344,31 +359,52 @@ class DataRecorder:
             self.recording_frames1.clear()
             self.recording_frames2.clear()
             self.recording_data.clear()
+        self.kc.set_recording_active(False)
         print("  [退出] 完成")
-
-
-def parse_joint_vector(value: str) -> np.ndarray:
-    parts = [float(part.strip()) for part in value.split(",") if part.strip()]
-    if len(parts) != 7:
-        raise argparse.ArgumentTypeError("--nullspace-q-target must contain 7 comma-separated joint values")
-    return np.asarray(parts, dtype=np.float64)
 
 
 def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-    parser = argparse.ArgumentParser(description="Franka 数据采集器")
-    parser.add_argument("--collection_dir", "--collection-dir", default=None)
-    parser.add_argument("--task_name", "--task-name", default=None)
-    parser.add_argument("--collect_hz", "--collect-hz", type=float, default=None)
-    parser.add_argument("--max_frames", "--max-frames", type=int, default=None)
-    parser.add_argument("--action_scale", "--action-scale", type=float, default=None)
+    parser = argparse.ArgumentParser(description="Franka 统一笛卡尔遥操作与数据采集入口")
+    parser.add_argument("--collection-dir", default=None)
+    parser.add_argument("--task-name", default=None)
+    parser.add_argument("--collect-hz", type=float, default=None)
+    parser.add_argument("--max-frames", type=int, default=None)
+    parser.add_argument("--action-scale", type=float, default=None)
     parser.add_argument("--prompt", default=None)
     parser.add_argument("--ip", default="172.16.0.2")
-    parser.add_argument("--input_device", "--input-device", choices=("keyboard", "ps4"), default="ps4")
-    parser.add_argument("--joystick_index", "--joystick-index", type=int, default=0)
+    parser.add_argument("--input-device", choices=("keyboard", "ps4", "pico"), default="keyboard")
+    parser.add_argument("--joystick-index", type=int, default=0)
+    parser.add_argument(
+        "--rotation-frame",
+        choices=("ee", "base"),
+        default="ee",
+        help="Keyboard/PS4 rotation input frame; PICO keeps its end-effector-frame mapping",
+    )
+    parser.add_argument(
+        "--tolerance-id",
+        type=str.upper,
+        choices=tuple(PANDA_TOLERANCE_PROFILES),
+        default=None,
+        help="Enable a hard-coded Franka Pre/Post rotation tolerance profile for PS4 SQP teleop",
+    )
+    parser.add_argument("--control-cpu", type=int, default=2)
     parser.add_argument("--no-home-first", action="store_true")
-    parser.add_argument("--no-cameras", action="store_true")
+    camera_group = parser.add_mutually_exclusive_group()
+    camera_group.add_argument("--with-cameras", action="store_true", help="Enable both cameras and episode recording")
+    camera_group.add_argument("--no-cameras", dest="with_cameras", action="store_false", help=argparse.SUPPRESS)
+    parser.set_defaults(with_cameras=False)
     parser.add_argument("--no-robot", action="store_true")
+    parser.add_argument("--pico-bind-host", default="127.0.0.1")
+    parser.add_argument("--pico-port", type=int, default=9010)
+    parser.add_argument("--pico-mapping-mode", choices=("split", "single_6dof"), default="split")
+    parser.add_argument("--pico-translation-scale", type=float, default=1.0)
+    parser.add_argument("--pico-rotation-scale", type=float, default=1.0)
+    parser.add_argument("--pico-grip-threshold", type=float, default=0.5)
+    parser.add_argument("--pico-trigger-threshold", type=float, default=0.5)
+    parser.add_argument("--pico-stale-timeout-s", type=float, default=0.15)
+    parser.add_argument("--pico-attitude-deadzone-deg", type=float, default=10.0)
+    parser.add_argument("--pico-attitude-full-scale-deg", type=float, default=45.0)
     parser.add_argument("--debug-ee-axes", action="store_true", help="Print 10Hz end-effector-frame input and base-frame action debug lines")
     parser.add_argument("--max-translation-velocity", type=float, default=DEFAULT_MAX_TRANSLATION_VELOCITY)
     parser.add_argument("--max-rotation-velocity", type=float, default=DEFAULT_MAX_ROTATION_VELOCITY)
@@ -377,6 +413,17 @@ def main() -> int:
     parser.add_argument("--max-torque-rate", type=float, default=DEFAULT_MAX_TORQUE_RATE)
     parser.add_argument("--reset-duration", type=float, default=5.0)
     parser.add_argument("--reference", choices=("min_jerk", "linear", "cubic", "motion_limited"), default="linear")
+    parser.add_argument("--planner-mode", choices=("direct", "baseline_sqp", "shadow_sqp"), default="direct")
+    parser.add_argument(
+        "--tracker-mode",
+        choices=TRACKER_MODE_CHOICES,
+        default="auto",
+    )
+    add_joint_pid_arguments(parser)
+    parser.add_argument("--rotation-ranged-axes", type=parse_bool, nargs=3, default=(False, False, False))
+    parser.add_argument("--rotation-limits-deg", type=float, nargs=3, default=(30.0, 30.0, 45.0))
+    parser.add_argument("--tolerance-frame-rotvec", type=float, nargs=3, default=(0.0, 0.0, 0.0))
+    parser.add_argument("--shadow-stage", default="teleop")
     parser.add_argument("--nullspace-enabled", action="store_true")
     parser.add_argument("--nullspace-pinv", choices=("plain", "damped"), default="plain")
     parser.add_argument("--nullspace-projector", choices=("kinematic", "dynamic"), default="kinematic")
@@ -386,16 +433,41 @@ def main() -> int:
     parser.add_argument("--nullspace-q-target", type=parse_joint_vector, default=None)
     args = parser.parse_args()
 
+    available_cpus = os.sched_getaffinity(0)
+    if args.control_cpu not in available_cpus:
+        parser.error(f"control CPU {args.control_cpu} is unavailable; choose one of {sorted(available_cpus)}")
+    os.sched_setaffinity(0, {args.control_cpu})
+
     kc = KeyboardController(
         robot_ip=args.ip,
         input_device=args.input_device,
         joystick_index=args.joystick_index,
+        rotation_frame=args.rotation_frame,
+        tolerance_id=args.tolerance_id,
+        pico_bind_host=args.pico_bind_host,
+        pico_port=args.pico_port,
+        pico_mapping_mode=args.pico_mapping_mode,
+        pico_translation_scale=args.pico_translation_scale,
+        pico_rotation_scale=args.pico_rotation_scale,
+        pico_grip_threshold=args.pico_grip_threshold,
+        pico_trigger_threshold=args.pico_trigger_threshold,
+        pico_stale_timeout_s=args.pico_stale_timeout_s,
+        pico_attitude_deadzone_deg=args.pico_attitude_deadzone_deg,
+        pico_attitude_full_scale_deg=args.pico_attitude_full_scale_deg,
         max_translation_velocity=args.max_translation_velocity,
         max_rotation_velocity=args.max_rotation_velocity,
         max_translation_goal_error=args.max_translation_goal_error,
         max_rotation_goal_error=args.max_rotation_goal_error,
+        max_torque_rate=args.max_torque_rate,
         reset_duration=args.reset_duration,
         reference_name=args.reference,
+        planner_mode=args.planner_mode,
+        tracker_mode=args.tracker_mode,
+        **joint_pid_kwargs(args),
+        rotation_ranged_axes=tuple(args.rotation_ranged_axes),
+        rotation_limits_deg=tuple(args.rotation_limits_deg),
+        tolerance_frame_rotvec=tuple(args.tolerance_frame_rotvec),
+        shadow_stage=args.shadow_stage,
         save_recording=False,
         nullspace_enabled=args.nullspace_enabled,
         nullspace_q_target=args.nullspace_q_target,
@@ -405,7 +477,7 @@ def main() -> int:
         nullspace_projector=args.nullspace_projector,
         nullspace_lambda=args.nullspace_lambda,
         no_robot=args.no_robot,
-        no_cameras=args.no_cameras,
+        no_cameras=not args.with_cameras,
         debug_ee_axes=args.debug_ee_axes,
     )
 
