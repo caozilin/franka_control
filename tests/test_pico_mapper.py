@@ -171,27 +171,25 @@ def test_stale_or_invalid_tracking_emits_no_command() -> None:
     assert mapper.step(_snapshot(tracked=False), now=10.0) is None
 
 
-def test_split_maps_both_controller_attitudes_to_velocity_actions() -> None:
+def test_split_maps_left_relative_position_and_right_relative_attitude() -> None:
     mapper = PicoPoseMapper(PicoMapperConfig(
         mapping_mode="split",
         translation_scale=1.0,
         max_translation_step_m=0.02,
         max_rotation_step_rad=0.2,
-        attitude_deadzone_rad=0.0,
-        attitude_full_scale_rad=0.2,
     ))
     mapper.step(_snapshot(sequence=1), now=10.0)
     command = mapper.step(
         _snapshot(
             sequence=2,
-            left_orientation=_quaternion_y(-0.2),
+            left_position=(0.02, 0.0, 0.0),
             right_orientation=_quaternion_y(0.2),
         ),
         now=10.0,
     )
 
     assert command is not None
-    np.testing.assert_allclose(command.action[:3], [0.0, 0.02, 0.0])
+    np.testing.assert_allclose(command.action[:3], [0.02, 0.0, 0.0])
     np.testing.assert_allclose(command.action[3:6], [-0.2, 0.0, 0.0], atol=1e-10)
 
 
@@ -200,12 +198,10 @@ def test_split_clutches_translation_and_rotation_independently() -> None:
         mapping_mode="split",
         max_translation_step_m=0.02,
         max_rotation_step_rad=0.1,
-        attitude_deadzone_rad=0.0,
-        attitude_full_scale_rad=0.1,
     ))
     translation_anchor = mapper.step(_snapshot(sequence=1, right_grip=0.0), now=10.0)
     translated = mapper.step(
-        _snapshot(sequence=2, left_orientation=_quaternion_y(-0.1), right_grip=0.0),
+        _snapshot(sequence=2, left_position=(0.01, 0.0, 0.0), right_grip=0.0),
         now=10.0,
     )
     rotation_anchor = mapper.step(
@@ -223,37 +219,31 @@ def test_split_clutches_translation_and_rotation_independently() -> None:
 
     assert translation_anchor is not None and translation_anchor.reanchored
     assert translated is not None
-    np.testing.assert_allclose(translated.action[:3], [0.0, 0.01, 0.0])
+    np.testing.assert_allclose(translated.action[:3], [0.005, 0.0, 0.0])
     assert rotation_anchor is not None and rotation_anchor.reanchored
     assert rotated is not None
     np.testing.assert_allclose(rotated.action[:3], 0.0)
     np.testing.assert_allclose(rotated.action[3:6], [-0.1, 0.0, 0.0], atol=1e-10)
 
 
-def test_attitude_velocity_deadzone_and_linear_ramp() -> None:
+def test_split_relative_pose_does_not_repeat_motion_while_held() -> None:
     mapper = PicoPoseMapper(PicoMapperConfig(
         mapping_mode="split",
         translation_scale=1.0,
         max_translation_step_m=0.02,
-        attitude_deadzone_rad=0.1,
-        attitude_full_scale_rad=0.3,
+        rotation_scale=1.0,
+        max_rotation_step_rad=0.2,
     ))
-    mapper.step(_snapshot(sequence=1, right_grip=0.0), now=10.0)
+    mapper.step(_snapshot(sequence=1), now=10.0)
+    pose = _snapshot(
+        sequence=2,
+        left_position=(0.01, 0.0, 0.0),
+        right_orientation=_quaternion_y(0.1),
+    )
+    moved = mapper.step(pose, now=10.0)
+    held = mapper.step(pose, now=10.0)
 
-    inside = mapper.step(
-        _snapshot(sequence=2, left_orientation=_quaternion_y(-0.05), right_grip=0.0),
-        now=10.0,
-    )
-    halfway = mapper.step(
-        _snapshot(sequence=3, left_orientation=_quaternion_y(-0.2), right_grip=0.0),
-        now=10.0,
-    )
-    saturated = mapper.step(
-        _snapshot(sequence=4, left_orientation=_quaternion_y(-0.5), right_grip=0.0),
-        now=10.0,
-    )
-
-    assert inside is not None and halfway is not None and saturated is not None
-    np.testing.assert_allclose(inside.action[:3], 0.0, atol=1e-12)
-    np.testing.assert_allclose(halfway.action[:3], [0.0, 0.01, 0.0], atol=1e-10)
-    np.testing.assert_allclose(saturated.action[:3], [0.0, 0.02, 0.0], atol=1e-10)
+    assert moved is not None and held is not None
+    np.testing.assert_allclose(moved.action[:3], [0.01, 0.0, 0.0], atol=1e-10)
+    np.testing.assert_allclose(moved.action[3:6], [-0.1, 0.0, 0.0], atol=1e-10)
+    np.testing.assert_allclose(held.action[:6], 0.0, atol=1e-12)

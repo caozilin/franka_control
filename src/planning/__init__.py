@@ -31,6 +31,7 @@ from planning.task_tolerance import (
     PANDA_TOLERANCE_PROFILES,
     GripperPhaseClassifier,
     ManipulationPhase,
+    RotationalToleranceState,
     TaskToleranceProfile,
     box_tolerance_frame,
 )
@@ -60,6 +61,7 @@ __all__ = [
     "PANDA_TOLERANCE_PROFILES",
     "GripperPhaseClassifier",
     "ManipulationPhase",
+    "RotationalToleranceState",
     "TaskToleranceProfile",
     "box_tolerance_frame",
 ]

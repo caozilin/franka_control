@@ -370,8 +370,8 @@ class KeyboardController:
 
         if self.input_device == "pico":
             print("  [控制] PICO 双手柄模式")
-            print("  [控制] 左 Grip+姿态:平移速度  右 Grip+姿态:末端系旋转速度")
-            print("  [控制] 姿态回零停止，保持倾斜持续运动；右 Trigger:切换夹爪")
+            print("  [控制] 左 Grip+相对位置:Base 平移  右 Grip+相对姿态:末端系旋转")
+            print("  [控制] 手柄保持在相对目标时机械臂最终静止；右 Trigger:切换夹爪")
             print("  [控制] A:开始录制/再次按下保存  B:作废当前录制  Ctrl+C:退出")
             return
 

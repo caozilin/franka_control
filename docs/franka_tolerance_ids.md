@@ -5,6 +5,8 @@
 
 每组数值顺序均为：`Rx- Rx+ Ry- Ry+ Rz- Rz+`，单位为度。`-`/`+` 表示目标姿态两侧可接受的非对称容差幅值，并不是带符号的输入值。
 
+旋转容差采用阶段固定坐标系中的固定轴 XYZ/RPY 欧拉坐标 `[roll, pitch, yaw]`：依次绕固定 X、Y、Z 轴旋转，组合矩阵为 `Rz(yaw) @ Ry(pitch) @ Rx(roll)`。三个方向的边界是同一张欧拉坐标图中的联合边界，不是 SO(3) 对数/轴角向量的三个独立分量。该约定只用于容差值、mask 和边界；普通末端位姿存储与 Base 系旋转增量仍使用旋转向量。
+
 | ID | Pre | Post | 对应任务 ID |
 | --- | --- | --- | --- |
 | `T01` | `30 30 30 10 0 0` | `0 0 0 0 45 45` | `adjust_cylindrical_bottle` |
@@ -32,5 +34,5 @@
 
 启用后按 PS 键依次采集 Pre、Post 目标姿态，之后继续按 PS 键会依次覆盖 Pre、Post。
 
-控制规则与 `franka_mujoco` 相同：Pre/Post 使用表中的非对称旋转范围，Grasp/Release 使用严格姿态；范围轴采用固定任务目标坐标、即时释放目标和意图 EMA，SQP 约束使用 `absolute_lower/absolute_upper`。阶段由夹爪开合命令与连续 3 帧宽度稳定共同判定。
+控制规则与 `franka_mujoco` 相同：Pre/Post 使用表中的非对称旋转范围，Grasp/Release 使用严格姿态；混合 mask 中的锁定轴与释放轴均围绕同一个固定阶段目标求值，范围轴采用即时释放目标和意图 EMA，SQP 约束使用 `absolute_lower/absolute_upper`。阶段由夹爪开合命令与连续 3 帧宽度稳定共同判定。
 运行阶段采用 MuJoCo 的四阶段夹爪规则：Pre/Post 使用表中对应容差；Grasp/Release 使用严格零容差。

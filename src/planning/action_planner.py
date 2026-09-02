@@ -245,6 +245,19 @@ class CartesianActionPlanner:
             shadow_plan = self._planner.step(
                 measured,
                 transformed[:6],
+                stage_target_rotation=(
+                    self._tolerance_state.target
+                    if self._tolerance_state is not None
+                    else (
+                        self._planner.baseline.target.rotation
+                        if self._planner.baseline.target is not None
+                        else self._planner.baseline.kinematics.evaluate(
+                            measured,
+                            include_manipulability=False,
+                            include_link_points=False,
+                        ).rotation
+                    )
+                ),
                 tolerance_frame=self._tolerance_frame,
                 ranged_axes=self._ranged_axes,
                 rotation_limits=self._rotation_limits,

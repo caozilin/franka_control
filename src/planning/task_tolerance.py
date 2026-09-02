@@ -6,7 +6,7 @@ from enum import IntEnum
 import numpy as np
 
 from planning.sqp.controller import AxisTask, TaskKind
-from utils.pose import matrix_to_rotvec
+from utils.pose import rotation_tolerance_coordinates
 
 
 class ManipulationPhase(IntEnum):
@@ -164,8 +164,8 @@ _INSTANT_PREFERENCE_FLOOR = 0.15
 
 
 def _rotation_error_in_frame(actual: np.ndarray, target: np.ndarray, frame: np.ndarray) -> np.ndarray:
-    """MuJoCo coordinate: actual-minus-target about fixed frame axes."""
-    return frame.T @ target @ matrix_to_rotvec(target.T @ actual)
+    """Actual-minus-target fixed-axis XYZ/RPY coordinates in ``frame``."""
+    return rotation_tolerance_coordinates(actual, target, frame)
 
 
 @dataclass
@@ -290,50 +290,82 @@ class RotationalToleranceState:
             self._instant_activity[stage] = self._smoothstep(np.abs(sample), _ACTIVITY_LOW, _ACTIVITY_HIGH)
 
     def task(self, axis: int, current_rotation: np.ndarray, target_rotation: np.ndarray | None = None, reference_rotation: np.ndarray | None = None) -> AxisTask:
-        if self.active_stage in _STRICT_STAGES or not self.ranged[axis]:
+        if self.active_stage in _STRICT_STAGES:
             return AxisTask(TaskKind.SPECIFIC, goal=0.0)
-        actual = self.boundary_tolerance(current_rotation, target_rotation)
-        value = float(actual[axis])
-        nominal_value = float(self.actual_tolerance(current_rotation, target_rotation)[axis])
-        previous_reference = current_rotation if reference_rotation is None else np.asarray(reference_rotation, dtype=float)
-        reference_value = float(self.actual_tolerance(previous_reference, target_rotation)[axis])
-        fixed_boundary_value = float(self.boundary_tolerance(current_rotation)[axis])
-        fixed_value = float(self.actual_tolerance(current_rotation)[axis])
-        fixed_center = fixed_value - fixed_boundary_value
-        nominal_from_fixed = nominal_value - fixed_value
-        negative_limit = float(self.negative_limits[axis] if self._signed_limits_are_custom else self.limits[axis])
-        positive_limit = float(self.positive_limits[axis] if self._signed_limits_are_custom else self.limits[axis])
-        if negative_limit <= 0.0 and positive_limit <= 0.0:
+        fixed_stage_reference = self.target.copy() if np.any(self.ranged) else None
+        planned_coordinates = (
+            self.actual_tolerance(current_rotation)
+            if fixed_stage_reference is not None
+            else None
+        )
+        if self.ranged[axis]:
+            previous_reference = (
+                current_rotation
+                if reference_rotation is None
+                else np.asarray(reference_rotation, dtype=float)
+            )
+            if previous_reference.shape != (3, 3):
+                raise ValueError("previous rotation reference must be 3x3")
+            reference_value = float(
+                self.actual_tolerance(previous_reference, target_rotation)[axis]
+            )
+            fixed_boundary_value = float(self.boundary_tolerance(current_rotation)[axis])
+            fixed_value = float(self.actual_tolerance(current_rotation)[axis])
+            fixed_center = fixed_value - fixed_boundary_value
+            negative_limit = float(
+                self.negative_limits[axis]
+                if self._signed_limits_are_custom
+                else self.limits[axis]
+            )
+            positive_limit = float(
+                self.positive_limits[axis]
+                if self._signed_limits_are_custom
+                else self.limits[axis]
+            )
+            if negative_limit <= 0.0 and positive_limit <= 0.0:
+                assert planned_coordinates is not None
+                goal = float(planned_coordinates[axis])
+                if abs(goal) <= 1.0e-12:
+                    goal = 0.0
+                return AxisTask(
+                    TaskKind.SPECIFIC,
+                    goal=goal,
+                    absolute_rotation_reference=fixed_stage_reference,
+                )
+            if fixed_boundary_value > positive_limit:
+                fixed_lower, fixed_upper = fixed_center - negative_limit, fixed_value
+            elif fixed_boundary_value < -negative_limit:
+                fixed_lower, fixed_upper = fixed_value, fixed_center + positive_limit
+            else:
+                fixed_lower, fixed_upper = fixed_center - negative_limit, fixed_center + positive_limit
+            instantaneous_release_goal = float(
+                np.clip(reference_value, -negative_limit, positive_limit)
+            )
+            at_fixed_boundary = (
+                fixed_boundary_value >= positive_limit - 1e-6
+                or fixed_boundary_value <= -negative_limit + 1e-6
+            )
+            instantaneous_activity = float(self._instant_activity[self.active_stage, axis])
+            preference_weight = float(self.intent_preference[axis])
+            if at_fixed_boundary:
+                instantaneous_activity = preference_weight = 1.0
+            return AxisTask(
+                TaskKind.FLAT_RANGE,
+                lower=fixed_lower,
+                upper=fixed_upper,
+                preference_goal=0.0,
+                preference_weight=preference_weight,
+                instantaneous_activity=instantaneous_activity,
+                instantaneous_release_goal=instantaneous_release_goal,
+                absolute_lower=fixed_lower,
+                absolute_upper=fixed_upper,
+                absolute_rotation_reference=fixed_stage_reference,
+            )
+        if fixed_stage_reference is None:
             return AxisTask(TaskKind.SPECIFIC, goal=0.0)
-        span = negative_limit + positive_limit
-        if value > positive_limit:
-            lower, upper = -span, 0.0
-        elif value < -negative_limit:
-            lower, upper = 0.0, span
-        else:
-            lower, upper = -negative_limit - value, positive_limit - value
-        if fixed_boundary_value > positive_limit:
-            fixed_lower, fixed_upper = fixed_center - negative_limit, fixed_value
-        elif fixed_boundary_value < -negative_limit:
-            fixed_lower, fixed_upper = fixed_value, fixed_center + positive_limit
-        else:
-            fixed_lower, fixed_upper = fixed_center - negative_limit, fixed_center + positive_limit
-        absolute_lower = fixed_lower + nominal_from_fixed
-        absolute_upper = fixed_upper + nominal_from_fixed
-        instantaneous_release_goal = float(np.clip(reference_value, absolute_lower, absolute_upper))
-        at_fixed_boundary = fixed_boundary_value >= positive_limit - 1e-6 or fixed_boundary_value <= -negative_limit + 1e-6
-        instantaneous_activity = float(self._instant_activity[self.active_stage, axis])
-        preference_weight = float(self.intent_preference[axis])
-        if at_fixed_boundary:
-            instantaneous_activity = preference_weight = 1.0
+        assert planned_coordinates is not None
         return AxisTask(
-            TaskKind.FLAT_RANGE,
-            lower=lower,
-            upper=upper,
-            preference_goal=0.0,
-            preference_weight=preference_weight,
-            instantaneous_activity=instantaneous_activity,
-            instantaneous_release_goal=instantaneous_release_goal,
-            absolute_lower=absolute_lower,
-            absolute_upper=absolute_upper,
+            TaskKind.SPECIFIC,
+            goal=float(planned_coordinates[axis]),
+            absolute_rotation_reference=fixed_stage_reference,
         )

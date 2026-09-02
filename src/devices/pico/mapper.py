@@ -68,13 +68,12 @@ class PicoTeleopCommand:
 
 
 class PicoPoseMapper:
-    """Map snapshots to bounded 10 Hz Base translations and EE-frame rotations."""
+    """Map controller-relative poses to bounded Base/EE Cartesian increments."""
 
     def __init__(self, config: PicoMapperConfig | None = None) -> None:
         self.config = config or PicoMapperConfig()
         self._active = False
         self._anchor_position: np.ndarray | None = None
-        self._anchor_translation_rotation: np.ndarray | None = None
         self._anchor_rotation: np.ndarray | None = None
         self._emitted_translation = np.zeros(3, dtype=np.float64)
         self._emitted_rotation = np.eye(3, dtype=np.float64)
@@ -86,7 +85,6 @@ class PicoPoseMapper:
     def _reset_motion(self) -> None:
         self._active = False
         self._anchor_position = None
-        self._anchor_translation_rotation = None
         self._anchor_rotation = None
         self._emitted_translation[:] = 0.0
         self._emitted_rotation[:] = np.eye(3)
@@ -125,19 +123,6 @@ class PicoPoseMapper:
         """Map controller roll/pitch to the requested EE pitch/roll axes."""
         step = np.asarray(rotation_step, dtype=np.float64)
         return step[[1, 0, 2]].copy()
-
-    @staticmethod
-    def _map_left_attitude_to_translation(rotation_step: np.ndarray) -> np.ndarray:
-        """Map controller roll/pitch/yaw to Base X/Y/Z translation axes."""
-        return np.asarray(rotation_step, dtype=np.float64).copy()
-
-    def _attitude_to_unit_velocity(self, rotvec: np.ndarray) -> np.ndarray:
-        """Apply a component-wise angular deadzone and linear full-scale ramp."""
-        value = np.asarray(rotvec, dtype=np.float64)
-        magnitude = np.abs(value)
-        span = self.config.attitude_full_scale_rad - self.config.attitude_deadzone_rad
-        normalized = np.clip((magnitude - self.config.attitude_deadzone_rad) / span, 0.0, 1.0)
-        return np.sign(value) * normalized
 
     def step(self, snapshot: PicoSnapshot | None, *, now: float | None = None) -> PicoTeleopCommand | None:
         if snapshot is None or snapshot.age_s(now) > self.config.stale_timeout_s:
@@ -201,7 +186,7 @@ class PicoPoseMapper:
     def _step_split(self, snapshot: PicoSnapshot) -> PicoTeleopCommand:
         left = snapshot.packet.left
         right = snapshot.packet.right
-        _, left_rotation = self._controller_pose_in_base_axes(left)
+        left_position, _ = self._controller_pose_in_base_axes(left)
         _, right_rotation = self._controller_pose_in_base_axes(right)
         translation_enabled = left.grip >= self.config.grip_threshold
         rotation_enabled = right.grip >= self.config.grip_threshold
@@ -213,20 +198,20 @@ class PicoPoseMapper:
             self._translation_active = False
         elif not self._translation_active:
             self._translation_active = True
-            self._anchor_translation_rotation = left_rotation
+            self._anchor_position = left_position
+            self._emitted_translation[:] = 0.0
             reanchored = True
         else:
-            assert self._anchor_translation_rotation is not None
-            controller_delta = self._anchor_translation_rotation.T @ left_rotation
-            mapped_attitude = self._map_left_attitude_to_translation(
-                matrix_to_rotvec(controller_delta)
+            assert self._anchor_position is not None
+            desired_translation = self.config.translation_scale * (
+                left_position - self._anchor_position
             )
-            unit_velocity = np.clip(
-                self.config.translation_scale * self._attitude_to_unit_velocity(mapped_attitude),
-                -1.0,
-                1.0,
+            translation_step = self._clip_norm(
+                desired_translation - self._emitted_translation,
+                self.config.max_translation_step_m,
             )
-            action[:3] = self.config.max_translation_step_m * unit_velocity
+            self._emitted_translation += translation_step
+            action[:3] = translation_step
 
         if not rotation_enabled:
             self._rotation_active = False
@@ -238,15 +223,15 @@ class PicoPoseMapper:
         else:
             assert self._anchor_rotation is not None
             controller_delta = self._anchor_rotation.T @ right_rotation
-            mapped_attitude = self._map_controller_rotation_to_ee(
-                matrix_to_rotvec(controller_delta)
+            desired_rotation = rotvec_to_matrix(
+                self.config.rotation_scale * matrix_to_rotvec(controller_delta)
             )
-            unit_velocity = np.clip(
-                self.config.rotation_scale * self._attitude_to_unit_velocity(mapped_attitude),
-                -1.0,
-                1.0,
+            rotation_step = self._clip_norm(
+                matrix_to_rotvec(self._emitted_rotation.T @ desired_rotation),
+                self.config.max_rotation_step_rad,
             )
-            action[3:6] = self.config.max_rotation_step_rad * unit_velocity
+            self._emitted_rotation = self._emitted_rotation @ rotvec_to_matrix(rotation_step)
+            action[3:6] = self._map_controller_rotation_to_ee(rotation_step)
 
         return PicoTeleopCommand(
             action,

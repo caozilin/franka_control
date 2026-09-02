@@ -10,7 +10,13 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from control.franka_env import DEFAULT_HOME_Q, FrankaEnv  # noqa: E402
 from planning.sqp import BaselineSQPPlanner, PandaKinematics, SQPSettings, TargetPose  # noqa: E402
-from utils.pose import matrix_to_rotvec, rotvec_to_matrix  # noqa: E402
+from utils.pose import (  # noqa: E402
+    rotation_from_tolerance_coordinates,
+    rotation_tolerance_coordinate_jacobian,
+    rotation_tolerance_coordinates,
+    matrix_to_rotvec,
+    rotvec_to_matrix,
+)
 
 
 def test_panda_analytic_jacobian_matches_finite_difference() -> None:
@@ -26,6 +32,45 @@ def test_panda_analytic_jacobian_matches_finite_difference() -> None:
         numeric[:3, index] = (changed.position - state.position) / epsilon
         numeric[3:, index] = matrix_to_rotvec(changed.rotation @ state.rotation.T) / epsilon
     np.testing.assert_allclose(state.jacobian, numeric, atol=5e-7)
+
+
+def test_fixed_xyz_tolerance_jacobian_matches_finite_difference() -> None:
+    frame = rotvec_to_matrix(np.array([0.31, -0.22, 0.18]))
+    target = rotvec_to_matrix(np.array([-0.17, 0.09, 0.26]))
+    coordinates = np.array([0.28, -0.34, 0.41])
+    actual = rotation_from_tolerance_coordinates(target, frame, coordinates)
+    angular_world = np.array(
+        (
+            (0.4, -0.1, 0.3, 0.2),
+            (-0.2, 0.5, 0.1, -0.3),
+            (0.3, 0.2, -0.4, 0.6),
+        )
+    )
+    analytic = rotation_tolerance_coordinate_jacobian(
+        actual, target, frame, angular_world
+    )
+    epsilon = 1e-7
+    numeric = np.empty_like(analytic)
+    for column in range(angular_world.shape[1]):
+        perturbed = rotvec_to_matrix(
+            epsilon * angular_world[:, column]
+        ) @ actual
+        numeric[:, column] = (
+            rotation_tolerance_coordinates(perturbed, target, frame)
+            - coordinates
+        ) / epsilon
+    np.testing.assert_allclose(analytic, numeric, atol=5e-8)
+
+
+def test_mask_011_keeps_end_effector_y_horizontal() -> None:
+    frame = rotvec_to_matrix(np.array([0.0, 0.0, 0.63]))
+    target = frame @ np.diag((-1.0, 1.0, -1.0))
+    for pitch in np.radians((-35.0, -15.0, 0.0, 20.0, 40.0)):
+        for yaw in np.radians((-70.0, -25.0, 0.0, 30.0, 75.0)):
+            orientation = rotation_from_tolerance_coordinates(
+                target, frame, np.array([0.0, pitch, yaw])
+            )
+            assert abs(float(orientation[:, 1] @ frame[:, 2])) < 1e-12
 
 
 def test_accelerated_panda_kinematics_matches_python_fallback() -> None:

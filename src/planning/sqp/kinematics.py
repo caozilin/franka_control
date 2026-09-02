@@ -6,7 +6,12 @@ from typing import Any
 
 import numpy as np
 
-from utils.pose import matrix_to_rotvec, rotvec_to_matrix
+from utils.pose import (
+    matrix_to_rotvec,
+    rotation_tolerance_coordinate_jacobian,
+    rotation_tolerance_coordinates,
+    rotvec_to_matrix,
+)
 
 
 PANDA_JOINT_LOWER = np.array(
@@ -212,9 +217,12 @@ class PandaKinematics:
         tolerance_rotation: np.ndarray | None = None,
     ) -> np.ndarray:
         goal_rotation = np.asarray(goal_rotation, dtype=np.float64)
-        rotation_error = matrix_to_rotvec(goal_rotation.T @ state.rotation)
-        if tolerance_rotation is not None:
-            rotation_error = np.asarray(tolerance_rotation, dtype=np.float64).T @ goal_rotation @ rotation_error
+        if tolerance_rotation is None:
+            rotation_error = matrix_to_rotvec(goal_rotation.T @ state.rotation)
+        else:
+            rotation_error = rotation_tolerance_coordinates(
+                state.rotation, goal_rotation, tolerance_rotation
+            )
         return np.concatenate((state.position - goal_position, rotation_error))
 
     @staticmethod
@@ -224,28 +232,30 @@ class PandaKinematics:
         tolerance_rotation: np.ndarray | None = None,
     ) -> np.ndarray:
         goal_rotation = np.asarray(goal_rotation, dtype=np.float64)
-        error = matrix_to_rotvec(goal_rotation.T @ state.rotation)
-        angle = float(np.linalg.norm(error))
-        skew = np.array(
-            ((0.0, -error[2], error[1]), (error[2], 0.0, -error[0]), (-error[1], error[0], 0.0)),
-            dtype=np.float64,
-        )
-        coefficient = (
-            1.0 / 12.0 + angle * angle / 720.0
-            if angle < 1e-5
-            else (1.0 - 0.5 * angle / math.tan(0.5 * angle)) / (angle * angle)
-        )
-        log_left_inverse = np.eye(3) - 0.5 * skew + coefficient * (skew @ skew)
         angular_world = state.jacobian[3:]
-        if tolerance_rotation is None:
-            rotation_jacobian = log_left_inverse @ goal_rotation.T @ angular_world
-        else:
-            tolerance_rotation = np.asarray(tolerance_rotation, dtype=np.float64)
-            rotation_jacobian = (
-                tolerance_rotation.T
-                @ goal_rotation
-                @ log_left_inverse
-                @ goal_rotation.T
-                @ angular_world
+        if tolerance_rotation is not None:
+            rotation_jacobian = rotation_tolerance_coordinate_jacobian(
+                state.rotation,
+                goal_rotation,
+                tolerance_rotation,
+                angular_world,
             )
+        else:
+            error = matrix_to_rotvec(goal_rotation.T @ state.rotation)
+            angle = float(np.linalg.norm(error))
+            skew = np.array(
+                (
+                    (0.0, -error[2], error[1]),
+                    (error[2], 0.0, -error[0]),
+                    (-error[1], error[0], 0.0),
+                ),
+                dtype=np.float64,
+            )
+            coefficient = (
+                1.0 / 12.0 + angle * angle / 720.0
+                if angle < 1e-5
+                else (1.0 - 0.5 * angle / math.tan(0.5 * angle)) / (angle * angle)
+            )
+            log_left_inverse = np.eye(3) - 0.5 * skew + coefficient * (skew @ skew)
+            rotation_jacobian = log_left_inverse @ goal_rotation.T @ angular_world
         return np.vstack((state.jacobian[:3], rotation_jacobian))

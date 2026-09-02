@@ -35,7 +35,7 @@ REFERENCE_CHOICES = ("min_jerk", "linear", "cubic", "motion_limited")
 NULLSPACE_PINV_CHOICES = ("plain", "damped")
 NULLSPACE_PROJECTOR_CHOICES = ("kinematic", "dynamic")
 CONTROL_MODE_CHOICES = ("cartesian", "joint")
-DEFAULT_MAX_TRANSLATION_VELOCITY = 0.2
+DEFAULT_MAX_TRANSLATION_VELOCITY = 0.15
 DEFAULT_MAX_ROTATION_VELOCITY = math.pi / 4.0
 DEFAULT_MAX_TRANSLATION_GOAL_ERROR = 0.3
 DEFAULT_MAX_ROTATION_GOAL_ERROR = math.pi / 6.0
@@ -56,8 +56,18 @@ DEFAULT_REFERENCE_POSITION_EPSILON = 0.0005
 DEFAULT_REFERENCE_LINEAR_VELOCITY_EPSILON = 0.001
 DEFAULT_REFERENCE_ROTATION_EPSILON = 0.001
 DEFAULT_REFERENCE_ANGULAR_VELOCITY_EPSILON = 0.001
-DEFAULT_COLLISION_TORQUE = np.array([20.0, 20.0, 18.0, 18.0, 16.0, 14.0, 12.0], dtype=np.float64)
-DEFAULT_COLLISION_FORCE = np.array([20.0, 20.0, 20.0, 25.0, 25.0, 25.0], dtype=np.float64)
+DEFAULT_COLLISION_LOWER_TORQUE = np.array(
+    [25.0, 25.0, 22.0, 20.0, 19.0, 17.0, 14.0], dtype=np.float64
+)
+DEFAULT_COLLISION_UPPER_TORQUE = np.array(
+    [35.0, 35.0, 32.0, 30.0, 29.0, 27.0, 24.0], dtype=np.float64
+)
+DEFAULT_COLLISION_LOWER_FORCE = np.array(
+    [30.0, 30.0, 30.0, 25.0, 25.0, 25.0], dtype=np.float64
+)
+DEFAULT_COLLISION_UPPER_FORCE = np.array(
+    [40.0, 40.0, 40.0, 35.0, 35.0, 35.0], dtype=np.float64
+)
 
 DEFAULT_HOME_Q = np.array(
     [0.0, -math.pi / 4.0, 0.0, -3.0 * math.pi / 4.0, 0.0, math.pi / 2.0, math.pi / 4.0],
@@ -601,16 +611,20 @@ class FrankaEnv:
         self.reference_rotation_epsilon = float(reference_rotation_epsilon)
         self.reference_angular_velocity_epsilon = float(reference_angular_velocity_epsilon)
         self.collision_lower_torque = np.asarray(
-            DEFAULT_COLLISION_TORQUE if collision_lower_torque is None else collision_lower_torque, dtype=np.float64
+            DEFAULT_COLLISION_LOWER_TORQUE if collision_lower_torque is None else collision_lower_torque,
+            dtype=np.float64,
         )
         self.collision_upper_torque = np.asarray(
-            DEFAULT_COLLISION_TORQUE if collision_upper_torque is None else collision_upper_torque, dtype=np.float64
+            DEFAULT_COLLISION_UPPER_TORQUE if collision_upper_torque is None else collision_upper_torque,
+            dtype=np.float64,
         )
         self.collision_lower_force = np.asarray(
-            DEFAULT_COLLISION_FORCE if collision_lower_force is None else collision_lower_force, dtype=np.float64
+            DEFAULT_COLLISION_LOWER_FORCE if collision_lower_force is None else collision_lower_force,
+            dtype=np.float64,
         )
         self.collision_upper_force = np.asarray(
-            DEFAULT_COLLISION_FORCE if collision_upper_force is None else collision_upper_force, dtype=np.float64
+            DEFAULT_COLLISION_UPPER_FORCE if collision_upper_force is None else collision_upper_force,
+            dtype=np.float64,
         )
         self.trace_capacity_sec = float(trace_capacity_sec)
         self.home_q = np.asarray(home_q if home_q is not None else DEFAULT_HOME_Q, dtype=np.float64)

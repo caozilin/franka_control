@@ -74,8 +74,9 @@ from being accumulated as a delta.
 Shadow SQP does not define a second optimizer. `ShadowOrientationReference`
 first removes historical rotation bias on strict axes, then `ShadowSQPPlanner`
 passes that corrected 10 Hz target to the same `BaselineSQPPlanner`. A semantic
-stage, tolerance mask, or tolerance-frame change reanchors the shadow at the
-last optimized orientation.
+stage or tolerance-mask change reanchors the shadow at the last optimized
+orientation. Updating the target/frame within the same stage re-expresses the
+unchanged absolute shadow in the new fixed-axis XYZ/RPY tolerance chart.
 
 ## Linux verification
 

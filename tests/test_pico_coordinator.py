@@ -37,14 +37,11 @@ def _controller(
     )
 
 
-def _send(sender: socket.socket, port: int, sequence: int, left_tilt: float) -> None:
-    left_orientation = np.array(
-        [0.0, math.sin(-left_tilt / 2.0), 0.0, math.cos(-left_tilt / 2.0)]
-    )
+def _send(sender: socket.socket, port: int, sequence: int, left_offset: float) -> None:
     packet = PicoPacket(
         sequence,
         time.time(),
-        _controller((0.0, 0.0, 0.0), orientation_xyzw=left_orientation),
+        _controller((left_offset, 0.0, 0.0)),
         _controller((0.0, 0.0, 0.0)),
         session_id="coordinator-test",
     )
@@ -93,14 +90,9 @@ def test_pico_source_runs_without_policy_server_or_robot() -> None:
 
         assert coordinator._latest_pico is not None
         assert coordinator._latest_pico["motion_enabled"] is True
-        deadzone = math.radians(10.0)
-        full_scale = math.radians(25.0)
-        expected_step = coordinator._env.max_translation_step * (
-            (0.2 - deadzone) / (full_scale - deadzone)
-        )
         np.testing.assert_allclose(
             coordinator._latest_action_transformed[:3],
-            [0.0, expected_step, 0.0],
+            [0.0, coordinator._env.max_translation_step, 0.0],
         )
     finally:
         sender.close()

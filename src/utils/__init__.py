@@ -8,11 +8,16 @@ from .control import (
     transform_action,
 )
 from .pose import (
+    fixed_xyz_rotation_angles,
+    fixed_xyz_rotation_matrix,
     matrix_to_pose_array,
     matrix_to_rotvec,
     matrix_to_rotvec_continuous,
     pose_array_to_matrix,
     pose_error,
+    rotation_from_tolerance_coordinates,
+    rotation_tolerance_coordinate_jacobian,
+    rotation_tolerance_coordinates,
     rotvec_to_matrix,
 )
 
@@ -23,11 +28,16 @@ __all__ = [
     "MAX_TORQUE_RATE",
     "POLICY_HZ",
     "limit_torque_rate",
+    "fixed_xyz_rotation_angles",
+    "fixed_xyz_rotation_matrix",
     "matrix_to_pose_array",
     "matrix_to_rotvec",
     "matrix_to_rotvec_continuous",
     "pose_array_to_matrix",
     "pose_error",
+    "rotation_from_tolerance_coordinates",
+    "rotation_tolerance_coordinate_jacobian",
+    "rotation_tolerance_coordinates",
     "rotvec_to_matrix",
     "transform_action",
 ]

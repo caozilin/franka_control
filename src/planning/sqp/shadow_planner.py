@@ -46,6 +46,7 @@ class ShadowSQPPlanner:
         measured_q: np.ndarray,
         cartesian_action: np.ndarray,
         *,
+        stage_target_rotation: np.ndarray,
         tolerance_frame: np.ndarray,
         ranged_axes: np.ndarray,
         semantic_key: Hashable,
@@ -69,6 +70,7 @@ class ShadowSQPPlanner:
         corrected_rotation, diagnostics = self.shadow.advance(
             previous_projected_rotation,
             action[3:6],
+            stage_target_rotation,
             tolerance_frame,
             ranged,
             semantic_key=semantic_key,

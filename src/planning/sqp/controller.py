@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from functools import lru_cache
 from typing import Callable
@@ -34,6 +34,11 @@ class AxisTask:
     instantaneous_release_goal: float | None = None
     absolute_lower: float | None = None
     absolute_upper: float | None = None
+    absolute_rotation_reference: np.ndarray | None = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
 
 
 @dataclass(frozen=True)
@@ -269,6 +274,7 @@ class BaselineSQPPlanner:
                         instantaneous_release_goal=task.instantaneous_release_goal,
                         absolute_lower=task.absolute_lower,
                         absolute_upper=task.absolute_upper,
+                        absolute_rotation_reference=task.absolute_rotation_reference,
                     )
                 resolved.append(task)
             return tuple(resolved)
@@ -297,18 +303,36 @@ class BaselineSQPPlanner:
         for index in range(3, 6):
             task = tasks[index]
             value = float(error[index])
+            row = jacobian[index]
+            if task.absolute_rotation_reference is not None:
+                absolute_reference = np.asarray(
+                    task.absolute_rotation_reference, dtype=np.float64
+                )
+                absolute_error = self.kinematics.pose_error(
+                    state,
+                    target.position,
+                    absolute_reference,
+                    tolerance_rotation,
+                )
+                absolute_jacobian = self.kinematics.pose_error_jacobian(
+                    state,
+                    absolute_reference,
+                    tolerance_rotation,
+                )
+                value = float(absolute_error[index])
+                row = absolute_jacobian[index]
             if task.kind is TaskKind.SPECIFIC:
                 residual = value - task.goal
                 equality_values.append(residual)
-                equality_rows.append(jacobian[index])
+                equality_rows.append(row)
                 strict_rotation.append(residual)
             elif task.kind in self._RANGED:
                 if np.isfinite(task.lower):
                     inequality_values.append(value - task.lower)
-                    inequality_rows.append(jacobian[index])
+                    inequality_rows.append(row)
                 if np.isfinite(task.upper):
                     inequality_values.append(task.upper - value)
-                    inequality_rows.append(-jacobian[index])
+                    inequality_rows.append(-row)
         inequality = np.asarray(inequality_values, dtype=np.float64)
         values = ConstraintValues(
             equality=np.asarray(equality_values, dtype=np.float64),
@@ -564,6 +588,15 @@ class BaselineSQPPlanner:
         seed = measured_q.copy() if self._xopt is None else self._xopt.copy()
         previous = seed if self._previous is None else self._previous
         previous2 = previous if self._previous2 is None else self._previous2
+        chart_rotation = (
+            tolerance_rotation
+            if any(
+                task.kind is not TaskKind.SPECIFIC
+                or task.absolute_rotation_reference is not None
+                for task in tasks[3:]
+            )
+            else None
+        )
         cache: dict[bytes, tuple[ConstraintValues, tuple[np.ndarray, np.ndarray]]] = {}
         state_cache: dict[bytes, KinematicState] = {}
         expensive_gradient_cache: dict[str, np.ndarray] = {}
@@ -593,7 +626,7 @@ class BaselineSQPPlanner:
             key = np.ascontiguousarray(q).tobytes()
             if key not in cache:
                 cache[key] = self._constraint_evaluation(
-                    q, target, tasks, tolerance_rotation, state_for
+                    q, target, tasks, chart_rotation, state_for
                 )
             return cache[key]
 
@@ -605,7 +638,7 @@ class BaselineSQPPlanner:
                 previous2,
                 target,
                 tasks,
-                tolerance_rotation,
+                chart_rotation,
                 breakdown,
                 state_for,
             ),
@@ -621,7 +654,7 @@ class BaselineSQPPlanner:
                 previous2,
                 target,
                 tasks,
-                tolerance_rotation,
+                chart_rotation,
                 state_for,
                 expensive_gradient_cache,
             ),
@@ -646,6 +679,14 @@ class BaselineSQPPlanner:
                 ranged,
                 lower,
                 upper,
+                reference_rotation=next(
+                    (
+                        np.asarray(task.absolute_rotation_reference, dtype=np.float64)
+                        for task in tasks[3:]
+                        if task.absolute_rotation_reference is not None
+                    ),
+                    target_rotation,
+                ),
             )
         self._target = TargetPose(np.asarray(target.position).copy(), target_rotation)
         return SQPPlan(command, self._target, nominal_target, result)
