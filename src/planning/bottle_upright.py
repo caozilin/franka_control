@@ -5,7 +5,7 @@ import math
 
 import numpy as np
 
-from planning.sqp.kinematics import PandaKinematics
+from planning.kinematics import PandaKinematics
 from utils.pose import matrix_to_rotvec, rotvec_to_matrix
 
 
@@ -76,7 +76,7 @@ class BottleUprightPlanner:
         ]
         for first in range(len(segments)):
             for second in range(first + 2, len(segments)):
-                # Same 5 cm serial-link capsule used by the live SQP objective.
+                # Same 5 cm serial-link capsule used by the live IPOPT objective.
                 if self._segment_distance(
                     segments[first][0], segments[first][1],
                     segments[second][0], segments[second][1],

@@ -1,12 +1,12 @@
 ## 1. 统一笛卡尔遥操作（键盘 / PS4 / PICO，默认：Direct + Linear，相机关闭）
 /home/franka/franka_my_code/franka_control/.venv/bin/python /home/franka/franka_my_code/franka_control/scripts/teleop.py \
   --input-device ps4 \
-  --planner-mode shadow_sqp \
+  --planner-mode ipopt \
   --reference linear \
   --tracker-mode pid \
   --tolerance-id T04
 
---input-device {keyboard,ps4,pico} ； --rotation-frame {ee,base} ； --planner-mode {direct,baseline_sqp,shadow_sqp} ； --reference {min_jerk,linear,cubic,motion_limited} ;  --tracker-mode {auto,pid}
+--input-device {keyboard,ps4,pico} ； --rotation-frame {ee,base} ； --planner-mode {direct,ipopt} ； --reference {min_jerk,linear,cubic,motion_limited} ;  --tracker-mode {auto,pid}
 
 # 扶瓶：手动抓紧后，腕部相机与瓶口同边按 N，异边按 M；两个最终末端姿态相差 180deg。
 # 固定末端目标 xyz=(0.429286, 0, 0.315028)m（标定时真机 x/z + 固定 y=0），左/右姿态按 MuJoCo 筛选。
@@ -96,7 +96,7 @@
 #   PICO 保持现有末端系旋转映射，不受该参数影响。
 #
 # --tolerance-id {T01,...,T13}
-#   PS4 SQP 的 Pre/Post 旋转容差组合；对应任务见 docs/franka_tolerance_ids.md。
+#   PS4 IPOPT 的 Pre/Post 旋转容差组合；对应任务见 docs/franka_tolerance_ids.md。
 #   启用后按 PS 键依次采集 Pre、Post 当前姿态，Grasp/Release 阶段自动使用零容差。
 #
 # --no-home-first
@@ -138,11 +138,10 @@
 
 # 二、运动规划与参考轨迹
 #
-# --planner-mode {direct,baseline_sqp,shadow_sqp}
+# --planner-mode {direct,ipopt}
 #   默认 direct。
-#   direct       ：7D 笛卡尔动作直接进入笛卡尔参考轨迹和阻抗控制。
-#   baseline_sqp ：7D 笛卡尔动作先经 SQP 求解为绝对关节目标。
-#   shadow_sqp   ：Shadow 目标姿态 + Baseline SQP，再生成绝对关节目标。
+#   direct：7D 笛卡尔动作直接进入笛卡尔参考轨迹和阻抗控制。
+#   ipopt ：10 Hz 单步硬约束 IPOPT，输出绝对关节目标。
 #
 # --tracker-mode {auto,pid}
 #   默认 auto：笛卡尔 Reference 选择内部 cartesian_impedance，关节 Reference 选择内部 joint_pid。
@@ -202,7 +201,7 @@
 #   最后一个动作后的稳定等待时间；固定轨迹默认 4.0 s。
 
 
-# 四、Shadow SQP 目标姿态与容差
+# 四、IPOPT stage-relative 旋转容差
 #
 # --rotation-ranged-axes RX RY RZ
 #   哪些 tolerance-frame 旋转轴允许在范围内优化；默认 false false false。
@@ -215,35 +214,23 @@
 # --tolerance-frame-rotvec RX RY RZ
 #   容差坐标系相对基坐标系的旋转向量，单位 rad；默认 0 0 0。
 #
-# --shadow-stage NAME
-#   Shadow 语义阶段键；阶段或 prompt 改变时重置 Shadow anchor。
-#   key_control/data_recorder 默认 teleop；Coordinator 默认 default。
-
-
-# 五、SQP 求解器（Coordinator 可配置，Baseline/Shadow 共用）
+# 五、IPOPT 求解器（Coordinator）
 #
-# --sqp-max-iterations INT                 最大 SQP 迭代数；默认 20。
-# --sqp-max-time-s SEC                     单拍求解时间上限；默认 0.095 s。
-# --sqp-derivative-epsilon FLOAT           数值导数步长；默认 1e-7。
-# --sqp-step-tolerance FLOAT               步长收敛阈值；默认 1e-7。
-# --sqp-position-tolerance M               位置约束容差；默认 1e-5。
-# --sqp-rotation-tolerance RAD             姿态约束容差；默认 1e-4。
-# --sqp-inequality-tolerance FLOAT         不等式可行容差；默认 1e-7。
-# --sqp-trust-region RAD                   关节搜索信赖域；默认 0.35。
-# --sqp-merit-penalty FLOAT                约束违反惩罚；默认 1000。
-# --sqp-line-search-iterations INT         最大线搜索次数；默认 12。
-# --sqp-qp-iterations INT                  每次 SQP 的最大 QP 迭代数；默认 32。
-#
-# --sqp-velocity-weight FLOAT              关节速度目标权重；默认 0.7。
-# --sqp-acceleration-weight FLOAT          关节加速度目标权重；默认 0.5。
-# --sqp-jerk-weight FLOAT                  关节加加速度目标权重；默认 0.3。
-# --sqp-joint-limit-weight FLOAT           关节限位避让权重；默认 0.1。
-# --sqp-manipulability-weight FLOAT        可操作度权重；默认 1.0。
-# --sqp-self-collision-weight FLOAT        自碰撞避让权重；默认 0.01。
-# --sqp-tolerance-weight FLOAT             容差区内偏好权重；默认 1.0。
+# --ipopt-max-iterations INT                    最大迭代数；默认 20。
+# --ipopt-max-cpu-time-s SEC                    单拍 CPU 时间上限；默认 0.095 s。
+# --ipopt-tolerance FLOAT                       收敛容差；默认 1e-7。
+# --ipopt-acceptable-tolerance FLOAT            可接受收敛容差；默认 1e-5。
+# --ipopt-acceptable-iterations INT             可接受连续次数；默认 3。
+# --ipopt-derivative-epsilon FLOAT              数值导数步长；默认 1e-7。
+# --ipopt-expensive-gradient-refresh-rad FLOAT  昂贵梯度刷新阈值；默认 0.015 rad。
+# --ipopt-position-tolerance M                  发布前位置阈值；默认 1e-5。
+# --ipopt-rotation-tolerance RAD                发布前严格旋转阈值；默认 1e-4。
+# --ipopt-inequality-tolerance FLOAT            发布前不等式阈值；默认 1e-7。
+# --ipopt-delta-q-squared-weight FLOAT          Δq² 权重；默认 1.0。
+# --ipopt-ema-release-loss-weight FLOAT         EMA 增量释放损失权重；默认 0.1。
 
 
-# 六、关节跟踪与扭矩（Coordinator 的 SQP 模式）
+# 六、关节跟踪与扭矩（Coordinator 的 IPOPT 模式）
 #
 # --joint-stiffness J1 J2 J3 J4 J5 J6 J7
 #   关节阻抗刚度；默认 80 80 80 60 25 15 10。
@@ -268,7 +255,7 @@
 # 七、Direct 笛卡尔控制的 Nullspace
 #
 # --nullspace-enabled
-#   启用 Nullspace 姿态控制；默认关闭。SQP 关节阻抗路径不使用该组参数。
+#   启用 Nullspace 姿态控制；默认关闭。IPOPT 关节路径不使用该组参数。
 #
 # --nullspace-pinv {plain,damped}
 #   Jacobian 伪逆；默认 plain。

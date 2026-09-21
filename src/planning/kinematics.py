@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import math
 from typing import Any
 
@@ -20,6 +20,30 @@ PANDA_JOINT_LOWER = np.array(
 PANDA_JOINT_UPPER = np.array(
     [2.8973, 1.7628, 2.8973, -0.0698, 2.8973, 3.7525, 2.8973], dtype=np.float64
 )
+PANDA_JOINT_VELOCITY_LIMITS = np.array(
+    [2.175, 2.175, 2.175, 2.175, 2.61, 2.61, 2.61], dtype=np.float64
+)
+
+
+@dataclass(frozen=True)
+class RobotSpec:
+    """Robot constants consumed by the source-identical task-space objective."""
+
+    arm_dof: int = 7
+    joint_velocity_limits: np.ndarray = field(
+        default_factory=lambda: PANDA_JOINT_VELOCITY_LIMITS.copy()
+    )
+    manipulability_display_offset: float = 0.90
+    self_collision_display_offset: float = 1.70
+
+
+@dataclass(frozen=True)
+class RobotHandles:
+    """Minimal real-robot replacement for MuJoCo's model handles."""
+
+    spec: RobotSpec
+    joint_lower: np.ndarray
+    joint_upper: np.ndarray
 
 
 @dataclass(frozen=True)
@@ -66,6 +90,11 @@ class PandaKinematics:
     ) -> None:
         self.joint_lower = np.asarray(joint_lower, dtype=np.float64).copy()
         self.joint_upper = np.asarray(joint_upper, dtype=np.float64).copy()
+        if self.joint_lower.shape != (7,) or self.joint_upper.shape != (7,):
+            raise ValueError("Panda joint bounds must have shape (7,)")
+        self.handles = RobotHandles(
+            RobotSpec(), self.joint_lower.copy(), self.joint_upper.copy()
+        )
         self._pin: Any | None = None
         self._pin_model: Any | None = None
         self._pin_data: Any | None = None
@@ -150,9 +179,13 @@ class PandaKinematics:
             pin.getFrameJacobian(model, data, frame_id, pin.ReferenceFrame.LOCAL_WORLD_ALIGNED),
             dtype=np.float64,
         ).copy()
+        base_jacobian = jacobian.copy()
+        # Match the maintained MuJoCo optimizer contract: translational rows
+        # are in the base frame and angular rows are in the current tool frame.
+        jacobian[3:] = np.asarray(placement.rotation, dtype=np.float64).T @ jacobian[3:]
         manipulability = None
         if include_manipulability:
-            determinant = float(np.linalg.det(jacobian @ jacobian.T))
+            determinant = float(np.linalg.det(base_jacobian @ base_jacobian.T))
             manipulability = float(np.sqrt(np.clip(determinant, 0.0, 1.0)))
         link_points = None
         if include_link_points:
@@ -201,6 +234,7 @@ class PandaKinematics:
         if include_manipulability:
             determinant = float(np.linalg.det(jacobian @ jacobian.T))
             manipulability = float(np.sqrt(np.clip(determinant, 0.0, 1.0)))
+        jacobian[3:] = rotation.T @ jacobian[3:]
         return KinematicState(
             position=position,
             rotation=rotation,
@@ -232,7 +266,7 @@ class PandaKinematics:
         tolerance_rotation: np.ndarray | None = None,
     ) -> np.ndarray:
         goal_rotation = np.asarray(goal_rotation, dtype=np.float64)
-        angular_world = state.jacobian[3:]
+        angular_world = state.rotation @ state.jacobian[3:]
         if tolerance_rotation is not None:
             rotation_jacobian = rotation_tolerance_coordinate_jacobian(
                 state.rotation,

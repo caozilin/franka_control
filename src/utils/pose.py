@@ -120,10 +120,6 @@ def rotation_tolerance_coordinate_jacobian(
     _, pitch, yaw = (float(item) for item in coordinates)
     sy, cy = math.sin(pitch), math.cos(pitch)
     sz, cz = math.sin(yaw), math.cos(yaw)
-    if abs(cy) <= 1.0e-8:
-        raise ValueError(
-            "Fixed-axis XYZ tolerance Jacobian is singular at pitch +/- pi/2"
-        )
     rate_to_spatial = np.array(
         (
             (cz * cy, -sz, 0.0),
@@ -135,6 +131,12 @@ def rotation_tolerance_coordinate_jacobian(
     angular = np.asarray(angular_world_jacobian, dtype=np.float64)
     if angular.ndim != 2 or angular.shape[0] != 3:
         raise ValueError("Angular Jacobian must have shape (3, N)")
+    if abs(cy) <= 1.0e-8:
+        damping = 1.0e-8
+        gram = rate_to_spatial.T @ rate_to_spatial + damping * np.eye(3)
+        return np.linalg.solve(
+            gram, rate_to_spatial.T @ (np.asarray(frame).T @ angular)
+        )
     return np.linalg.solve(rate_to_spatial, np.asarray(frame).T @ angular)
 
 
@@ -172,6 +174,99 @@ def matrix_to_rotvec(matrix: np.ndarray) -> np.ndarray:
         dtype=np.float64,
     ) / (2.0 * math.sin(angle))
     return axis * angle
+
+
+# Names used by the maintained MuJoCo optimizer.  The implementations remain
+# NumPy-only on the real robot so importing the planner never requires MuJoCo.
+rotation_matrix = rotvec_to_matrix
+rotation_vector = matrix_to_rotvec
+
+
+def nominal_rotation_coordinates(
+    actual: np.ndarray,
+    nominal: np.ndarray,
+    tolerance_frame: np.ndarray,
+) -> np.ndarray:
+    return rotation_tolerance_coordinates(actual, nominal, tolerance_frame)
+
+
+def stage_reference_rotation(
+    stage_handoff_rotation: np.ndarray,
+    stage_handoff_nominal_rotation: np.ndarray,
+    nominal_rotation: np.ndarray,
+) -> np.ndarray:
+    handoff = np.asarray(stage_handoff_rotation, dtype=np.float64)
+    handoff_nominal = np.asarray(stage_handoff_nominal_rotation, dtype=np.float64)
+    nominal = np.asarray(nominal_rotation, dtype=np.float64)
+    if any(value.shape != (3, 3) for value in (handoff, handoff_nominal, nominal)):
+        raise ValueError("Stage reference requires three 3x3 rotations")
+    return (nominal @ handoff_nominal.T) @ handoff
+
+
+def stage_relative_rotation_coordinates(
+    actual_rotation: np.ndarray,
+    nominal_rotation: np.ndarray,
+    stage_handoff_rotation: np.ndarray,
+    stage_handoff_nominal_rotation: np.ndarray,
+    tolerance_frame: np.ndarray,
+) -> np.ndarray:
+    reference = stage_reference_rotation(
+        stage_handoff_rotation,
+        stage_handoff_nominal_rotation,
+        nominal_rotation,
+    )
+    return rotation_tolerance_coordinates(actual_rotation, reference, tolerance_frame)
+
+
+def rotation_increment_coordinates(
+    increment: np.ndarray,
+    frame: np.ndarray,
+) -> np.ndarray:
+    value = np.asarray(increment, dtype=np.float64)
+    frame_array = np.asarray(frame, dtype=np.float64)
+    if value.shape != (3,) or frame_array.shape != (3, 3):
+        raise ValueError("Rotation increment coordinates require a 3-vector and 3x3 frame")
+    return fixed_xyz_rotation_angles(
+        frame_array.T @ rotation_matrix(value) @ frame_array
+    )
+
+
+def nominal_rotation_coordinate_jacobian(
+    actual: np.ndarray,
+    nominal: np.ndarray,
+    angular_world_jacobian: np.ndarray,
+    tolerance_frame: np.ndarray,
+) -> np.ndarray:
+    actual_array = np.asarray(actual, dtype=np.float64)
+    nominal_array = np.asarray(nominal, dtype=np.float64)
+    if actual_array.shape != (3, 3) or nominal_array.shape != (3, 3):
+        raise ValueError("Nominal rotation Jacobian requires two 3x3 rotations")
+    return rotation_tolerance_coordinate_jacobian(
+        actual_array,
+        nominal_array,
+        tolerance_frame,
+        angular_world_jacobian,
+    )
+
+
+def project_to_rotation_matrix(value: np.ndarray) -> np.ndarray:
+    matrix = np.asarray(value, dtype=np.float64)
+    if matrix.shape != (3, 3) or not np.all(np.isfinite(matrix)):
+        raise ValueError("Rotation projection requires a finite 3x3 matrix")
+    left, _, right = np.linalg.svd(matrix)
+    rotation = left @ right
+    if np.linalg.det(rotation) < 0.0:
+        left[:, -1] *= -1.0
+        rotation = left @ right
+    return rotation
+
+
+def rotation_error_in_frame(
+    actual: np.ndarray,
+    target: np.ndarray,
+    reference: np.ndarray,
+) -> np.ndarray:
+    return rotation_tolerance_coordinates(actual, target, reference)
 
 
 def matrix_to_rotvec_continuous(matrix: np.ndarray, previous: np.ndarray | None = None) -> np.ndarray:

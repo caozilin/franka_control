@@ -25,10 +25,10 @@
 # PS4 手柄，绕 Base 固定 XYZ 轴旋转
 .venv/bin/python scripts/teleop.py --input-device ps4 --rotation-frame base
 
-# PS4 + Shadow SQP + 任务容差组合 T09
+# PS4 + IPOPT + 任务容差组合 T09
 .venv/bin/python scripts/teleop.py \
   --input-device ps4 \
-  --planner-mode shadow_sqp \
+  --planner-mode ipopt \
   --tolerance-id T09
 
 # PICO；入口会同时管理 XRoboToolkit SDK bridge
@@ -61,7 +61,7 @@ PICO 的 B 只作废当前片段，不保存，也不复位机械臂。A/B 均�
 ## 扶瓶自动后半程
 
 手动抓紧瓶子后，按键盘 `M` 或 `N` 从当前姿态开始执行 MuJoCo Adjust Bottle 的抓取后流程：保持抓取姿态抬升、转移并转正、下降、停留、释放。腕部相机与瓶口在同一边时按 `N`，在相反两边时按 `M`；这个相对关系已同时包含瓶子世界朝向和腕部抓取分支，不再额外从当前末端姿态猜测 positive/negative 分支。N/M 对应的最终末端姿态相差 `180°`。左/右两个末端姿态候选使用同样的 IK、自碰撞、边可行性、可操作度和关节余量筛选。规划和执行时会屏蔽手动位移，但复位、作废和退出按键仍会轮询。
-该功能只提供预设的笛卡尔动作序列，不改变、收紧或绕过当前的阶段容差；Direct/Baseline SQP/Shadow SQP 仍按启动时的现有设置执行。
+该功能只提供预设的笛卡尔动作序列，不改变、收紧或绕过当前的阶段容差；Direct/IPOPT 仍按启动时的现有设置执行。
 序列使用 MuJoCo 的 10 Hz 时间参数化：单轴平移峰值 `0.1 m/s`，抬升/转移/下降保持非零边界速度连续衔接，下降用 `2 s` raised-cosine 减速。按标定姿态生成的标称序列约 `6.5 s`，其中停留和夹爪张开各 `1 s`。
 
 当前真机标定的固定末端位置为 `(0.429286, 0.000000, 0.315028) m`，其中 x/z 来自标定时读取的真机末端位置，y 按要求固定为 0；姿态由 MuJoCo 同款 Base yaw `-90°/+90°` 候选决定。必须先关闭夹爪，否则 `M/N` 会拒绝启动。

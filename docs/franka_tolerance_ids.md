@@ -1,4 +1,4 @@
-# Franka SQP 容差 ID
+# Franka IPOPT 容差 ID
 
 数据来源：`90833e0f-ffaf-4fb7-983c-11ec2db5cc77.csv` 中 `robot_uid=panda` 的 25 条记录。
 具有完全相同 Pre/Post 十二个边界值的任务共用一个 ID。
@@ -28,11 +28,11 @@
 ```bash
 .venv/bin/python scripts/teleop.py \
   --input-device ps4 \
-  --planner-mode shadow_sqp \
+  --planner-mode ipopt \
   --tolerance-id T09
 ```
 
 启用后按 PS 键依次采集 Pre、Post 目标姿态，之后继续按 PS 键会依次覆盖 Pre、Post。
 
-控制规则与 `franka_mujoco` 相同：Pre/Post 使用表中的非对称旋转范围，Grasp/Release 使用严格姿态；混合 mask 中的锁定轴与释放轴均围绕同一个固定阶段目标求值，范围轴采用即时释放目标和意图 EMA，SQP 约束使用 `absolute_lower/absolute_upper`。阶段由夹爪开合命令与连续 3 帧宽度稳定共同判定。
+控制规则与 `franka_mujoco` 相同：Pre/Post 使用表中的非对称旋转范围，Grasp/Release 使用严格姿态；每个阶段捕获物理/标称 handoff，以 stage-relative 固定 XYZ 图表达硬约束，并用 EMA 标称动作缩放本周期的增量释放损失。阶段由夹爪开合命令与连续 3 帧宽度稳定共同判定。
 运行阶段采用 MuJoCo 的四阶段夹爪规则：Pre/Post 使用表中对应容差；Grasp/Release 使用严格零容差。

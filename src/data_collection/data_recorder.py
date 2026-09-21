@@ -386,7 +386,7 @@ def main() -> int:
         type=str.upper,
         choices=tuple(PANDA_TOLERANCE_PROFILES),
         default=None,
-        help="Enable a hard-coded Franka Pre/Post rotation tolerance profile for PS4 SQP teleop",
+        help="Enable a hard-coded Franka Pre/Post rotation tolerance profile for PS4 IPOPT teleop",
     )
     parser.add_argument("--control-cpu", type=int, default=2)
     parser.add_argument("--no-home-first", action="store_true")
@@ -413,7 +413,7 @@ def main() -> int:
     parser.add_argument("--max-torque-rate", type=float, default=DEFAULT_MAX_TORQUE_RATE)
     parser.add_argument("--reset-duration", type=float, default=5.0)
     parser.add_argument("--reference", choices=("min_jerk", "linear", "cubic", "motion_limited"), default="linear")
-    parser.add_argument("--planner-mode", choices=("direct", "baseline_sqp", "shadow_sqp"), default="direct")
+    parser.add_argument("--planner-mode", choices=("direct", "ipopt"), default="direct")
     parser.add_argument(
         "--tracker-mode",
         choices=TRACKER_MODE_CHOICES,
@@ -423,7 +423,6 @@ def main() -> int:
     parser.add_argument("--rotation-ranged-axes", type=parse_bool, nargs=3, default=(False, False, False))
     parser.add_argument("--rotation-limits-deg", type=float, nargs=3, default=(30.0, 30.0, 45.0))
     parser.add_argument("--tolerance-frame-rotvec", type=float, nargs=3, default=(0.0, 0.0, 0.0))
-    parser.add_argument("--shadow-stage", default="teleop")
     parser.add_argument("--nullspace-enabled", action="store_true")
     parser.add_argument("--nullspace-pinv", choices=("plain", "damped"), default="plain")
     parser.add_argument("--nullspace-projector", choices=("kinematic", "dynamic"), default="kinematic")
@@ -467,7 +466,6 @@ def main() -> int:
         rotation_ranged_axes=tuple(args.rotation_ranged_axes),
         rotation_limits_deg=tuple(args.rotation_limits_deg),
         tolerance_frame_rotvec=tuple(args.tolerance_frame_rotvec),
-        shadow_stage=args.shadow_stage,
         save_recording=False,
         nullspace_enabled=args.nullspace_enabled,
         nullspace_q_target=args.nullspace_q_target,

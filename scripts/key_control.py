@@ -85,7 +85,6 @@ def main() -> int:
     parser.add_argument("--rotation-ranged-axes", type=parse_bool, nargs=3, default=(False, False, False))
     parser.add_argument("--rotation-limits-deg", type=float, nargs=3, default=(30.0, 30.0, 45.0))
     parser.add_argument("--tolerance-frame-rotvec", type=float, nargs=3, default=(0.0, 0.0, 0.0))
-    parser.add_argument("--shadow-stage", default="teleop")
     parser.add_argument("--save-recording", action="store_true", help="Save pose/timing CSVs and analysis after control exits")
     parser.add_argument("--nullspace-enabled", action="store_true")
     parser.add_argument("--nullspace-pinv", choices=("plain", "damped"), default="plain")
@@ -119,7 +118,6 @@ def main() -> int:
         rotation_ranged_axes=tuple(args.rotation_ranged_axes),
         rotation_limits_deg=tuple(args.rotation_limits_deg),
         tolerance_frame_rotvec=tuple(args.tolerance_frame_rotvec),
-        shadow_stage=args.shadow_stage,
         save_recording=args.save_recording,
         nullspace_enabled=args.nullspace_enabled,
         nullspace_q_target=args.nullspace_q_target,

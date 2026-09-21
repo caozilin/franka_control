@@ -38,9 +38,10 @@ from control.contracts import ControlRates, PolicyActionSpec
 from control.franka_env import DEFAULT_CAM1_SERIAL, DEFAULT_CAM2_SERIAL, FrankaEnv, ROBOT_IP
 from planning import (
     CartesianActionPlanner,
+    IpoptConsecutiveFailureError,
+    IpoptSettings,
+    ObjectiveSettings,
     PlannerConfig,
-    SQPObjectiveSettings,
-    SQPSettings,
 )
 from client.realtime_utils import (
     coerce_rgb_frame,
@@ -117,7 +118,7 @@ class Args:
         1.0, 0.0, 0.0,
         0.0, 1.0, 0.0,
     )
-    planner_mode: Literal["direct", "baseline_sqp", "shadow_sqp"] = "direct"
+    planner_mode: Literal["direct", "ipopt"] = "direct"
     tracker_mode: Literal["auto", "pid"] = "auto"
     policy_translation_scale_m: float = 0.01
     policy_rotation_scale_rad: float = 0.01
@@ -132,28 +133,21 @@ class Args:
     pid_stationary_integral_time_constant_s: float = 0.25
     pid_stationary_velocity_threshold_rad_s: float = 0.02
     max_torque_rate: float = 1000.0
-    sqp_max_iterations: int = 20
-    sqp_max_time_s: float = 0.095
-    sqp_derivative_epsilon: float = 1e-7
-    sqp_step_tolerance: float = 1e-7
-    sqp_position_tolerance: float = 1e-5
-    sqp_rotation_tolerance: float = 1e-4
-    sqp_inequality_tolerance: float = 1e-7
-    sqp_trust_region: float = 0.35
-    sqp_merit_penalty: float = 1000.0
-    sqp_line_search_iterations: int = 12
-    sqp_qp_iterations: int = 32
-    sqp_velocity_weight: float = 0.7
-    sqp_acceleration_weight: float = 0.5
-    sqp_jerk_weight: float = 0.3
-    sqp_joint_limit_weight: float = 0.1
-    sqp_manipulability_weight: float = 1.0
-    sqp_self_collision_weight: float = 0.01
-    sqp_tolerance_weight: float = 1.0
+    ipopt_max_iterations: int = 20
+    ipopt_max_cpu_time_s: float = 0.095
+    ipopt_tolerance: float = 1e-7
+    ipopt_acceptable_tolerance: float = 1e-5
+    ipopt_acceptable_iterations: int = 3
+    ipopt_derivative_epsilon: float = 1e-7
+    ipopt_expensive_gradient_refresh_rad: float = 0.015
+    ipopt_position_tolerance: float = 1e-5
+    ipopt_rotation_tolerance: float = 1e-4
+    ipopt_inequality_tolerance: float = 1e-7
+    ipopt_delta_q_squared_weight: float = 1.0
+    ipopt_ema_release_loss_weight: float = 0.1
     rotation_ranged_axes: tuple[bool, bool, bool] = (False, False, False)
     rotation_limits_deg: tuple[float, float, float] = (30.0, 30.0, 45.0)
     tolerance_frame_rotvec: tuple[float, float, float] = (0.0, 0.0, 0.0)
-    shadow_stage: str = "default"
     reference: Literal["min_jerk", "linear", "cubic", "motion_limited"] = "min_jerk"
     nullspace_enabled: bool = False
     nullspace_q_target: tuple[float, float, float, float, float, float, float] | None = None
@@ -227,7 +221,7 @@ class Coordinator:
         self._latest_action_transformed: list | None = None
         self._latest_infer_ms: float | None = None
         self._latest_total_ms: float | None = None
-        self._latest_sqp: dict[str, Any] | None = None
+        self._latest_optimizer: dict[str, Any] | None = None
         self._latest_pico: dict[str, Any] | None = None
         self._latest_ee_force_torque: list | None = None
         self._latest_value_prediction: float | None = None
@@ -246,32 +240,25 @@ class Coordinator:
         action_planner = CartesianActionPlanner(
             PlannerConfig(
                 mode=args.planner_mode,
-                solver_settings=SQPSettings(
-                    max_iterations=args.sqp_max_iterations,
-                    max_time_s=args.sqp_max_time_s,
-                    derivative_epsilon=args.sqp_derivative_epsilon,
-                    step_tolerance=args.sqp_step_tolerance,
-                    position_tolerance=args.sqp_position_tolerance,
-                    rotation_tolerance=args.sqp_rotation_tolerance,
-                    inequality_tolerance=args.sqp_inequality_tolerance,
-                    trust_region=args.sqp_trust_region,
-                    merit_penalty=args.sqp_merit_penalty,
-                    max_line_search_iterations=args.sqp_line_search_iterations,
-                    max_qp_iterations=args.sqp_qp_iterations,
+                ipopt_settings=IpoptSettings(
+                    max_iterations=args.ipopt_max_iterations,
+                    max_cpu_time_s=args.ipopt_max_cpu_time_s,
+                    tolerance=args.ipopt_tolerance,
+                    acceptable_tolerance=args.ipopt_acceptable_tolerance,
+                    acceptable_iterations=args.ipopt_acceptable_iterations,
+                    derivative_epsilon=args.ipopt_derivative_epsilon,
+                    expensive_gradient_refresh_rad=args.ipopt_expensive_gradient_refresh_rad,
+                    position_tolerance=args.ipopt_position_tolerance,
+                    rotation_tolerance=args.ipopt_rotation_tolerance,
+                    inequality_tolerance=args.ipopt_inequality_tolerance,
                 ),
-                objective_settings=SQPObjectiveSettings(
-                    velocity_weight=args.sqp_velocity_weight,
-                    acceleration_weight=args.sqp_acceleration_weight,
-                    jerk_weight=args.sqp_jerk_weight,
-                    joint_limit_weight=args.sqp_joint_limit_weight,
-                    manipulability_weight=args.sqp_manipulability_weight,
-                    self_collision_weight=args.sqp_self_collision_weight,
-                    tolerance_weight=args.sqp_tolerance_weight,
+                objective_settings=ObjectiveSettings.delta_q_squared_conditioning_safeguard(
+                    motion_weight=args.ipopt_delta_q_squared_weight,
+                    ema_release_loss_weight=args.ipopt_ema_release_loss_weight,
                 ),
                 rotation_ranged_axes=args.rotation_ranged_axes,
                 rotation_limits_deg=args.rotation_limits_deg,
                 tolerance_frame_rotvec=args.tolerance_frame_rotvec,
-                shadow_stage=args.shadow_stage,
             )
         )
         self._env = FrankaEnv(
@@ -421,7 +408,7 @@ class Coordinator:
             self._latest_action_transformed = None
             self._latest_infer_ms = None
             self._latest_total_ms = None
-            self._latest_sqp = None
+            self._latest_optimizer = None
             self._latest_pico = None
 
     def close(self) -> None:
@@ -580,6 +567,11 @@ class Coordinator:
             last_state = current_state
             try:
                 self._step(current_state)
+            except IpoptConsecutiveFailureError:
+                logger.exception(
+                    "IPOPT rejected three consecutive commands; stopping control"
+                )
+                self.cmd_stop()
             except Exception:
                 logger.exception("Control loop error")
             next_tick += dt
@@ -701,15 +693,15 @@ class Coordinator:
             exec_action = self._policy_action_spec.decode_cartesian(action).as_vector()
         transformed = transform_action(exec_action, self._env.action_config)
         with self._prompt_lock:
-            semantic_key = (self._prompt, self._args.shadow_stage)
+            semantic_key = self._prompt
         planned = self._env.enqueue_cartesian_action(exec_action, semantic_key=semantic_key)
-        sqp_telemetry = planned.telemetry
+        optimizer_telemetry = planned.telemetry
         if self._args.action_source == "policy":
             self._action_scheduler.consume_executed_step()
         with self._telemetry_lock:
             self._latest_action = raw_action.tolist()
             self._latest_action_transformed = transformed.tolist()
-            self._latest_sqp = sqp_telemetry
+            self._latest_optimizer = optimizer_telemetry
         self._record_action_telemetry()
 
     def _next_pico_action(self, obs: dict) -> tuple[np.ndarray, np.ndarray] | None:
@@ -922,7 +914,7 @@ class Coordinator:
                 "ee_force_torque": self._latest_ee_force_torque,
                 "action_raw": self._latest_action,
                 "action_transformed": self._latest_action_transformed,
-                "sqp": self._latest_sqp,
+                "optimizer": self._latest_optimizer,
                 "pico": self._latest_pico,
                 "action_source": self._args.action_source,
                 "inference_time_ms": self._latest_infer_ms,
@@ -957,7 +949,7 @@ class Coordinator:
                 "ee_force_torque": self._latest_ee_force_torque,
                 "action_raw": self._latest_action,
                 "action_transformed": self._latest_action_transformed,
-                "sqp": self._latest_sqp,
+                "optimizer": self._latest_optimizer,
                 "pico": self._latest_pico,
                 "action_source": self._args.action_source,
                 "inference_time_ms": self._latest_infer_ms,
@@ -998,7 +990,7 @@ class Coordinator:
                 "ee_force_torque": self._latest_ee_force_torque,
                 "action_raw": self._latest_action,
                 "action_transformed": self._latest_action_transformed,
-                "sqp": self._latest_sqp,
+                "optimizer": self._latest_optimizer,
                 "pico": self._latest_pico,
                 "action_source": self._args.action_source,
                 "infer_ms": self._latest_infer_ms,
@@ -1122,7 +1114,7 @@ def build_app(coordinator: Coordinator) -> FastAPI:
                 "target_pose": coordinator._latest_target_pose,
                 "action_raw": coordinator._latest_action,
                 "action_transformed": coordinator._latest_action_transformed,
-                "sqp": coordinator._latest_sqp,
+                "optimizer": coordinator._latest_optimizer,
                 "pico": coordinator._latest_pico,
                 "action_source": coordinator._args.action_source,
                 "infer_ms": coordinator._latest_infer_ms,

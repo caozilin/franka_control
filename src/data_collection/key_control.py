@@ -130,7 +130,6 @@ class KeyboardController:
         rotation_ranged_axes: tuple[bool, bool, bool] = (False, False, False),
         rotation_limits_deg: tuple[float, float, float] = (30.0, 30.0, 45.0),
         tolerance_frame_rotvec: tuple[float, float, float] = (0.0, 0.0, 0.0),
-        shadow_stage: str = "teleop",
         save_recording: bool = False,
         nullspace_enabled: bool = False,
         nullspace_q_target: np.ndarray | None = None,
@@ -154,7 +153,7 @@ class KeyboardController:
         if normalized_tolerance_id is not None and input_device != "ps4":
             raise ValueError("阶段容差 ID 目前只支持 PS4 手柄")
         if normalized_tolerance_id is not None and planner_mode == "direct":
-            raise ValueError("阶段容差 ID 需要 --planner-mode baseline_sqp 或 shadow_sqp")
+            raise ValueError("阶段容差 ID 需要 --planner-mode ipopt")
 
         self.input_device = input_device
         self.joystick_index = int(joystick_index)
@@ -167,7 +166,6 @@ class KeyboardController:
                 rotation_ranged_axes=rotation_ranged_axes,
                 rotation_limits_deg=rotation_limits_deg,
                 tolerance_frame_rotvec=tolerance_frame_rotvec,
-                shadow_stage=shadow_stage,
             )
         )
         self.env = FrankaEnv(

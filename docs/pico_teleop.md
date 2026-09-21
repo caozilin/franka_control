@@ -1,6 +1,6 @@
 # PICO 双手柄遥操作
 
-PICO 端只负责发送左右手柄的 tracking pose 和按键状态。本项目通过 UDP 接收最新状态，以 10Hz 生成笛卡尔动作，再选择 `direct`、`baseline_sqp` 或 `shadow_sqp` 路径执行。
+PICO 端只负责发送左右手柄的 tracking pose 和按键状态。本项目通过 UDP 接收最新状态，以 10Hz 生成笛卡尔动作，再选择 `direct` 或 `ipopt` 路径执行。
 
 ## 当前映射
 
@@ -111,11 +111,8 @@ uv run python examples/pico_udp_sender.py
 # 直接笛卡尔跟踪
 uv run python scripts/coordinator.py --action-source pico --planner-mode direct
 
-# baseline SQP
-uv run python scripts/coordinator.py --action-source pico --planner-mode baseline_sqp
-
-# shadow 容差修正 + baseline SQP
-uv run python scripts/coordinator.py --action-source pico --planner-mode shadow_sqp
+# 单步硬约束 IPOPT（含 stage-relative 容差释放）
+uv run python scripts/coordinator.py --action-source pico --planner-mode ipopt
 ```
 
-主要可调参数都在 coordinator 的 Python CLI：`pico_mapping_mode`、`pico_translation_scale`、`pico_rotation_scale`、Grip/Trigger 阈值、超时、坐标标定矩阵，以及现有全部 SQP、reference 和 1kHz tracker 参数。
+主要可调参数都在 coordinator 的 Python CLI：`pico_mapping_mode`、`pico_translation_scale`、`pico_rotation_scale`、Grip/Trigger 阈值、超时、坐标标定矩阵，以及 IPOPT、reference 和 1kHz tracker 参数。

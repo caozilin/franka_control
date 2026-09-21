@@ -26,8 +26,8 @@ def test_direct_planner_preserves_cartesian_command_contract() -> None:
     assert command.telemetry is None
 
 
-def test_env_executes_baseline_sqp_through_same_cartesian_interface() -> None:
-    planner = CartesianActionPlanner(PlannerConfig(mode="baseline_sqp"))
+def test_env_executes_ipopt_through_same_cartesian_interface() -> None:
+    planner = CartesianActionPlanner(PlannerConfig(mode="ipopt"))
     env = FrankaEnv(
         no_robot=True,
         no_cameras=True,
@@ -43,7 +43,7 @@ def test_env_executes_baseline_sqp_through_same_cartesian_interface() -> None:
         assert command.reference_space == "joint"
         assert command.joint_target is not None
         assert command.telemetry is not None
-        assert command.telemetry["planner_mode"] == "baseline_sqp"
+        assert command.telemetry["planner_mode"] == "ipopt"
         assert command.actual_pose is not None
         assert command.planned_pose is not None
         assert command.nominal_pose is not None
@@ -54,7 +54,7 @@ def test_env_executes_baseline_sqp_through_same_cartesian_interface() -> None:
 
 @pytest.mark.parametrize(
     "mode",
-    ("direct", "baseline_sqp"),
+    ("direct", "ipopt"),
 )
 def test_planner_routes_publish_the_same_10hz_event(
     mode: str,
@@ -78,8 +78,8 @@ def test_planner_routes_publish_the_same_10hz_event(
         assert "actual_plan_drot_rad=" in output
         assert "plan_nominal_dxyz_m=" not in output
         assert "plan_nominal_drot_rad=" not in output
-        if mode == "baseline_sqp":
-            assert output.index("actual_plan_drot_rad=") < output.index("sqp_status=")
+        if mode == "ipopt":
+            assert output.index("actual_plan_drot_rad=") < output.index("ipopt_status=")
     finally:
         env.stop()
 
@@ -97,7 +97,7 @@ def test_env_defaults_to_direct_planner_for_backward_compatibility() -> None:
 
 @pytest.mark.parametrize("profile", ("min_jerk", "linear", "cubic"))
 def test_joint_route_selects_reference_independently(profile: str) -> None:
-    planner = CartesianActionPlanner(PlannerConfig(mode="baseline_sqp"))
+    planner = CartesianActionPlanner(PlannerConfig(mode="ipopt"))
     route = ControlRoute(planner, profile, "joint_impedance")
 
     assert route.reference_space == "joint"
@@ -106,7 +106,7 @@ def test_joint_route_selects_reference_independently(profile: str) -> None:
 
 
 def test_joint_pid_is_an_independent_joint_tracker_choice() -> None:
-    sqp = CartesianActionPlanner(PlannerConfig(mode="baseline_sqp"))
+    sqp = CartesianActionPlanner(PlannerConfig(mode="ipopt"))
     route = ControlRoute(sqp, "min_jerk", "joint_pid")
 
     assert route.reference_space == "joint"
@@ -127,7 +127,7 @@ def test_joint_pid_is_an_independent_joint_tracker_choice() -> None:
 
 def test_auto_tracker_follows_reference_space() -> None:
     direct = ControlRoute(CartesianActionPlanner(PlannerConfig(mode="direct")), "linear", "auto")
-    sqp = ControlRoute(CartesianActionPlanner(PlannerConfig(mode="baseline_sqp")), "linear", "auto")
+    sqp = ControlRoute(CartesianActionPlanner(PlannerConfig(mode="ipopt")), "linear", "auto")
     assert direct.tracker_mode == "cartesian_impedance"
     assert sqp.tracker_mode == "joint_pid"
 
@@ -146,20 +146,20 @@ def test_auto_tracker_follows_reference_space() -> None:
 
 def test_pid_cli_mode_follows_reference_space_without_converting_reference() -> None:
     direct = ControlRoute(CartesianActionPlanner(PlannerConfig(mode="direct")), "linear", "pid")
-    sqp = ControlRoute(CartesianActionPlanner(PlannerConfig(mode="baseline_sqp")), "linear", "pid")
+    ipopt = ControlRoute(CartesianActionPlanner(PlannerConfig(mode="ipopt")), "linear", "pid")
     assert direct.reference_space == "cartesian"
     assert direct.tracker_mode == "cartesian_impedance"
-    assert sqp.reference_space == "joint"
-    assert sqp.tracker_mode == "joint_pid"
+    assert ipopt.reference_space == "joint"
+    assert ipopt.tracker_mode == "joint_pid"
 
 
 def test_router_rejects_cross_space_tracker_and_unsupported_reference() -> None:
     direct = CartesianActionPlanner(PlannerConfig(mode="direct"))
-    sqp = CartesianActionPlanner(PlannerConfig(mode="baseline_sqp"))
+    ipopt = CartesianActionPlanner(PlannerConfig(mode="ipopt"))
 
     with pytest.raises(ValueError, match="requires tracker"):
         ControlRoute(direct, "linear", "joint_impedance")
     with pytest.raises(ValueError, match="requires"):
         ControlRoute(direct, "linear", "joint_pid")
     with pytest.raises(ValueError, match="joint reference"):
-        ControlRoute(sqp, "motion_limited", "joint_impedance")
+        ControlRoute(ipopt, "motion_limited", "joint_impedance")

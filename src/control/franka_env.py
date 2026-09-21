@@ -843,17 +843,24 @@ class FrankaEnv:
         torque_window = self._format_torque_window()
         dx, dy, dz = action[0], action[1], action[2]
         drx, dry, drz = action[3], action[4], action[5]
-        sqp_text = ""
+        optimizer_text = ""
         pose_error_text = ""
         if planned_command is not None and self.action_planner is not None:
             telemetry = planned_command.telemetry
             if telemetry is not None:
-                sqp_text = (
-                    f" sqp_status={telemetry.get('status', 'unknown')}"
+                optimizer_text = (
+                    f" ipopt_status={telemetry.get('status', 'unknown')}"
                     f" feasible={telemetry.get('feasible', False)}"
                     f" iter={telemetry.get('iterations', 0)}"
                     f" solve_ms={float(telemetry.get('elapsed_ms', 0.0)):.2f}"
                 )
+                if not telemetry.get("feasible", False):
+                    optimizer_text += (
+                        f" failures={int(telemetry.get('consecutive_failures', 0))}"
+                        f" pos_res={float(telemetry.get('position_residual', 0.0)):.3e}"
+                        f" rot_res={float(telemetry.get('rotation_residual', 0.0)):.3e}"
+                        f" ineq_viol={float(telemetry.get('tolerance_violation', 0.0)):.3e}"
+                    )
             actual_pose = planned_command.actual_pose
             planned_pose = planned_command.planned_pose
             if planned_command.reference_space == "cartesian":
@@ -870,7 +877,7 @@ class FrankaEnv:
             f"drot=[{drx:+.3f},{dry:+.3f},{drz:+.3f}]"
             f"{pose_error_text}"
             f"{torque_window}"
-            f"{sqp_text}",
+            f"{optimizer_text}",
             flush=True,
         )
 

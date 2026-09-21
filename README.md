@@ -81,14 +81,14 @@ uv run python examples/move_forward_30cm.py --ip 172.16.0.2 --yes --connect-only
 ## 统一运动规划接口
 
 所有笛卡尔动作源都通过同一个 `CartesianActionPlanner` 接口，可在启动时选择
-`direct`、`baseline_sqp` 或 `shadow_sqp`。键盘、PS4 和 PICO 遥操作及数据采集统一
+`direct` 或 `ipopt`。键盘、PS4 和 PICO 遥操作及数据采集统一
 使用 `scripts/teleop.py`；Policy 和固定轨迹也使用相同规划边界。
 
 ```bash
 .venv/bin/python scripts/teleop.py --input-device keyboard
-.venv/bin/python scripts/teleop.py --input-device ps4 --planner-mode baseline_sqp
+.venv/bin/python scripts/teleop.py --input-device ps4 --planner-mode ipopt
 .venv/bin/python scripts/teleop.py --input-device pico --with-cameras
-.venv/bin/python scripts/teleop.py --input-device ps4 --planner-mode shadow_sqp \
+.venv/bin/python scripts/teleop.py --input-device ps4 --planner-mode ipopt \
   --rotation-ranged-axes false false true --rotation-limits-deg 30 30 45
 ```
 
@@ -96,13 +96,19 @@ uv run python examples/move_forward_30cm.py --ip 172.16.0.2 --yes --connect-only
 
 Planner、Reference 和 Torque Tracker 分别选择，再由类型化 Router 按输出空间检查兼容性。
 `direct` 输出笛卡尔目标，可配 `min_jerk`、`linear`、`cubic` 或 `motion_limited`
-笛卡尔 Reference，并使用内部的 `cartesian_impedance`。两种 SQP 输出绝对关节目标，可配
+笛卡尔 Reference，并使用内部的 `cartesian_impedance`。`ipopt` 输出绝对关节目标，可配
 `min_jerk`、`linear` 或 `cubic` 关节 Reference，并使用内部的 `joint_pid`。
 `joint_pid` 移植自 `franka_mujoco` 的有界泄漏 PID 关节参考外环，
 修正后的关节参考仍由关节阻抗安全转换为扭矩。关节 Reference 固定在一个 10 Hz
 控制周期内走完。CLI 只提供 `--tracker-mode {auto,pid}`；两者都按 Reference 空间
 选择内部实现：笛卡尔 Reference 保持笛卡尔并使用 `cartesian_impedance`，关节
 Reference 使用 `joint_pid`，不会把笛卡尔 Reference 转成关节 Reference。
+
+`ipopt` 是与 `franka_mujoco` 当前正式运行链一致的 10 Hz 单步直接关节优化器：
+位置、严格旋转轴、容差旋转范围和关节限位均为硬约束；活动目标仅含
+`Δq²` 与 EMA 增量释放损失。连续三次求解结果不可发布时保持上一条关节命令并抛出异常。
+算法运行在 Python 非实时层，C++ 1 kHz reference/tracker/安全链保持不变。
+实现、依赖和失败语义详见 [IPOPT planning mode](docs/ipopt_planning.md)。
 
 ## 6秒轨迹复现
 

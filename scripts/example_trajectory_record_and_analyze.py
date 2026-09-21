@@ -184,7 +184,6 @@ def main() -> int:
             rotation_ranged_axes=tuple(args.rotation_ranged_axes),
             rotation_limits_deg=tuple(args.rotation_limits_deg),
             tolerance_frame_rotvec=tuple(args.tolerance_frame_rotvec),
-            shadow_stage="trajectory_replay",
         )
     )
     env = FrankaEnv(

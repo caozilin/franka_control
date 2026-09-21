@@ -32,7 +32,7 @@ libfranka robot.control() at 1 kHz
   `franka::Duration`; no queue or scheduler is inserted between them.
 
 The shared 10 Hz event reports `actual_plan_dxyz_m` / `actual_plan_drot_rad`
-for every planner. SQP nominal-target residuals are not printed because the
+for every planner. IPOPT nominal-target residuals are not printed because the
 nominal Cartesian target is enforced as a hard constraint.
 
 Every realtime route publishes the same 1 kHz trace and timing records. For
@@ -52,31 +52,30 @@ opened. Cartesian references support `min_jerk`, `linear`, `cubic`, and
 
 ## Non-realtime boundary
 
-Python inference and future SQP planning must publish bounded low-frequency
+Python inference and IPOPT planning publish bounded low-frequency
 commands through the backend command boundary.  They must never be called by a
 reference generator or tracker.  If the non-realtime producer is delayed, the
 reference generator finishes or holds its current safe target while the 1 kHz
 pipeline continues to run.
 
-The baseline SQP path is therefore:
+The IPOPT path is therefore:
 
 ```text
-Python Cartesian action -> BaselineSQPPlanner at 10 Hz
+Python Cartesian action -> IpoptPlanner at 10 Hz
                         -> absolute q target
                         -> FrankaEnv.enqueue_joint_target()
                         -> 1 kHz JointReferenceGenerator + tracker
 ```
 
-Joint deltas and absolute SQP waypoints use distinct backend queues. This keeps
+Joint deltas and absolute IPOPT waypoints use distinct backend queues. This keeps
 the existing joint teleoperation contract intact and prevents optimizer output
 from being accumulated as a delta.
 
-Shadow SQP does not define a second optimizer. `ShadowOrientationReference`
-first removes historical rotation bias on strict axes, then `ShadowSQPPlanner`
-passes that corrected 10 Hz target to the same `BaselineSQPPlanner`. A semantic
-stage or tolerance-mask change reanchors the shadow at the last optimized
-orientation. Updating the target/frame within the same stage re-expresses the
-unchanged absolute shadow in the new fixed-axis XYZ/RPY tolerance chart.
+Rotational tolerance uses the same stage-relative release state as
+`franka_mujoco`: each stage captures paired physical and nominal handoffs,
+transports accepted spatial release with nominal motion, freezes one tolerance
+chart per 10 Hz cycle, and commits state only after an independently validated
+IPOPT result is publishable.
 
 ## Linux verification
 
