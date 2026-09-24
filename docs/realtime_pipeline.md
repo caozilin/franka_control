@@ -76,6 +76,9 @@ Rotational tolerance uses the same stage-relative release state as
 transports accepted spatial release with nominal motion, freezes one tolerance
 chart per 10 Hz cycle, and commits state only after an independently validated
 IPOPT result is publishable.
+The chart frame comes from the action-integrated nominal EE rotation on every
+10 Hz cycle: world Z stays upright and the tool Y heading is projected into
+the horizontal plane. The frame is frozen for that cycle's solve.
 
 ## Linux verification
 

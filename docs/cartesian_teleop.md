@@ -35,7 +35,7 @@
 .venv/bin/python scripts/teleop.py --input-device pico
 ```
 
-容差 ID 与任务的对应关系见 [franka_tolerance_ids.md](franka_tolerance_ids.md)。启用后按 PS 键依次记录 Pre、Post 当前姿态；第三次起循环覆盖 Pre、Post。夹爪阶段按照 MuJoCo 的 Pre/Grasp/Post/Release 稳定开度规则切换，其中 Grasp/Release 为严格零容差。
+容差 ID 与任务的对应关系见 [franka_tolerance_ids.md](franka_tolerance_ids.md)。启用后无需按 PS 键标注容差系；每个规划周期从当前标称末端姿态实时生成。夹爪阶段按照 MuJoCo 的 Pre/Grasp/Post/Release 稳定开度规则自动切换 mask，其中 Grasp/Release 为严格零容差。
 
 需要数据采集时显式打开相机：
 

@@ -95,9 +95,9 @@
 #   键盘/PS4 旋转增量的输入坐标系；默认 ee。base 表示绕 Base 固定 XYZ 轴旋转。
 #   PICO 保持现有末端系旋转映射，不受该参数影响。
 #
-# --tolerance-id {T01,...,T13}
+# --tolerance-id {T01,...,T16}
 #   PS4 IPOPT 的 Pre/Post 旋转容差组合；对应任务见 docs/franka_tolerance_ids.md。
-#   启用后按 PS 键依次采集 Pre、Post 当前姿态，Grasp/Release 阶段自动使用零容差。
+#   启用后无需按 PS 键标注容差系；Pre/Post mask 随夹爪阶段自动切换，Grasp/Release 使用零容差。
 #
 # --no-home-first
 #   从当前位置开始，跳过启动时 Home 复位。
@@ -208,11 +208,11 @@
 #   key_control/data_recorder 使用小写 false/true；Coordinator 使用 False/True。
 #
 # --rotation-limits-deg RX RY RZ
-#   各旋转轴容差半宽，实际范围为 +/-该值；默认 30 30 45 deg。
+#   各旋转轴容差半宽，实际范围为 +/-该值；默认 30 30 30 deg。
 #   只有 rotation-ranged-axes 为 true 的轴使用对应容差。
 #
 # --tolerance-frame-rotvec RX RY RZ
-#   容差坐标系相对基坐标系的旋转向量，单位 rad；默认 0 0 0。
+#   兼容旧参数；启用 IPOPT 旋转容差时，每拍都按当前标称末端姿态生成实时容差系，此值不参与求解。
 #
 # 五、IPOPT 求解器（Coordinator）
 #

@@ -11,7 +11,7 @@ PID_DEFAULTS = {
     "pid_maximum_correction_rad": math.radians(3.0),
     "pid_integration_error_limit_rad": math.radians(4.0),
     "pid_integral_time_constant_s": 1.0,
-    "pid_stationary_integral_time_constant_s": 0.25,
+    "pid_stationary_integral_time_constant_s": 15.0,
     "pid_stationary_velocity_threshold_rad_s": 0.02,
 }
 

@@ -1,27 +1,27 @@
 # Franka IPOPT 容差 ID
 
-数据来源：`90833e0f-ffaf-4fb7-983c-11ec2db5cc77.csv` 中 `robot_uid=panda` 的 25 条记录。
-具有完全相同 Pre/Post 十二个边界值的任务共用一个 ID。
+Txx 尽量保留原有 ID 与任务对应关系；MuJoCo 当前对直立圆柱的盘子与区域目标使用不同的 Post mask，因此新增 `T14`；窄盒放置任务使用 `T15`、`T16`。每组 mask 按容差坐标系的 `(Rx, Ry, Rz)` 排列：`1` 表示允许该轴在 `±30°` 内优化，`0` 表示严格约束。不同 ID 现在可能有相同 mask。长任务的子任务容差暂未纳入。
 
-每组数值顺序均为：`Rx- Rx+ Ry- Ry+ Rz- Rz+`，单位为度。`-`/`+` 表示目标姿态两侧可接受的非对称容差幅值，并不是带符号的输入值。
-
-旋转容差采用阶段固定坐标系中的固定轴 XYZ/RPY 欧拉坐标 `[roll, pitch, yaw]`：依次绕固定 X、Y、Z 轴旋转，组合矩阵为 `Rz(yaw) @ Ry(pitch) @ Rx(roll)`。三个方向的边界是同一张欧拉坐标图中的联合边界，不是 SO(3) 对数/轴角向量的三个独立分量。该约定只用于容差值、mask 和边界；普通末端位姿存储与 Base 系旋转增量仍使用旋转向量。
-
-| ID | Pre | Post | 对应任务 ID |
+| ID | Pre mask | Post mask | 对应任务 ID |
 | --- | --- | --- | --- |
-| `T01` | `30 30 30 10 0 0` | `0 0 0 0 45 45` | `adjust_cylindrical_bottle` |
-| `T02` | `0 0 30 10 0 0` | `0 0 0 0 45 45` | `adjust_rectangular_bottle` |
-| `T03` | `30 30 30 30 45 45` | `30 30 30 30 45 45` | `click_bell`, `pear_to_bowl`, `pear_to_plate`, `press_power_strip` |
-| `T04` | `0 0 30 30 45 45` | `0 0 0 0 45 45` | `close_cylindrical_pot_lid`, `geometry_plate_cylinder_upright`, `geometry_region_cylinder_upright`, `open_cylindrical_pot_lid` |
-| `T05` | `30 30 30 30 0 0` | `0 0 0 0 45 45` | `close_handle_pot_lid`, `open_handle_pot_lid` |
-| `T06` | `10 10 0 0 0 0` | `30 30 30 30 45 45` | `banana_to_plate` |
-| `T07` | `20 20 0 0 0 0` | `30 30 30 30 45 45` | `strawberry_to_bowl`, `strawberry_to_plate` |
-| `T08` | `20 20 30 30 45 45` | `20 20 30 30 45 45` | `geometry_plate_ball` |
-| `T09` | `0 0 30 30 0 0` | `30 30 30 30 45 45` | `geometry_plate_box_lying`, `geometry_plate_cube` |
-| `T10` | `0 0 30 30 0 0` | `0 0 0 0 45 45` | `geometry_plate_box_upright` |
-| `T11` | `5 5 0 0 0 0` | `20 20 30 30 45 45` | `geometry_plate_cylinder_lying` |
-| `T12` | `0 0 30 30 0 0` | `0 0 0 0 0 0` | `geometry_region_box_lying`, `geometry_region_box_upright`, `geometry_region_cube`, `rotate_knob` |
-| `T13` | `10 10 30 30 0 0` | `30 30 0 0 0 0` | `geometry_region_cylinder_lying` |
+| `T01` | `1 1 0` | `0 0 1` | `adjust_cylindrical_bottle` |
+| `T02` | `0 1 0` | `0 0 1` | `adjust_rectangular_bottle` |
+| `T03` | `1 1 1` | `1 1 1` | `click_bell`, `pear_to_bowl`, `pear_to_plate`, `press_power_strip` |
+| `T04` | `0 1 1` | `0 0 1` | `close_cylindrical_pot_lid`, `geometry_region_cylinder_upright`, `open_cylindrical_pot_lid` |
+| `T05` | `1 1 0` | `0 0 1` | `close_handle_pot_lid`, `open_handle_pot_lid` |
+| `T06` | `1 1 0` | `1 1 1` | `banana_to_plate` |
+| `T07` | `1 1 1` | `1 1 1` | `strawberry_to_bowl`, `strawberry_to_plate` |
+| `T08` | `1 1 1` | `1 1 1` | `geometry_plate_ball` |
+| `T09` | `0 1 0` | `1 1 1` | `geometry_plate_box_lying`, `geometry_plate_cube` |
+| `T10` | `0 1 0` | `1 1 1` | `geometry_plate_box_upright` |
+| `T11` | `1 1 0` | `1 1 1` | `geometry_plate_cylinder_lying` |
+| `T12` | `0 1 0` | `0 0 0` | `geometry_region_box_lying`, `geometry_region_box_upright`, `geometry_region_cube`, `rotate_knob` |
+| `T13` | `1 1 0` | `1 0 0` | `geometry_region_cylinder_lying` |
+| `T14` | `0 1 1` | `1 1 1` | `geometry_plate_cylinder_upright` |
+| `T15` | `1 1 0` | `1 1 0` | `cylinder_to_narrow_box` |
+| `T16` | `0 1 0` | `0 1 0` | `box_to_narrow_box` |
+
+旋转容差使用固定轴 XYZ/RPY 欧拉坐标 `[roll, pitch, yaw]`，组合矩阵为 `Rz(yaw) @ Ry(pitch) @ Rx(roll)`。每个 10 Hz 规划周期从动作积分后的当前标称末端姿态构造重力对齐容差系：Z 轴为世界竖直方向，Y 轴沿末端 Y 轴的水平投影。该周期的 IPOPT 求解与释放约束共用这一个固定容差系，不经过阶段目标容差系的 EMA。普通末端位姿及 Base 系旋转增量仍使用旋转向量。
 
 启动示例：
 
@@ -32,7 +32,4 @@
   --tolerance-id T09
 ```
 
-启用后按 PS 键依次采集 Pre、Post 目标姿态，之后继续按 PS 键会依次覆盖 Pre、Post。
-
-控制规则与 `franka_mujoco` 相同：Pre/Post 使用表中的非对称旋转范围，Grasp/Release 使用严格姿态；每个阶段捕获物理/标称 handoff，以 stage-relative 固定 XYZ 图表达硬约束，并用 EMA 标称动作缩放本周期的增量释放损失。阶段由夹爪开合命令与连续 3 帧宽度稳定共同判定。
-运行阶段采用 MuJoCo 的四阶段夹爪规则：Pre/Post 使用表中对应容差；Grasp/Release 使用严格零容差。
+启用后无需按 PS 键标注容差系或 Pre/Post 目标姿态。Pre/Post mask 随夹爪阶段自动切换，Grasp/Release 始终严格零容差。阶段由夹爪开合命令与连续 3 帧宽度稳定共同判定。各阶段的物理/标称 handoff 与 stage-relative 释放状态继续由同一 IPOPT 求解路径处理。

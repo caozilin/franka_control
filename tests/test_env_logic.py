@@ -12,7 +12,13 @@ sys.path.insert(0, str(ROOT / "src"))
 from analysis import analyze_trace_csv  # noqa: E402
 from recording import TraceRecorder, create_run_paths  # noqa: E402
 from utils.control import GRIPPER_WIDTH_MAX, transform_action  # noqa: E402
-from control.franka_env import FrankaEnv  # noqa: E402
+from control.franka_env import (  # noqa: E402
+    DEFAULT_JOINT_DAMPING,
+    DEFAULT_JOINT_STIFFNESS,
+    DEFAULT_PID_STATIONARY_INTEGRAL_TIME_CONSTANT_S,
+    FrankaEnv,
+)
+from control.pid_config import PID_DEFAULTS  # noqa: E402
 from utils.pose import (  # noqa: E402
     end_effector_rotation_to_backend_rotation,
     matrix_to_pose_array,
@@ -85,6 +91,22 @@ def test_trace_recorder_and_analysis_roundtrip(tmp_path: pathlib.Path) -> None:
 def test_franka_env_task_constraint_mask_defaults_to_full_constraint() -> None:
     env = FrankaEnv(no_robot=True, no_cameras=True, print_events=False)
     np.testing.assert_array_equal(env.task_constraint_mask, np.ones(6, dtype=np.float64))
+    env.stop()
+
+
+def test_validated_joint_tracking_defaults_are_applied_consistently() -> None:
+    expected_stiffness = np.array(
+        [200.0, 200.0, 200.0, 160.0, 80.0, 50.0, 30.0], dtype=np.float64
+    )
+    np.testing.assert_array_equal(DEFAULT_JOINT_STIFFNESS, expected_stiffness)
+    np.testing.assert_allclose(DEFAULT_JOINT_DAMPING, 2.0 * np.sqrt(expected_stiffness))
+    assert DEFAULT_PID_STATIONARY_INTEGRAL_TIME_CONSTANT_S == 15.0
+    assert PID_DEFAULTS["pid_stationary_integral_time_constant_s"] == 15.0
+
+    env = FrankaEnv(no_robot=True, no_cameras=True, print_events=False)
+    np.testing.assert_array_equal(env.joint_stiffness, expected_stiffness)
+    np.testing.assert_allclose(env.joint_damping, 2.0 * np.sqrt(expected_stiffness))
+    assert env.pid_stationary_integral_time_constant_s == 15.0
     env.stop()
 
 

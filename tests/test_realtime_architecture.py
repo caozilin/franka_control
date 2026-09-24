@@ -34,6 +34,7 @@ def test_realtime_reference_tracker_and_safety_are_separate_components() -> None
     assert "proportional_gain{0.18}" in joint_pid
     assert "integral_gain_s{0.30}" in joint_pid
     assert "velocity_gain_s{0.04}" in joint_pid
+    assert "stationary_integral_time_constant_s{15.0}" in joint_pid
     assert "pushing" not in joint_pid or "same_direction" in joint_pid
 
     safety = (CPP / "safety" / "torque_rate_limiter.hpp").read_text(encoding="utf-8")

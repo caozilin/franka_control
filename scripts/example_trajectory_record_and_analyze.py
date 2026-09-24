@@ -145,7 +145,7 @@ def main() -> int:
     parser.add_argument("--tracker-mode", choices=TRACKER_MODE_CHOICES, default="auto")
     add_joint_pid_arguments(parser)
     parser.add_argument("--rotation-ranged-axes", type=parse_bool, nargs=3, default=(False, False, False))
-    parser.add_argument("--rotation-limits-deg", type=float, nargs=3, default=(30.0, 30.0, 45.0))
+    parser.add_argument("--rotation-limits-deg", type=float, nargs=3, default=(30.0, 30.0, 30.0))
     parser.add_argument("--tolerance-frame-rotvec", type=float, nargs=3, default=(0.0, 0.0, 0.0))
     parser.add_argument("--log-dir", type=pathlib.Path, default=ROOT / "logs" / "runs")
     parser.add_argument("--max-translation-step", type=float, default=0.1)

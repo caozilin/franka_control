@@ -24,7 +24,7 @@ class PlannerConfig:
         default_factory=ObjectiveSettings.delta_q_squared_conditioning_safeguard
     )
     rotation_ranged_axes: tuple[bool, bool, bool] = (False, False, False)
-    rotation_limits_deg: tuple[float, float, float] = (30.0, 30.0, 45.0)
+    rotation_limits_deg: tuple[float, float, float] = (30.0, 30.0, 30.0)
     tolerance_frame_rotvec: tuple[float, float, float] = (0.0, 0.0, 0.0)
 
     def __post_init__(self) -> None:
@@ -161,6 +161,11 @@ class CartesianActionPlanner:
     @property
     def control_mode(self) -> str:
         return "cartesian" if self._planner is None else "joint"
+
+    @property
+    def nominal_rotation(self) -> np.ndarray | None:
+        target = None if self._planner is None else self._planner.target
+        return None if target is None else target.rotation.copy()
 
     def reset(self, measured_q: np.ndarray | None = None) -> None:
         if self._tolerance_state is not None:

@@ -89,7 +89,7 @@ uv run python examples/move_forward_30cm.py --ip 172.16.0.2 --yes --connect-only
 .venv/bin/python scripts/teleop.py --input-device ps4 --planner-mode ipopt
 .venv/bin/python scripts/teleop.py --input-device pico --with-cameras
 .venv/bin/python scripts/teleop.py --input-device ps4 --planner-mode ipopt \
-  --rotation-ranged-axes false false true --rotation-limits-deg 30 30 45
+  --rotation-ranged-axes false false true --rotation-limits-deg 30 30 30
 ```
 
 统一入口默认 `direct + linear` 且关闭相机；只有显式传入 `--with-cameras` 才启用双相机和片段录制。详细按键见 [统一笛卡尔遥操作文档](docs/cartesian_teleop.md)。

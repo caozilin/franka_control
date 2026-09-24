@@ -5,6 +5,7 @@ from enum import IntEnum
 
 import numpy as np
 
+from planning.tolerance.frame import box_tolerance_frame
 from planning.tolerance.state import RotationalToleranceState
 
 
@@ -88,38 +89,43 @@ class GripperPhaseClassifier:
 
 @dataclass(frozen=True)
 class TaskToleranceProfile:
-    pre_deg: tuple[float, float, float, float, float, float]
-    post_deg: tuple[float, float, float, float, float, float]
+    pre_mask: tuple[int, int, int]
+    post_mask: tuple[int, int, int]
 
     def bounds_rad(self, phase: ManipulationPhase) -> tuple[np.ndarray, np.ndarray]:
-        values = self.pre_deg if phase is ManipulationPhase.PREGRASP else self.post_deg
-        bounds = np.radians(np.asarray(values, dtype=np.float64))
-        return bounds[0::2], bounds[1::2]
+        if phase in (ManipulationPhase.GRASP, ManipulationPhase.RELEASE):
+            return np.zeros(3), np.zeros(3)
+        mask = self.pre_mask if phase is ManipulationPhase.PREGRASP else self.post_mask
+        limits = np.radians(30.0 * np.asarray(mask, dtype=np.float64))
+        return limits.copy(), limits.copy()
 
 
-# Unique Franka/Panda pre/post combinations extracted from the supplied CSV.
-# Order per stage: Rx-, Rx+, Ry-, Ry+, Rz-, Rz+ in degrees.
+# Keep existing Txx IDs stable. Masks follow franka_mujoco's current
+# single-task Pre/Post declarations; enabled axes use a symmetric 30 degree bound.
 PANDA_TOLERANCE_PROFILES: dict[str, TaskToleranceProfile] = {
-    "T01": TaskToleranceProfile((30, 30, 30, 10, 0, 0), (0, 0, 0, 0, 45, 45)),
-    "T02": TaskToleranceProfile((0, 0, 30, 10, 0, 0), (0, 0, 0, 0, 45, 45)),
-    "T03": TaskToleranceProfile((30, 30, 30, 30, 45, 45), (30, 30, 30, 30, 45, 45)),
-    "T04": TaskToleranceProfile((0, 0, 30, 30, 45, 45), (0, 0, 0, 0, 45, 45)),
-    "T05": TaskToleranceProfile((30, 30, 30, 30, 0, 0), (0, 0, 0, 0, 45, 45)),
-    "T06": TaskToleranceProfile((10, 10, 0, 0, 0, 0), (30, 30, 30, 30, 45, 45)),
-    "T07": TaskToleranceProfile((20, 20, 0, 0, 0, 0), (30, 30, 30, 30, 45, 45)),
-    "T08": TaskToleranceProfile((20, 20, 30, 30, 45, 45), (20, 20, 30, 30, 45, 45)),
-    "T09": TaskToleranceProfile((0, 0, 30, 30, 0, 0), (30, 30, 30, 30, 45, 45)),
-    "T10": TaskToleranceProfile((0, 0, 30, 30, 0, 0), (0, 0, 0, 0, 45, 45)),
-    "T11": TaskToleranceProfile((5, 5, 0, 0, 0, 0), (20, 20, 30, 30, 45, 45)),
-    "T12": TaskToleranceProfile((0, 0, 30, 30, 0, 0), (0, 0, 0, 0, 0, 0)),
-    "T13": TaskToleranceProfile((10, 10, 30, 30, 0, 0), (30, 30, 0, 0, 0, 0)),
+    "T01": TaskToleranceProfile((1, 1, 0), (0, 0, 1)),
+    "T02": TaskToleranceProfile((0, 1, 0), (0, 0, 1)),
+    "T03": TaskToleranceProfile((1, 1, 1), (1, 1, 1)),
+    "T04": TaskToleranceProfile((0, 1, 1), (0, 0, 1)),
+    "T05": TaskToleranceProfile((1, 1, 0), (0, 0, 1)),
+    "T06": TaskToleranceProfile((1, 1, 0), (1, 1, 1)),
+    "T07": TaskToleranceProfile((1, 1, 1), (1, 1, 1)),
+    "T08": TaskToleranceProfile((1, 1, 1), (1, 1, 1)),
+    "T09": TaskToleranceProfile((0, 1, 0), (1, 1, 1)),
+    "T10": TaskToleranceProfile((0, 1, 0), (1, 1, 1)),
+    "T11": TaskToleranceProfile((1, 1, 0), (1, 1, 1)),
+    "T12": TaskToleranceProfile((0, 1, 0), (0, 0, 0)),
+    "T13": TaskToleranceProfile((1, 1, 0), (1, 0, 0)),
+    "T14": TaskToleranceProfile((0, 1, 1), (1, 1, 1)),
+    "T15": TaskToleranceProfile((1, 1, 0), (1, 1, 0)),
+    "T16": TaskToleranceProfile((0, 1, 0), (0, 1, 0)),
 }
 
 PANDA_TASK_TOLERANCE_IDS: dict[str, str] = {
     "adjust_cylindrical_bottle": "T01",
     "adjust_rectangular_bottle": "T02",
     "click_bell": "T03", "pear_to_bowl": "T03", "pear_to_plate": "T03", "press_power_strip": "T03",
-    "close_cylindrical_pot_lid": "T04", "geometry_plate_cylinder_upright": "T04", "geometry_region_cylinder_upright": "T04", "open_cylindrical_pot_lid": "T04",
+    "close_cylindrical_pot_lid": "T04", "geometry_plate_cylinder_upright": "T14", "geometry_region_cylinder_upright": "T04", "open_cylindrical_pot_lid": "T04",
     "close_handle_pot_lid": "T05", "open_handle_pot_lid": "T05",
     "banana_to_plate": "T06",
     "strawberry_to_bowl": "T07", "strawberry_to_plate": "T07",
@@ -129,23 +135,6 @@ PANDA_TASK_TOLERANCE_IDS: dict[str, str] = {
     "geometry_plate_cylinder_lying": "T11",
     "geometry_region_box_lying": "T12", "geometry_region_box_upright": "T12", "geometry_region_cube": "T12", "rotate_knob": "T12",
     "geometry_region_cylinder_lying": "T13",
+    "cylinder_to_narrow_box": "T15",
+    "box_to_narrow_box": "T16",
 }
-
-
-def box_tolerance_frame(target_rotation: np.ndarray) -> np.ndarray:
-    """MuJoCo rule: world Z and the target tool-Y projected horizontally."""
-    rotation = np.asarray(target_rotation, dtype=np.float64)
-    if rotation.shape != (3, 3):
-        raise ValueError("target rotation must be 3x3")
-    z_axis = np.array((0.0, 0.0, 1.0), dtype=np.float64)
-    y_axis = rotation[:, 1].copy()
-    y_axis -= z_axis * float(y_axis @ z_axis)
-    if np.linalg.norm(y_axis) < 1e-8:
-        projected_x = rotation[:, 0] - z_axis * float(rotation[:, 0] @ z_axis)
-        projected_x /= np.linalg.norm(projected_x)
-        y_axis = np.cross(z_axis, projected_x)
-    y_axis /= np.linalg.norm(y_axis)
-    x_axis = np.cross(y_axis, z_axis)
-    x_axis /= np.linalg.norm(x_axis)
-    y_axis = np.cross(z_axis, x_axis)
-    return np.column_stack((x_axis, y_axis, z_axis))

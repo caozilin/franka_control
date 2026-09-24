@@ -48,6 +48,11 @@ def frame_from_heading(code: np.ndarray) -> np.ndarray:
     return np.column_stack((x_axis, y_axis, z_axis))
 
 
+def box_tolerance_frame(target_rotation: np.ndarray) -> np.ndarray:
+    """Build the gravity-aligned frame from the current nominal EE heading."""
+    return frame_from_heading(heading_code(target_rotation))
+
+
 class ToleranceFrameEMA:
     """Stage-local exponential moving average on SO(3).
 
@@ -182,6 +187,7 @@ __all__ = (
     "HEADING_CODE_EPSILON",
     "ToleranceFrameEMA",
     "ToleranceLimitsEMA",
+    "box_tolerance_frame",
     "frame_from_heading",
     "heading_code",
 )

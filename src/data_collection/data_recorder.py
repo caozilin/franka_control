@@ -421,7 +421,7 @@ def main() -> int:
     )
     add_joint_pid_arguments(parser)
     parser.add_argument("--rotation-ranged-axes", type=parse_bool, nargs=3, default=(False, False, False))
-    parser.add_argument("--rotation-limits-deg", type=float, nargs=3, default=(30.0, 30.0, 45.0))
+    parser.add_argument("--rotation-limits-deg", type=float, nargs=3, default=(30.0, 30.0, 30.0))
     parser.add_argument("--tolerance-frame-rotvec", type=float, nargs=3, default=(0.0, 0.0, 0.0))
     parser.add_argument("--nullspace-enabled", action="store_true")
     parser.add_argument("--nullspace-pinv", choices=("plain", "damped"), default="plain")

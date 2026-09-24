@@ -10,6 +10,7 @@ from planning.ipopt.controller import IpoptIK
 from planning.ipopt.types import TargetPose
 from planning.task_space.types import AxisTask, TaskKind
 from utils.pose import rotation_matrix
+from .frame import box_tolerance_frame
 from .release_state import RotationReleaseState, RotationReleaseStep
 from .state import RotationalToleranceState
 
@@ -108,8 +109,10 @@ def solve_stage_relative_target(
 
     This is the single backend used by interactive, benchmark, and
     counterfactual simulation. It owns task installation, the frozen release
-    snapshot, the solve, and the feasible-state commit.
+    snapshot, the solve, and the feasible-state commit. The tolerance frame is
+    rebuilt from this cycle's action-integrated nominal rotation, without EMA.
     """
+    tolerance.frame = box_tolerance_frame(target.rotation)
     rotation_tasks, release_mask = configure_rotation_axis_tasks(
         tolerance, (controller,),
     )

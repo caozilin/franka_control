@@ -19,12 +19,14 @@ from planning import (  # noqa: E402
     PlannerConfig,
     RotationalToleranceState,
     TaskKind,
+    TargetPose,
     box_tolerance_frame,
 )
 from planning.tolerance.projection import (  # noqa: E402
     constraint_consistent_release_loss_reference,
 )
 from planning.tolerance.release_state import RotationReleaseState  # noqa: E402
+from planning.tolerance.runtime import solve_stage_relative_target  # noqa: E402
 from utils.pose import (  # noqa: E402
     rotation_from_tolerance_coordinates,
     rotation_tolerance_coordinates,
@@ -33,10 +35,49 @@ from utils.pose import (  # noqa: E402
 )
 
 
-def test_csv_task_rows_are_grouped_into_unique_tolerance_ids() -> None:
-    assert len(PANDA_TOLERANCE_PROFILES) == 13
-    assert len(PANDA_TASK_TOLERANCE_IDS) == 25
+def test_tolerance_ids_cover_selected_single_tasks() -> None:
+    assert len(PANDA_TOLERANCE_PROFILES) == 16
+    assert len(PANDA_TASK_TOLERANCE_IDS) == 27
     assert set(PANDA_TASK_TOLERANCE_IDS.values()) == set(PANDA_TOLERANCE_PROFILES)
+    assert PANDA_TASK_TOLERANCE_IDS["geometry_plate_cylinder_upright"] == "T14"
+    assert PANDA_TASK_TOLERANCE_IDS["geometry_region_cylinder_upright"] == "T04"
+    assert PANDA_TASK_TOLERANCE_IDS["cylinder_to_narrow_box"] == "T15"
+    assert PANDA_TASK_TOLERANCE_IDS["box_to_narrow_box"] == "T16"
+
+
+def test_txx_profiles_store_mujoco_masks_with_uniform_thirty_degree_bounds() -> None:
+    expected = {
+        "T01": ((1, 1, 0), (0, 0, 1)),
+        "T02": ((0, 1, 0), (0, 0, 1)),
+        "T03": ((1, 1, 1), (1, 1, 1)),
+        "T04": ((0, 1, 1), (0, 0, 1)),
+        "T05": ((1, 1, 0), (0, 0, 1)),
+        "T06": ((1, 1, 0), (1, 1, 1)),
+        "T07": ((1, 1, 1), (1, 1, 1)),
+        "T08": ((1, 1, 1), (1, 1, 1)),
+        "T09": ((0, 1, 0), (1, 1, 1)),
+        "T10": ((0, 1, 0), (1, 1, 1)),
+        "T11": ((1, 1, 0), (1, 1, 1)),
+        "T12": ((0, 1, 0), (0, 0, 0)),
+        "T13": ((1, 1, 0), (1, 0, 0)),
+        "T14": ((0, 1, 1), (1, 1, 1)),
+        "T15": ((1, 1, 0), (1, 1, 0)),
+        "T16": ((0, 1, 0), (0, 1, 0)),
+    }
+    for identifier, (pre_mask, post_mask) in expected.items():
+        profile = PANDA_TOLERANCE_PROFILES[identifier]
+        assert (profile.pre_mask, profile.post_mask) == (pre_mask, post_mask)
+        for phase, mask in (
+            (ManipulationPhase.PREGRASP, pre_mask),
+            (ManipulationPhase.POSTGRASP, post_mask),
+        ):
+            negative, positive = profile.bounds_rad(phase)
+            np.testing.assert_allclose(negative, np.radians(30 * np.asarray(mask)))
+            np.testing.assert_allclose(positive, negative)
+        for phase in (ManipulationPhase.GRASP, ManipulationPhase.RELEASE):
+            negative, positive = profile.bounds_rad(phase)
+            np.testing.assert_array_equal(negative, np.zeros(3))
+            np.testing.assert_array_equal(positive, np.zeros(3))
 
 
 def test_phase_classifier_matches_mujoco_stable_width_rule() -> None:
@@ -143,3 +184,30 @@ def test_box_tolerance_frame_keeps_world_z() -> None:
     frame = box_tolerance_frame(rotation)
     np.testing.assert_allclose(frame[:, 2], (0.0, 0.0, 1.0), atol=1e-12)
     np.testing.assert_allclose(frame.T @ frame, np.eye(3), atol=1e-12)
+
+
+def test_solver_freezes_realtime_nominal_frame_for_each_cycle() -> None:
+    class Controller:
+        def __init__(self) -> None:
+            self.solve_frames: list[np.ndarray] = []
+
+        def set_axis_task(self, axis: int, task: object) -> None:
+            pass
+
+        def solve(self, measured_q, target, active_dofs, frame, *, rotation_release_step):
+            np.testing.assert_allclose(frame, rotation_release_step.tolerance_frame)
+            self.solve_frames.append(frame.copy())
+            return np.zeros(7), type("Diagnostics", (), {"feasible": False})()
+
+    controller = Controller()
+    tolerance = RotationalToleranceState(ranged=np.array((False, True, False)))
+    release = RotationReleaseState()
+    active_dofs = np.ones(6, dtype=bool)
+    for angle_deg in (15.0, 65.0):
+        nominal = rotvec_to_matrix(np.radians((0.0, 0.0, angle_deg)))
+        target = TargetPose(np.zeros(3), nominal)
+        _, _, _, _, step = solve_stage_relative_target(
+            controller, np.zeros(7), target, tolerance, release, active_dofs,
+        )
+        np.testing.assert_allclose(step.tolerance_frame, box_tolerance_frame(nominal))
+    assert not np.allclose(controller.solve_frames[0], controller.solve_frames[1])

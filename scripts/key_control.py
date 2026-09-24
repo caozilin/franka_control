@@ -83,7 +83,7 @@ def main() -> int:
     parser.add_argument("--tracker-mode", choices=TRACKER_MODE_CHOICES, default="auto")
     add_joint_pid_arguments(parser)
     parser.add_argument("--rotation-ranged-axes", type=parse_bool, nargs=3, default=(False, False, False))
-    parser.add_argument("--rotation-limits-deg", type=float, nargs=3, default=(30.0, 30.0, 45.0))
+    parser.add_argument("--rotation-limits-deg", type=float, nargs=3, default=(30.0, 30.0, 30.0))
     parser.add_argument("--tolerance-frame-rotvec", type=float, nargs=3, default=(0.0, 0.0, 0.0))
     parser.add_argument("--save-recording", action="store_true", help="Save pose/timing CSVs and analysis after control exits")
     parser.add_argument("--nullspace-enabled", action="store_true")

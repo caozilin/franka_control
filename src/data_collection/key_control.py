@@ -35,6 +35,7 @@ from control.franka_env import (
     DEFAULT_MAX_TRANSLATION_GOAL_ERROR,
     DEFAULT_MAX_TRANSLATION_VELOCITY,
     DEFAULT_MAX_TORQUE_RATE,
+    DEFAULT_PID_STATIONARY_INTEGRAL_TIME_CONSTANT_S,
     FrankaEnv,
 )  # noqa: E402
 from devices.pico import (  # noqa: E402
@@ -80,7 +81,6 @@ PS4_BUTTON_SQUARE = 3
 PS4_BUTTON_L1 = 4
 PS4_BUTTON_R1 = 5
 PS4_BUTTON_OPTIONS = 9
-PS4_BUTTON_PS = 10
 PS4_BUTTON_L3 = 11
 PS4_BUTTON_R3 = 12
 
@@ -125,10 +125,12 @@ class KeyboardController:
         pid_maximum_correction_rad: float = math.radians(3.0),
         pid_integration_error_limit_rad: float = math.radians(4.0),
         pid_integral_time_constant_s: float = 1.0,
-        pid_stationary_integral_time_constant_s: float = 0.25,
+        pid_stationary_integral_time_constant_s: float = (
+            DEFAULT_PID_STATIONARY_INTEGRAL_TIME_CONSTANT_S
+        ),
         pid_stationary_velocity_threshold_rad_s: float = 0.02,
         rotation_ranged_axes: tuple[bool, bool, bool] = (False, False, False),
-        rotation_limits_deg: tuple[float, float, float] = (30.0, 30.0, 45.0),
+        rotation_limits_deg: tuple[float, float, float] = (30.0, 30.0, 30.0),
         tolerance_frame_rotvec: tuple[float, float, float] = (0.0, 0.0, 0.0),
         save_recording: bool = False,
         nullspace_enabled: bool = False,
@@ -217,10 +219,7 @@ class KeyboardController:
             None if self.tolerance_id is None else PANDA_TOLERANCE_PROFILES[self.tolerance_id]
         )
         self._phase_classifier = GripperPhaseClassifier()
-        self._stage_target_poses: dict[ManipulationPhase, np.ndarray] = {}
-        self._next_stage_capture = ManipulationPhase.PREGRASP
         self._active_manipulation_phase: ManipulationPhase | None = None
-        self._tolerance_config_dirty = False
         self._bottle_planner = BottleUprightPlanner()
         self._bottle_actions: deque[np.ndarray] = deque()
         self._bottle_plan_lock = threading.Lock()
@@ -329,7 +328,6 @@ class KeyboardController:
         self._sync_pico_state()
         self._phase_classifier.reset()
         self._active_manipulation_phase = None
-        self._tolerance_config_dirty = bool(self._stage_target_poses)
         print("  [复位] 完成")
 
     def stop(self):
@@ -379,10 +377,10 @@ class KeyboardController:
         print("  [控制] L3/R3:开始/结束录制并恢复控制  OPTIONS:退出")
         print("  [控制] 键盘 N:腕部相机/瓶口同边  M:异边（最终末端相差 180deg）")
         if self._tolerance_profile is not None:
-            print(f"  [容差] id={self.tolerance_id}；PS键依次采集/覆盖 Pre、Post 目标姿态")
+            print(f"  [容差] id={self.tolerance_id}；按夹爪阶段自动切换 Pre/Post mask，容差系实时生成")
             print(
-                f"  [容差] Pre={self._tolerance_profile.pre_deg} deg  "
-                f"Post={self._tolerance_profile.post_deg} deg"
+                f"  [容差] Pre mask={self._tolerance_profile.pre_mask}  "
+                f"Post mask={self._tolerance_profile.post_mask}；启用轴默认 ±30°"
             )
 
     def _on_key_press(self, key):
@@ -596,37 +594,8 @@ class KeyboardController:
         self._pico_primary_pressed = bool(snapshot.packet.right.primary)
         self._pico_secondary_pressed = bool(snapshot.packet.right.secondary)
 
-    def _capture_stage_target(self) -> None:
-        if self._tolerance_profile is None:
-            return
-        state = self.env.get_robot_state_vector()
-        pose = np.eye(4, dtype=np.float64)
-        pose[:3, 3] = state[:3]
-        pose[:3, :3] = rotvec_to_matrix(state[3:6])
-        stage = self._next_stage_capture
-        self._stage_target_poses[stage] = pose
-        self._next_stage_capture = (
-            ManipulationPhase.POSTGRASP
-            if stage is ManipulationPhase.PREGRASP
-            else ManipulationPhase.PREGRASP
-        )
-        self._tolerance_config_dirty = True
-        label = "Pre" if stage is ManipulationPhase.PREGRASP else "Post"
-        p = pose[:3, 3]
-        print(
-            f"  [容差目标] 已记录 {label}: "
-            f"position=({p[0]:+.4f},{p[1]:+.4f},{p[2]:+.4f}) "
-            f"rotvec=({state[3]:+.4f},{state[4]:+.4f},{state[5]:+.4f})",
-            flush=True,
-        )
-        if len(self._stage_target_poses) < 2:
-            print("  [容差目标] 请移动到 Post 目标姿态，再按一次 PS 键", flush=True)
-        else:
-            next_label = "Pre" if self._next_stage_capture is ManipulationPhase.PREGRASP else "Post"
-            print(f"  [容差目标] Pre/Post 已就绪；下一次 PS 键将覆盖 {next_label}", flush=True)
-
     def _update_stage_tolerance(self, state: np.ndarray) -> None:
-        if self._tolerance_profile is None or len(self._stage_target_poses) < 2:
+        if self._tolerance_profile is None:
             return
         aperture = float(abs(state[6]) + abs(state[7])) if state.shape[0] >= 8 else self.gripper_target
         observation = self._phase_classifier.update(
@@ -634,28 +603,20 @@ class KeyboardController:
             commanded_closed=self.gripper_target <= 0.0,
         )
         phase = observation.phase
-        if phase is self._active_manipulation_phase and not self._tolerance_config_dirty:
+        if phase is self._active_manipulation_phase:
             return
-        stable_phase = (
-            ManipulationPhase.PREGRASP
-            if phase in (ManipulationPhase.PREGRASP, ManipulationPhase.GRASP)
-            else ManipulationPhase.POSTGRASP
-        )
-        pose = self._stage_target_poses[stable_phase]
-        if phase in (ManipulationPhase.GRASP, ManipulationPhase.RELEASE):
-            negative = np.zeros(3, dtype=np.float64)
-            positive = np.zeros(3, dtype=np.float64)
-        else:
-            negative, positive = self._tolerance_profile.bounds_rad(phase)
+        target_rotation = self.action_planner.nominal_rotation
+        if target_rotation is None:
+            target_rotation = rotvec_to_matrix(state[3:6])
+        negative, positive = self._tolerance_profile.bounds_rad(phase)
         self.action_planner.configure_rotation_tolerance(
-            pose[:3, :3],
-            box_tolerance_frame(pose[:3, :3]),
+            target_rotation,
+            box_tolerance_frame(target_rotation),
             negative,
             positive,
             phase=phase,
         )
         self._active_manipulation_phase = phase
-        self._tolerance_config_dirty = False
         print(
             f"  [容差阶段] {phase.key.upper()} aperture={observation.aperture_m:.4f}m "
             f"bounds_deg=(-{np.degrees(negative).round(1).tolist()},"
@@ -780,9 +741,6 @@ class KeyboardController:
                     self.running = False
                     self.env.request_stop()
                     return False
-                if button_idx == PS4_BUTTON_PS:
-                    self._capture_stage_target()
-                    continue
                 if button_idx == PS4_BUTTON_CROSS:
                     self._emit_event("record_discard")
                     self.reset_to_home(open_gripper=True)

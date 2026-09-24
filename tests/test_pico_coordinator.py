@@ -59,6 +59,19 @@ def _wait_for_sequence(coordinator: Coordinator, sequence: int) -> None:
     raise AssertionError(f"PICO sequence {sequence} was not received")
 
 
+def test_coordinator_uses_validated_joint_tracking_defaults() -> None:
+    args = Args()
+    np.testing.assert_allclose(
+        args.joint_stiffness,
+        [200.0, 200.0, 200.0, 160.0, 80.0, 50.0, 30.0],
+    )
+    np.testing.assert_allclose(
+        args.joint_damping,
+        [28.28427125, 28.28427125, 28.28427125, 25.29822128, 17.88854382, 14.14213562, 10.95445115],
+    )
+    assert args.pid_stationary_integral_time_constant_s == 15.0
+
+
 def test_pico_source_runs_without_policy_server_or_robot() -> None:
     coordinator = Coordinator(
         Args(

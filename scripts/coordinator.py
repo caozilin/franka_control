@@ -35,7 +35,15 @@ from devices.pico import PicoMapperConfig, PicoPoseMapper, PicoUdpReceiver
 from orchestration import ActionPlanScheduler, RTCConfig
 from recording import RealtimeTimingProfiler
 from control.contracts import ControlRates, PolicyActionSpec
-from control.franka_env import DEFAULT_CAM1_SERIAL, DEFAULT_CAM2_SERIAL, FrankaEnv, ROBOT_IP
+from control.franka_env import (
+    DEFAULT_CAM1_SERIAL,
+    DEFAULT_CAM2_SERIAL,
+    DEFAULT_JOINT_DAMPING,
+    DEFAULT_JOINT_STIFFNESS,
+    DEFAULT_PID_STATIONARY_INTEGRAL_TIME_CONSTANT_S,
+    FrankaEnv,
+    ROBOT_IP,
+)
 from planning import (
     CartesianActionPlanner,
     IpoptConsecutiveFailureError,
@@ -122,15 +130,21 @@ class Args:
     tracker_mode: Literal["auto", "pid"] = "auto"
     policy_translation_scale_m: float = 0.01
     policy_rotation_scale_rad: float = 0.01
-    joint_stiffness: tuple[float, float, float, float, float, float, float] = (80.0, 80.0, 80.0, 60.0, 25.0, 15.0, 10.0)
-    joint_damping: tuple[float, float, float, float, float, float, float] = (17.8885, 17.8885, 17.8885, 15.4919, 10.0, 7.7460, 6.3246)
+    joint_stiffness: tuple[float, float, float, float, float, float, float] = tuple(
+        float(value) for value in DEFAULT_JOINT_STIFFNESS
+    )
+    joint_damping: tuple[float, float, float, float, float, float, float] = tuple(
+        float(value) for value in DEFAULT_JOINT_DAMPING
+    )
     pid_proportional_gain: float = 0.18
     pid_integral_gain_s: float = 0.30
     pid_velocity_gain_s: float = 0.04
     pid_maximum_correction_rad: float = 0.05235987755982989
     pid_integration_error_limit_rad: float = 0.06981317007977318
     pid_integral_time_constant_s: float = 1.0
-    pid_stationary_integral_time_constant_s: float = 0.25
+    pid_stationary_integral_time_constant_s: float = (
+        DEFAULT_PID_STATIONARY_INTEGRAL_TIME_CONSTANT_S
+    )
     pid_stationary_velocity_threshold_rad_s: float = 0.02
     max_torque_rate: float = 1000.0
     ipopt_max_iterations: int = 20
@@ -146,7 +160,7 @@ class Args:
     ipopt_delta_q_squared_weight: float = 1.0
     ipopt_ema_release_loss_weight: float = 0.1
     rotation_ranged_axes: tuple[bool, bool, bool] = (False, False, False)
-    rotation_limits_deg: tuple[float, float, float] = (30.0, 30.0, 45.0)
+    rotation_limits_deg: tuple[float, float, float] = (30.0, 30.0, 30.0)
     tolerance_frame_rotvec: tuple[float, float, float] = (0.0, 0.0, 0.0)
     reference: Literal["min_jerk", "linear", "cubic", "motion_limited"] = "min_jerk"
     nullspace_enabled: bool = False

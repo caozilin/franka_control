@@ -18,7 +18,7 @@ struct JointPidSettings {
   double maximum_correction_rad{0.05235987755982989};
   double integration_error_limit_rad{0.06981317007977318};
   double integral_time_constant_s{1.0};
-  double stationary_integral_time_constant_s{0.25};
+  double stationary_integral_time_constant_s{15.0};
   double stationary_velocity_threshold_rad_s{0.02};
 };
 
